@@ -5,15 +5,16 @@
 """
 import logging
 import json
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.models.entities import VideoCache
+from app.models.entities import FavoriteVideo, VideoCache
 from app.services.knowledge_service import knowledge_service
 from app.services.markdown_export import export_ai_organized, export_original
 from app.services.worker import WorkerBusyError, worker
@@ -22,6 +23,33 @@ from app.services.ingestion_metrics import latest_ingestion_run
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/knowledge", tags=["知识库"])
+
+
+@router.get("/videos")
+def list_knowledge_videos(
+    status: Literal["done", "all"] = "done",
+    page: int = Query(1, ge=1),
+    size: int = Query(100, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """List saved material independently of current Douyin favorites."""
+    conditions = [VideoCache.status == "done"] if status == "done" else []
+    total = db.scalar(select(func.count()).select_from(VideoCache).where(*conditions)) or 0
+    rows = db.execute(
+        select(VideoCache, FavoriteVideo)
+        .outerjoin(FavoriteVideo, FavoriteVideo.platform_item_id == VideoCache.platform_item_id)
+        .where(*conditions)
+        .order_by(VideoCache.updated_at.desc(), VideoCache.id.desc())
+        .offset((page - 1) * size).limit(size)
+    ).all()
+    return {"success": True, "total": total, "items": [
+        {"id": cache.id, "collection_id": str(favorite.collection_id) if favorite else "",
+         "platform_item_id": cache.platform_item_id, "title": cache.title,
+         "author": favorite.author if favorite else "",
+         "duration": int(cache.analysis_duration_seconds or (favorite.duration if favorite else 0)),
+         "url": f"https://www.douyin.com/video/{cache.platform_item_id}", "status": cache.status}
+        for cache, favorite in rows
+    ]}
 
 
 class SyncRequest(BaseModel):

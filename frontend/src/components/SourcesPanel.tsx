@@ -1,4 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { createPortal } from 'react-dom';
+import { AudioLines, Check, ChevronRight, Download, Ellipsis, FileAudio, FileDown, FolderInput, FolderMinus, History, ListChecks, MessageCircle, Pencil, RefreshCw, RotateCcw, Trash2 } from 'lucide-react';
+import type { WorkspaceView } from '../workspaceView';
+import ActionMenu from './ActionMenu';
 import * as api from '../api';
 import BuildConfirmModal from './BuildConfirmModal';
 import VideoContentModal from './VideoContentModal';
@@ -7,6 +11,11 @@ import KnowledgeBasesPanel from './KnowledgeBasesPanel';
 import type { CollectionImportSource } from '../collectionImport';
 
 interface Props {
+  view: WorkspaceView;
+  onChangeView: (view: WorkspaceView) => void;
+  contentContainer: HTMLElement | null;
+  chatOnly: boolean;
+  onKnowledgeBaseUpdated: (base: api.KnowledgeBaseItem) => void;
   onBuildDone: () => void;
   selectedId: string;
   onSelectCollection: (id: string) => void;
@@ -22,7 +31,7 @@ interface Props {
   onSessionDeleted: (id: number) => void;
 }
 
-export default function SourcesPanel({ onBuildDone, selectedId, onSelectCollection, selectedKnowledgeBase, onSelectKnowledgeBase, statsRefreshKey, historyRefreshKey, activeSessionId, chatBusy, onSelectSession, onNewChat, onSessionRenamed, onSessionDeleted }: Props) {
+export default function SourcesPanel({ view, onChangeView, contentContainer, chatOnly, onKnowledgeBaseUpdated, onBuildDone, selectedId, onSelectCollection, selectedKnowledgeBase, onSelectKnowledgeBase, statsRefreshKey, historyRefreshKey, activeSessionId, chatBusy, onSelectSession, onNewChat, onSessionRenamed, onSessionDeleted }: Props) {
   const [collections, setCollections] = useState<api.CollectionItem[]>([]);
   const [stats, setStats] = useState<any>(null);
   const collectionsRequestRef = useRef(0);
@@ -58,27 +67,75 @@ export default function SourcesPanel({ onBuildDone, selectedId, onSelectCollecti
   const [baseVideosLoading, setBaseVideosLoading] = useState(false);
   const [baseVideosError, setBaseVideosError] = useState('');
   const [removingVideoId, setRemovingVideoId] = useState<string | null>(null);
+  const [taskVideos, setTaskVideos] = useState<api.VideoItem[]>([]);
+  const [taskVideosError, setTaskVideosError] = useState('');
+  const [taskVideosTotal, setTaskVideosTotal] = useState(0);
+  const [taskVideosLoading, setTaskVideosLoading] = useState(false);
+
+  const fetchStats = useCallback(async () => {
+    const requestId = ++statsRequestRef.current;
+    try {
+      const r = await api.getKnowledgeStats();
+      if (r.success && requestId === statsRequestRef.current) {
+        setStats(r);
+        return true;
+      }
+    } catch {}
+    return false;
+  }, []);
 
   const baseCreated = (base: api.KnowledgeBaseItem) => {
     setKnowledgeBases(previous => [...previous.filter(item => item.id !== base.id), base]);
     setBasesRefreshKey(key => key + 1);
   };
   useEffect(() => {
-    if (!selectedKnowledgeBase) { setBaseVideos([]); return; }
     let active = true;
     setBaseVideos([]);
     setBaseVideosLoading(true);
     setBaseVideosError('');
-    api.listAllKnowledgeBaseVideos(selectedKnowledgeBase.id).then(videos => {
+    (selectedKnowledgeBase ? api.listAllKnowledgeBaseVideos(selectedKnowledgeBase.id) : selectedId !== 'all' ? api.listAllCollectionVideos(selectedId).then(videos => videos.filter(video => video.status === 'done')) : api.listAllKnowledgeVideos()).then(videos => {
       if (active) setBaseVideos(videos);
     }).catch(() => {
       if (active) setBaseVideosError('知识库内容加载失败，请重试。');
     }).finally(() => { if (active) setBaseVideosLoading(false); });
     return () => { active = false; };
-  }, [selectedKnowledgeBase?.id, statsRefreshKey, basesRefreshKey]);
+  }, [selectedKnowledgeBase?.id, selectedId, statsRefreshKey, basesRefreshKey]);
+
+  useEffect(() => {
+    if (!selectedKnowledgeBase) return;
+    const fresh = knowledgeBases.find(base => base.id === selectedKnowledgeBase.id);
+    if (fresh && (fresh.name !== selectedKnowledgeBase.name || fresh.video_count !== selectedKnowledgeBase.video_count || fresh.ready_count !== selectedKnowledgeBase.ready_count)) onKnowledgeBaseUpdated(fresh);
+  }, [knowledgeBases, selectedKnowledgeBase, onKnowledgeBaseUpdated]);
+
+  useEffect(() => {
+    if (view === 'collections' && expandedId === null && collections.length) setExpandedId(collections.find(item => item.collection_id === 'all')?.collection_id ?? collections[0].collection_id);
+  }, [view, collections, expandedId]);
+
+  useEffect(() => {
+    if (view !== 'progress') return;
+    let active = true;
+    let loading = false;
+    const refresh = async () => {
+      if (loading) return;
+      loading = true;
+      try {
+        const [result] = await Promise.all([api.listKnowledgeVideos('all'), fetchStats()]);
+        if (active) {
+          if (!result.success) throw new Error('加载失败');
+          setTaskVideos(result.items); setTaskVideosTotal(result.total); setTaskVideosError('');
+        }
+      } catch { if (active) setTaskVideosError('处理状态加载失败，请重新加载。'); }
+      finally { loading = false; if (active) setTaskVideosLoading(false); }
+    };
+    setTaskVideosLoading(true);
+    void refresh();
+    const timer = setInterval(refresh, 2500);
+    return () => { active = false; clearInterval(timer); };
+  }, [view, statsRefreshKey, videosRefreshKey, fetchStats]);
 
   const removeFromBase = async (video: api.VideoItem) => {
     if (!selectedKnowledgeBase || removingVideoId) return;
+    if (!confirm(`仅从“${selectedKnowledgeBase.name}”移出这个视频？原文字稿和其他知识库中的资料会保留。`)) return;
     setRemovingVideoId(video.platform_item_id);
     try {
       const result = await api.removeKnowledgeBaseVideo(selectedKnowledgeBase.id, video.platform_item_id);
@@ -94,18 +151,6 @@ export default function SourcesPanel({ onBuildDone, selectedId, onSelectCollecti
       const r = await api.listCollections();
       if (r.success && requestId === collectionsRequestRef.current) setCollections(r.items);
     } catch {}
-  }, []);
-
-  const fetchStats = useCallback(async () => {
-    const requestId = ++statsRequestRef.current;
-    try {
-      const r = await api.getKnowledgeStats();
-      if (r.success && requestId === statsRequestRef.current) {
-        setStats(r);
-        return true;
-      }
-    } catch {}
-    return false;
   }, []);
 
   const fetchSessions = useCallback(async () => {
@@ -195,6 +240,7 @@ export default function SourcesPanel({ onBuildDone, selectedId, onSelectCollecti
       if (r.success && r.task_id) {
         setBuildTotal(r.pending_count || 0);
         setSubmittedTaskId(r.task_id);
+        onChangeView('progress');
       } else {
         setBuilding(false);
         setBuildMessage(r.message || '没有可入库的视频');
@@ -237,7 +283,6 @@ export default function SourcesPanel({ onBuildDone, selectedId, onSelectCollecti
 
   const handleCollectionClick = (collectionId: string) => {
     if (chatBusy) return;
-    onSelectCollection(collectionId);
     setExpandedId(previous => previous === collectionId ? null : collectionId);
   };
 
@@ -281,7 +326,8 @@ export default function SourcesPanel({ onBuildDone, selectedId, onSelectCollecti
   const handleDelete = async (platformItemId: string) => {
     if (!confirm('确定要删除这个视频的全部文字稿和检索资料吗？\n\n它也会从所有知识库移除，需要时可重新识别入库。')) return;
     try {
-      await api.deleteVideo(platformItemId);
+      const result = await api.deleteVideo(platformItemId);
+      if (!result.success) throw new Error(result.message || '删除未完成，请稍后重试。');
       fetchStats();
       setVideosRefreshKey(key => key + 1);
       setBasesRefreshKey(key => key + 1);
@@ -333,234 +379,83 @@ export default function SourcesPanel({ onBuildDone, selectedId, onSelectCollecti
     return () => { cancelled = true; clearInterval(poll); };
   }, [activeTaskId, fetchStats, onBuildDone]);
 
+  const statusLabel = (status: string) => ({done: '可提问', failed: '失败', pending: '待入库', downloading: '下载中', transcribing: '转写中', embedding: '保存中'} as Record<string, string>)[status] || '处理中';
+  const videoActions = (video: api.VideoItem, inLibrary = false) => <ActionMenu label={`更多操作：${video.title}`}>
+      <button onClick={() => setViewingItemId(video.platform_item_id)}><FileAudio size={15} />查看识别结果</button>
+      {video.status === 'done' && <>
+        <button onClick={() => handleExport(video.platform_item_id, 'original')}><FileDown size={15} />导出原文与时间</button>
+        <button onClick={() => handleExport(video.platform_item_id, 'ai')}><ListChecks size={15} />AI 整理导出</button>
+      </>}
+      {inLibrary && selectedKnowledgeBase && <button onClick={() => removeFromBase(video)} disabled={chatBusy || Boolean(removingVideoId)}><FolderMinus size={15} />仅移出当前知识库</button>}
+      {video.status === 'done' && <button className="danger-action" onClick={() => handleDelete(video.platform_item_id)} disabled={chatBusy}><Trash2 size={15} />删除全部入库资料</button>}
+  </ActionMenu>;
+
   return (
-    <div className="h-full flex flex-col bg-[var(--color-panel)] border-r border-[var(--color-border)]">
-      <div className="flex-1 flex flex-col min-h-0 p-4 gap-3 overflow-y-auto">
+    <div className="sources-sidebar h-full flex flex-col">
+      <div className="flex-1 min-h-0 overflow-y-auto p-3 md:p-4">
         <KnowledgeBasesPanel selectedId={selectedKnowledgeBase?.id ?? null} refreshKey={statsRefreshKey + basesRefreshKey}
-          disabled={chatBusy} onListLoaded={setKnowledgeBases} onSelect={onSelectKnowledgeBase}
-          onRefresh={onBuildDone}
-          onCreated={base => { baseCreated(base); onSelectKnowledgeBase(base); }} />
-        {selectedKnowledgeBase && <div className="rounded-xl border border-[var(--color-border)] bg-white/50 p-3">
-          <h3 className="text-xs font-semibold text-[var(--color-ink)]">{selectedKnowledgeBase.name} · 视频资料</h3>
-          {baseVideosLoading ? <p className="mt-2 text-xs text-[var(--color-ink-muted)]">正在加载…</p>
-            : baseVideosError ? <p role="alert" className="mt-2 text-xs text-red-600">{baseVideosError} <button onClick={() => setBasesRefreshKey(key => key + 1)} className="underline">重试</button></p>
-            : baseVideos.length === 0 ? <p className="mt-2 text-xs leading-relaxed text-[var(--color-ink-muted)]">还没有视频。从下方收藏夹勾选视频，再导入到这个知识库。</p>
-            : <div className="mt-2 max-h-56 overflow-y-auto space-y-1.5">{baseVideos.map(video => <div key={video.platform_item_id} className="flex items-center gap-2 text-xs">
-              <button onClick={() => setViewingItemId(video.platform_item_id)} title={video.title} className="min-w-0 flex-1 truncate text-left text-[var(--color-ink)] hover:text-accent">{video.title}</button>
-              <span className={video.status === 'done' ? 'text-success' : 'text-[var(--color-ink-muted)]'}>{video.status === 'done' ? '已完成' : video.status === 'failed' ? '失败' : '处理中'}</span>
-              <button onClick={() => removeFromBase(video)} disabled={chatBusy || Boolean(removingVideoId)} title="只从这个知识库移出，保留原文字稿" className="flex-shrink-0 text-[var(--color-ink-muted)] hover:text-accent disabled:opacity-40">{removingVideoId === video.platform_item_id ? '移出中' : '移出'}</button>
-            </div>)}</div>}
-          <p className="mt-2 text-[10px] text-[var(--color-ink-muted)]">移出只调整当前知识库，原文字稿仍保留。</p>
-        </div>}
-        <hr className="border-[var(--color-border)]" />
-        {/* Header */}
-        <div className="flex items-center justify-between">
-          <h2 className="text-sm font-bold text-[var(--color-ink)]">📁 我的收藏夹</h2>
-          <button
-            onClick={handleSync}
-            disabled={syncing}
-            className="flex items-center gap-1 px-3 py-1.5 rounded-full text-xs text-[var(--color-ink-soft)] bg-black/3 hover:bg-black/6 transition-colors disabled:opacity-50"
-          >
-            {syncing ? '⏳' : '🔄'} 同步
-          </button>
-        </div>
-
-        <hr className="border-[var(--color-border)]" />
-
-        {/* Collections */}
-        <p className="text-[11px] text-[var(--color-ink-muted)]">展开收藏夹，勾选要入库的视频</p>
-        <div className="flex flex-col gap-2">
-          {collections.map(col => {
-            const isSelected = selectedId === col.collection_id;
-            const isExpanded = expandedId === col.collection_id;
-            return (
-              <div key={col.collection_id}>
-                <button
-                  onClick={() => handleCollectionClick(col.collection_id)}
-                  disabled={chatBusy}
-                  className={`w-full text-left p-2.5 rounded-xl transition-all border ${
-                    isSelected
-                      ? 'border-accent/40 bg-accent-light shadow-sm'
-                      : 'border-transparent hover:border-[var(--color-border)] hover:bg-white/60'
-                  }`}
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm font-semibold text-[var(--color-ink)] truncate flex-1">{col.title}</span>
-                    <span className="text-[11px] text-[var(--color-ink-muted)] ml-2 flex-shrink-0">
-                      {col.video_count} 个 {isExpanded ? '▲' : '▼'}
-                    </span>
-                  </div>
-                </button>
-                {/* Expanded video list */}
-                {isExpanded && (
-                  <div className="ml-3 mt-1 border-l-2 border-[var(--color-border)] pl-3 py-1">
-                    {loadingVideos ? (
-                      <p className="text-xs text-[var(--color-ink-muted)] py-2">加载中...</p>
-                    ) : videoLoadError ? (
-                      <div className="py-2 text-xs text-red-500">
-                        <p>{videoLoadError}</p>
-                        <button onClick={() => setVideosRefreshKey(key => key + 1)} className="mt-1 underline">重新加载</button>
-                      </div>
-                    ) : expandedVideos.length === 0 ? (
-                      <p className="text-xs text-[var(--color-ink-muted)] py-2">暂无视频，请先同步</p>
-                    ) : (
-                      <>
-                      {selectableVideos.length > 0 && (
-                        <div className="flex items-center justify-between gap-2 pb-1.5 text-[11px]">
-                          <button onClick={toggleCollection} disabled={building} className="text-accent hover:underline disabled:opacity-40">
-                            {allVisibleSelected ? '取消本收藏夹选择' : '全选本收藏夹'}
-                          </button>
-                          <button onClick={() => openBuildConfirm(expandedVideos, sourceForCollection(col.collection_id, expandedVideos))}
-                            disabled={building || chatBusy} title={`全部导入，并自动使用“${col.title}”作为知识库名称`}
-                            className="text-accent hover:underline disabled:opacity-40">整夹导入</button>
-                          <span className="text-[var(--color-ink-muted)]">{selectableVideos.filter(video => selectedVideos.has(video.platform_item_id)).length} / {selectableVideos.length}</span>
-                        </div>
-                      )}
-                      {expandedVideos.map(v => (
-                        <div key={v.platform_item_id} className={`flex items-center justify-between py-1.5 gap-2 rounded-md ${selectedVideos.has(v.platform_item_id) ? 'bg-accent-light' : ''}`}>
-                          <input
-                            type="checkbox"
-                            checked={selectedVideos.has(v.platform_item_id)}
-                            onChange={() => toggleVideo(v)}
-                            disabled={building || !['pending', 'failed', 'done'].includes(v.status)}
-                            aria-label={`选择视频：${v.title}`}
-                            title={v.status === 'done' ? '已有文字稿，可直接加入知识库' : '选择这个视频导入知识库'}
-                            className="w-4 h-4 flex-shrink-0 cursor-pointer accent-[var(--color-accent)] disabled:cursor-default disabled:opacity-40"
-                          />
-                          <button onClick={() => setViewingItemId(v.platform_item_id)} className="text-xs text-[var(--color-ink)] truncate flex-1 text-left hover:text-accent" title={v.status === 'failed' ? '查看入库失败原因' : `查看${resultDescription}`}>{v.title}</button>
-                          {v.status === 'done' && (
-                            <div className="flex gap-1 flex-shrink-0">
-                              <button onClick={() => handleExport(v.platform_item_id, 'original')}
-                                className="text-[10px] px-1.5 py-0.5 rounded hover:bg-black/5 transition-colors text-[var(--color-ink-muted)]"
-                                title={`导出${resultDescription}`}>📄</button>
-                              <button onClick={() => handleExport(v.platform_item_id, 'ai')}
-                                className="text-[10px] px-1.5 py-0.5 rounded hover:bg-black/5 transition-colors text-[var(--color-ink-muted)]"
-                                title="AI 整理导出">✨</button>
-                              <button onClick={() => handleDelete(v.platform_item_id)}
-                                className="text-[10px] px-1.5 py-0.5 rounded hover:bg-red-50 transition-colors text-[var(--color-ink-muted)] hover:text-red-500"
-                                title="删除入库数据">🗑️</button>
-                            </div>
-                          )}
-                          {v.status === 'failed' ? (
-                            <button onClick={() => setViewingItemId(v.platform_item_id)}
-                              aria-label={`查看入库失败原因：${v.title}`}
-                              className="text-[10px] ml-1 px-2 py-1 rounded-full flex-shrink-0 bg-red-50 text-red-600 hover:bg-red-100 transition-colors">
-                              ✗ 查看原因
-                            </button>
-                          ) : <span title={({done: '已入库', pending: '待入库'} as Record<string, string>)[v.status]} className={`text-[10px] ml-1 px-1.5 py-0.5 rounded-full flex-shrink-0 ${
-                            v.status === 'done' ? 'bg-success-light text-success' :
-                            v.status === 'pending' ? 'bg-amber-light text-amber' :
-                            'bg-black/5 text-[var(--color-ink-muted)]'
-                          }`}>
-                            {({done: '✓', pending: '⏳', downloading: '下载中', transcribing: '识别中', embedding: '保存中'} as Record<string, string>)[v.status] || '处理中'}
-                          </span>}
-                        </div>
-                      ))}
-                      </>
-                    )}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-
-        <hr className="border-[var(--color-border)]" />
-
-        {/* Build Section */}
-        <div className="flex flex-col gap-2">
-          <h3 className="text-xs text-[var(--color-ink-soft)]">📥 {building ? '入库进度' : '入库状态'}</h3>
-
-          {building ? (
-            <>
-              <p className="text-[11px] text-[var(--color-ink)] truncate">{buildMessage}</p>
-              <div className="h-2 rounded-full bg-black/5 overflow-hidden">
-                <div
-                  className="h-full rounded-full bg-gradient-to-r from-accent to-amber transition-all duration-700 ease-linear"
-                  style={{ width: `${buildTotal ? (buildProgress / buildTotal) * 100 : 0}%` }}
-                />
-              </div>
-              <div className="flex justify-between text-[11px]">
-                <span className="text-[var(--color-ink)] font-semibold">{buildProgress} / {buildTotal}</span>
-                <span className="text-accent font-bold">{buildTotal ? Math.round((buildProgress / buildTotal) * 100) : 0}%</span>
-              </div>
-              <button disabled className="w-full py-3 rounded-full text-sm font-bold transition-all opacity-40 cursor-not-allowed"
-                style={{ backgroundColor: 'rgba(0,0,0,0.06)', color: 'var(--color-ink-muted)' }}>
-                ⏳ 入库中...
-              </button>
-            </>
-          ) : (
-            <>
-              <p className="text-[11px] text-[var(--color-ink-muted)]">
-                ✅ {doneCount} 已入库 · ⏳ {pendingCount} 待入库{failedCount > 0 ? ` · ❌ ${failedCount} 失败` : ''}{isStuck ? ' · ⚠️ 卡住' : ''} · 📊 {totalCount} 总计
-              </p>
-              <div className="h-1.5 rounded-full bg-black/5">
-                <div className="h-full rounded-full bg-gradient-to-r from-accent to-amber transition-all duration-500" style={{ width: `${totalCount ? (doneCount / totalCount) * 100 : 0}%` }} />
-              </div>
-              <div className="flex items-center justify-between gap-2 text-xs pt-1">
-                <span className="font-semibold text-[var(--color-ink)]">已选 {selectedVideos.size} 个视频</span>
-                <button onClick={() => setSelectedVideos(new Map())} disabled={selectedVideos.size === 0} className="text-[var(--color-ink-muted)] hover:text-accent disabled:opacity-40">清空选择</button>
-              </div>
-              <p className="text-[11px] text-[var(--color-ink-muted)]">可跨收藏夹勾选，导入时选择目标知识库</p>
-              {failedCount > 0 && <p className="text-[11px] text-red-600">失败的视频可点“查看原因”，处理问题后再勾选重试。</p>}
-              {isStuck && (
-                <button
-                  onClick={handleResetInterrupted}
-                  disabled={resettingVideos}
-                  aria-busy={resettingVideos}
-                  className="w-full py-2 rounded-full text-xs text-accent border border-accent/30 hover:bg-accent-light transition-colors disabled:opacity-50"
-                >
-                  {resettingVideos ? '正在重置…' : '🔄 重置失败/卡住的视频'}
-                </button>
-              )}
-              <button
-                onClick={() => openBuildConfirm([...selectedVideos.values()])}
-                disabled={selectedVideos.size === 0}
-                className="w-full py-3 rounded-full bg-gradient-to-r from-accent to-accent-hover text-white text-sm font-bold shadow-md shadow-accent/20 hover:shadow-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                🚀 导入所选视频 ({selectedVideos.size})
-              </button>
-              <button
-                onClick={() => openBuildConfirm(undefined, sourceForCollection('all', []))}
-                disabled={allFavoriteCount === 0}
-                className="w-full py-2 rounded-full text-xs text-[var(--color-ink-soft)] border border-[var(--color-border)] hover:bg-white/60 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                导入全部收藏 ({allFavoriteCount})
-              </button>
-              {buildMessage && <p role="status" className="text-[11px] text-[var(--color-ink-muted)]">{buildMessage}</p>}
-            </>
-          )}
-        </div>
-
-        {/* History */}
-        <>
-            <hr className="border-[var(--color-border)]" />
-            <div className="flex flex-col gap-1.5">
-              <div className="flex items-center justify-between gap-2">
-                <h3 className="text-xs text-[var(--color-ink-soft)]">💬 历史对话</h3>
-                <button onClick={onNewChat} disabled={chatBusy} className="rounded-full border border-[var(--color-border)] px-2.5 py-1 text-xs text-accent hover:bg-accent-light disabled:opacity-40">＋ 新对话</button>
-              </div>
-              {historyError && <p role="alert" className="text-xs text-red-600">{historyError} <button onClick={fetchSessions} className="underline">重新加载</button></p>}
-              {historyLoading && sessions.length === 0 && <p className="py-2 text-xs text-[var(--color-ink-muted)]">正在加载历史对话…</p>}
-              {!historyLoading && !historyError && sessions.length === 0 && <p className="py-2 text-xs text-[var(--color-ink-muted)]">还没有历史对话，开始聊天后会自动保存。</p>}
-              {sessions.map(s => (
-                <div key={s.id} className={`flex items-center gap-1 rounded-lg border text-xs transition-colors ${activeSessionId === s.id ? 'border-accent/40 bg-accent-light' : 'border-transparent hover:bg-black/3'}`}>
-                  <button onClick={() => onSelectSession(s, knowledgeBases.find(base => base.id === s.knowledge_base_id) ?? null)} disabled={chatBusy || (s.knowledge_base_id != null && !knowledgeBases.some(base => base.id === s.knowledge_base_id))} aria-current={activeSessionId === s.id ? 'true' : undefined}
-                    title={chatBusy ? '请等待当前回答完成' : s.title} className="flex min-w-0 flex-1 items-center gap-2 px-2 py-2 text-left disabled:opacity-60">
-                    <span className="truncate flex-1 text-[var(--color-ink)]">{s.title}</span>
-                    <span title={`${s.message_count} 条消息`} className="flex-shrink-0 text-[var(--color-ink-muted)]">{s.message_count}</span>
-                  </button>
-                  <button onClick={() => setSessionAction({session: s, action: 'rename'})} disabled={chatBusy && activeSessionId === s.id}
-                    aria-label={`重命名对话：${s.title}`} title="重命名" className="h-7 w-7 flex-shrink-0 rounded-md text-[var(--color-ink-muted)] hover:bg-white hover:text-accent disabled:opacity-40">✎</button>
-                  <button onClick={() => setSessionAction({session: s, action: 'delete'})} disabled={chatBusy && activeSessionId === s.id}
-                    aria-label={`删除对话：${s.title}`} title="删除" className="mr-1 h-7 w-7 flex-shrink-0 rounded-md text-[var(--color-ink-muted)] hover:bg-red-50 hover:text-red-600 disabled:opacity-40">🗑</button>
-                </div>
-              ))}
-              {sessions.length === 100 && <p className="text-[11px] text-[var(--color-ink-muted)]">显示最近 100 段对话</p>}
-            </div>
-        </>
+          disabled={chatBusy || chatOnly} onListLoaded={setKnowledgeBases} onSelect={onSelectKnowledgeBase}
+          onRefresh={onBuildDone} onCreated={base => { baseCreated(base); onSelectKnowledgeBase(base); }} />
+        <section className="history-section" aria-label="历史对话">
+          <div className="flex items-center justify-between mb-3"><h2 className="section-title"><History size={16} />历史对话</h2><span className="text-xs text-[var(--color-ink-muted)]">自动保存</span></div>
+          {historyError && <p role="alert" className="text-xs text-red-600">{historyError} <button onClick={fetchSessions} className="underline">重新加载</button></p>}
+          {historyLoading && sessions.length === 0 && <p className="text-xs text-[var(--color-ink-muted)]">正在加载历史对话…</p>}
+          {!historyLoading && !historyError && sessions.length === 0 && <p className="text-xs text-[var(--color-ink-muted)] leading-relaxed">还没有对话。提问后会自动保存，方便下次继续。</p>}
+          {sessions.map(s => <div key={s.id} className={`history-row ${activeSessionId === s.id ? 'active' : ''}`}>
+            <button onClick={() => onSelectSession(s, knowledgeBases.find(base => base.id === s.knowledge_base_id) ?? null)} disabled={chatBusy || (s.knowledge_base_id != null && !knowledgeBases.some(base => base.id === s.knowledge_base_id))} aria-current={activeSessionId === s.id ? 'true' : undefined} title={s.title} className="history-open">
+              <MessageCircle size={14} className="shrink-0" /><span className="truncate">{s.title}</span>
+            </button>
+            <ActionMenu label={`管理对话：${s.title}`}>
+              <button onClick={() => setSessionAction({session: s, action: 'rename'})} disabled={chatBusy && activeSessionId === s.id}><Pencil size={15} />重命名</button>
+              <button className="danger-action" onClick={() => setSessionAction({session: s, action: 'delete'})} disabled={chatBusy && activeSessionId === s.id}><Trash2 size={15} />删除对话</button>
+            </ActionMenu>
+          </div>)}
+          {sessions.length === 100 && <p className="mt-2 text-xs text-[var(--color-ink-muted)]">显示最近 100 段对话</p>}
+        </section>
       </div>
+      {!chatOnly && <div className="sidebar-footer"><button className="task-shortcut" onClick={() => onChangeView('progress')}><AudioLines size={19} /><span><strong>{building || processingCount ? '视频正在处理中' : '处理进度'}</strong><small>{doneCount} 可提问{failedCount ? ` · ${failedCount} 个失败待处理` : ' · 查看导入状态'}</small></span><ChevronRight size={16} /></button></div>}
 
+      {contentContainer && view !== 'chat' && createPortal(<div className="source-workspace">
+        {view === 'materials' && <>
+          <div className="page-section-heading"><div><h3>视频资料</h3><p>完整文字稿、逐段时间和处理结果</p></div><button className="ui-button" onClick={() => onChangeView('collections')} disabled={chatBusy}><FolderInput size={16} />添加视频</button></div>
+          {baseVideosLoading ? <p role="status" className="empty-hint">正在加载视频资料…</p> : baseVideosError ? <p role="alert" className="empty-hint text-red-600">{baseVideosError} <button onClick={() => setBasesRefreshKey(key => key + 1)} className="underline">重新加载</button></p> : baseVideos.length === 0 ? <div className="empty-resource"><FileAudio size={30} /><h3>还没有可查看的视频</h3><p>从收藏夹选择视频，导入到知识库后就能查看文字稿。</p><button className="ui-button ui-button-primary" onClick={() => onChangeView('collections')}>从收藏夹导入</button></div> : <div className="resource-list">{baseVideos.map(video => <div key={video.platform_item_id} className="resource-row">
+            <span className="resource-icon"><FileAudio size={20} /></span><button className="resource-title" onClick={() => setViewingItemId(video.platform_item_id)}><strong>{video.title || '未命名视频'}</strong><small>{video.author ? `@${video.author} · ` : ''}{video.duration ? `${Math.floor(video.duration / 60)}:${String(video.duration % 60).padStart(2, '0')} · ` : ''}查看完整识别结果</small></button>
+            <span className={`status-badge ${video.status === 'failed' ? 'status-failed' : ''}`}>{video.status === 'done' && <Check size={13} />}{statusLabel(video.status)}</span>{videoActions(video, true)}
+          </div>)}</div>}
+          <p className="mt-5 text-xs text-[var(--color-ink-muted)] leading-relaxed">“移出”仅调整当前知识库；“删除全部入库资料”会影响所有知识库。原始导出保留完整文字稿与时间，AI 整理导出会额外调用模型。</p>
+        </>}
+        {view === 'collections' && <>
+          <div className="page-section-heading"><div><h3>选择收藏的视频</h3><p>支持跨收藏夹选择，再统一指定目标知识库。</p></div><button className="ui-button" onClick={handleSync} disabled={syncing || building}><RefreshCw size={15} className={syncing ? 'animate-spin' : ''} />{syncing ? '同步中…' : '同步收藏夹'}</button></div>
+          <div className="collection-workspace"><nav className="collection-navigation" aria-label="抖音收藏夹">{collections.map(col => <button key={col.collection_id} onClick={() => handleCollectionClick(col.collection_id)} disabled={chatBusy} aria-pressed={expandedId === col.collection_id} className={expandedId === col.collection_id ? 'active' : ''}><span>{col.title}</span><small>{col.video_count}</small></button>)}{collections.length === 0 && <p className="empty-hint">还没有收藏夹，点击同步后再查看。</p>}</nav>
+          <div className="min-w-0">
+            {loadingVideos ? <p role="status" className="empty-hint">正在加载视频…</p> : videoLoadError ? <p role="alert" className="empty-hint text-red-600">{videoLoadError} <button onClick={() => setVideosRefreshKey(key => key + 1)} className="underline">重新加载</button></p> : !expandedId ? <p className="empty-hint">选择一个收藏夹查看视频。</p> : expandedVideos.length === 0 ? <p className="empty-hint">这个收藏夹暂无视频。</p> : <>
+              <div className="collection-selection-heading"><label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={allVisibleSelected} onChange={toggleCollection} disabled={building || !selectableVideos.length} aria-label="全选本收藏夹" />全选本收藏夹</label><button className="text-button" onClick={() => openBuildConfirm(expandedVideos, sourceForCollection(expandedId, expandedVideos))} disabled={building || chatBusy}>整夹导入<ChevronRight size={14} /></button></div>
+              {expandedVideos.map(video => <div key={video.platform_item_id} className={`collection-video-row ${selectedVideos.has(video.platform_item_id) ? 'selected' : ''}`}>
+                <input type="checkbox" checked={selectedVideos.has(video.platform_item_id)} onChange={() => toggleVideo(video)} disabled={building || !['pending', 'failed', 'done'].includes(video.status)} aria-label={`选择视频：${video.title}`} />
+                <button className="resource-title" onClick={() => setViewingItemId(video.platform_item_id)}><strong>{video.title || '未命名视频'}</strong><small>{video.author ? `@${video.author}` : '作者未知'}{video.duration ? ` · ${Math.floor(video.duration / 60)}:${String(video.duration % 60).padStart(2, '0')}` : ''}</small></button>
+                <button onClick={() => setViewingItemId(video.platform_item_id)} className={`status-badge ${video.status === 'failed' ? 'status-failed' : ''}`} aria-label={video.status === 'failed' ? `查看入库失败原因：${video.title}` : `查看视频状态：${video.title}`}>{video.status === 'failed' ? '查看失败原因' : statusLabel(video.status)}</button>{videoActions(video)}
+              </div>)}
+              <button className="text-button mt-5" onClick={() => onSelectCollection(expandedId)} disabled={chatBusy}><MessageCircle size={15} />在此收藏夹的已入库资料中提问</button>
+            </>}
+          </div></div>
+          <div className="selection-toolbar"><div><strong>已选 {selectedVideos.size} 个视频</strong><small>切换收藏夹保留已选视频，确认导入时选择知识库。</small></div><button className="text-button" onClick={() => setSelectedVideos(new Map())} disabled={!selectedVideos.size || building}>清空</button><button className="ui-button ui-button-primary" onClick={() => openBuildConfirm([...selectedVideos.values()])} disabled={!selectedVideos.size || building || chatBusy}><Download size={16} />导入所选视频 ({selectedVideos.size})</button></div>
+          <button className="text-button mt-4" onClick={() => openBuildConfirm(undefined, sourceForCollection('all', []))} disabled={allFavoriteCount === 0 || building || chatBusy}>导入全部收藏 ({allFavoriteCount})</button>
+        </>}
+        {view === 'progress' && <>
+          <div className="page-section-heading"><div><h3>当前处理状态</h3><p>下载音频 → 声音转文字 → 整理入库</p></div><button className="ui-button" onClick={onBuildDone}><RefreshCw size={15} />刷新状态</button></div>
+          <div className="processing-summary"><span>{doneCount} 可提问</span><span>{processingCount} 处理中</span><span>{pendingCount} 待入库</span><span>{failedCount} 失败</span><small>{totalCount} 个视频总计</small></div>
+          {building && <div className="processing-current"><div className="flex gap-3 items-start"><AudioLines size={22} /><div className="min-w-0"><strong>正在处理视频</strong><p className="mt-2 text-sm break-words">{buildMessage || '正在读取进度…'}</p></div></div><div className="processing-track"><div style={{width: `${buildTotal ? buildProgress / buildTotal * 100 : 0}%`}} /></div><p className="mt-2 text-xs text-[var(--color-ink-muted)]">已完成 {buildProgress} / {buildTotal} 个视频</p></div>}
+          {taskVideosLoading && <p role="status" className="empty-hint">正在读取视频状态…</p>}
+          {taskVideosError && <p role="alert" className="text-sm text-red-600">{taskVideosError} <button className="underline" onClick={() => setVideosRefreshKey(key => key + 1)}>重新加载</button></p>}
+          <div className="resource-list">{taskVideos.filter(video => video.status !== 'done').map(video => <div key={video.platform_item_id} className="resource-row flex-wrap"><span className="resource-icon"><FileAudio size={19} /></span><button className="resource-title" onClick={() => setViewingItemId(video.platform_item_id)}><strong>{video.title || '未命名视频'}</strong><small>{statusLabel(video.status)}</small></button>{video.status === 'failed' && <><button className="ui-button" onClick={() => setViewingItemId(video.platform_item_id)}>查看原因</button><button className="ui-button" disabled={building || chatBusy} onClick={() => { setSelectedVideos(previous => new Map(previous).set(video.platform_item_id, video)); const col = collections.find(item => item.id === Number(video.collection_id)); setExpandedId(col?.collection_id ?? 'all'); onChangeView('collections'); }}>选择重试<RotateCcw size={14} /></button></>}</div>)}</div>
+          {taskVideosTotal > taskVideos.length && <p className="mt-3 text-xs text-[var(--color-ink-muted)]">此处展示最近 {taskVideos.length} 个视频的未完成项。其他视频也可以从收藏夹查看。</p>}
+          {(isStuck || failedCount > 0) && <div className="mt-6"><button onClick={handleResetInterrupted} disabled={resettingVideos || building} aria-busy={resettingVideos} className="ui-button"><RefreshCw size={15} />{resettingVideos ? '正在重置…' : '重置失败/卡住的视频'}</button><p className="mt-2 text-xs text-[var(--color-ink-muted)]">任务进行期间不能重置；重置后重新选择需要导入的视频。</p></div>}
+          {buildMessage && !building && <p role="status" className="mt-4 text-sm text-[var(--color-ink-soft)]">{buildMessage}</p>}
+          {!building && !failedCount && !pendingCount && !taskVideosLoading && <div className="empty-resource"><Check size={28} /><h3>资料已准备好</h3><p>选择知识库，就可以开始提问。</p></div>}
+        </>}
+      </div>, contentContainer)}
+
+      {createPortal(<>
       {showBuildConfirm && (
         <BuildConfirmModal
           pendingCount={pendingCount}
@@ -590,6 +485,7 @@ export default function SourcesPanel({ onBuildDone, selectedId, onSelectCollecti
           setSessions(previous => previous.filter(session => session.id !== id));
           onSessionDeleted(id);
         }} />}
+      </>, document.body)}
     </div>
   );
 }

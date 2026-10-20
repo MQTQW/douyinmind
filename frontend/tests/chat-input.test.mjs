@@ -153,8 +153,12 @@ export function useEffect(effect, deps) {
 `);
 const jsxURL = asURL('export const jsx=(type,props)=>({type,props}); export const jsxs=jsx;');
 const traceURL = asURL('export default function ExecutionTrace() { return null; }');
+const markdownURL = asURL('export default function MessageContent() { return null; }');
+const clipboardURL = asURL('export function answerClipboardText(text) { return text; } export async function copyText() {}');
+const iconsURL = asURL('export const ArrowUp=()=>null, BookOpen=()=>null, Check=()=>null, Copy=()=>null, ExternalLink=()=>null, Sparkles=()=>null;');
 const { default: ChatPanel } = await import(await moduleURL('../src/components/ChatPanel.tsx', {
   react: reactURL, 'react/jsx-runtime': jsxURL, '../api': apiURL, './ExecutionTrace': traceURL,
+  './MessageContent': markdownURL, '../clipboard': clipboardURL, 'lucide-react': iconsURL,
 }));
 
 function findAll(node, predicate) {
@@ -183,11 +187,11 @@ test('ChatPanel rejects overlong pasted emoji before clearing input or adding me
     const { render, busy } = componentHarness();
     let tree = render();
     const pasted = `  ${'😀'.repeat(2001)}\n`;
-    findAll(tree, node => node.type === 'input')[0].props.onChange({ target: { value: pasted } });
+    findAll(tree, node => node.type === 'textarea')[0].props.onChange({ target: { value: pasted } });
     tree = render();
     await findAll(tree, node => node.type === 'form')[0].props.onSubmit({ preventDefault() {} });
     tree = render();
-    assert.equal(findAll(tree, node => node.type === 'input')[0].props.value, pasted);
+    assert.equal(findAll(tree, node => node.type === 'textarea')[0].props.value, pasted);
     assert.equal(findAll(tree, node => node.props?.className?.includes('chat-bubble')).length, 0);
     assert.equal(findAll(tree, node => node.props?.role === 'alert')[0].props.children, '问题请控制在2000字以内。');
     assert.ok(findAll(tree, node => Array.isArray(node.props?.children) && node.props.children.join('') === '2001/2000').length);
@@ -199,7 +203,7 @@ test('ChatPanel preserves whitespace-only input on submit and clears the inline 
   await withFetch(() => assert.fail('blank UI input must not fetch'), async () => {
     const { render, busy } = componentHarness();
     let tree = render();
-    const input = () => findAll(tree, node => node.type === 'input')[0];
+    const input = () => findAll(tree, node => node.type === 'textarea')[0];
     input().props.onChange({ target: { value: ' \n\t\u3000' } });
     tree = render();
     await findAll(tree, node => node.type === 'form')[0].props.onSubmit({ preventDefault() {} });

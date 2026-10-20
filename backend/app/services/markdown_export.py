@@ -134,7 +134,7 @@ def export_ai_organized(video: VideoCache) -> str:
     lines = [
         f"# {video.title}",
         "",
-        f"> 作者：{video.platform_item_id}",
+        f"> 视频编号：{video.platform_item_id}",
         f"> 链接：https://www.douyin.com/video/{video.platform_item_id}",
         f"> 导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         "",

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import * as api from '../api';
+import { CircleAlert, CircleCheck, ScanLine } from 'lucide-react';
 
 interface Props { onClose: () => void; onSuccess: () => void; }
 
@@ -32,11 +33,11 @@ export default function LoginModal({ onClose, onSuccess }: Props) {
         onClick={e => e.stopPropagation()}
       >
         <h2 className="font-display text-xl text-[var(--color-ink)]">
-          {status === 'success' ? '✅ 登录成功' : status === 'failed' ? '❌ 登录失败' : '🔐 登录抖音'}
+          {status === 'success' ? '登录成功' : status === 'failed' ? '登录失败' : '登录抖音'}
         </h2>
 
         <div className="w-48 h-48 rounded-xl bg-black/3 flex items-center justify-center">
-          <span className="text-5xl">{status === 'pending' ? '📱' : status === 'success' ? '✅' : '❌'}</span>
+          <span className="text-accent">{status === 'pending' ? <ScanLine size={52} /> : status === 'success' ? <CircleCheck size={52} /> : <CircleAlert size={52} />}</span>
         </div>
 
         <p className="text-sm text-[var(--color-ink-soft)] text-center">{message}</p>

@@ -156,6 +156,23 @@ export async function getKnowledgeStats(): Promise<any> {
   return request('/knowledge/stats');
 }
 
+export async function listKnowledgeVideos(status: 'done' | 'all' = 'done', page = 1, size = 100): Promise<{ success: boolean; items: VideoItem[]; total: number }> {
+  return request(`/knowledge/videos?status=${status}&page=${page}&size=${size}`);
+}
+
+export async function listAllKnowledgeVideos(): Promise<VideoItem[]> {
+  const videos = new Map<string, VideoItem>();
+  let loaded = 0;
+  for (let page = 1; ; page++) {
+    const result = await listKnowledgeVideos('done', page);
+    if (!result.success) throw new Error('已入库资料加载失败，请重试。');
+    result.items.forEach(video => videos.set(video.platform_item_id, video));
+    loaded += result.items.length;
+    if (loaded >= result.total) return [...videos.values()];
+    if (!result.items.length) throw new Error('已入库资料未加载完整，请重试。');
+  }
+}
+
 export type AnalysisMode = 'audio' | 'audio_visual';
 
 export interface ProcessingMetrics {

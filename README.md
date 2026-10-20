@@ -1,322 +1,206 @@
-# DouyinMind · 抖音收藏夹 RAG 知识库
+<p align="center">
+  <img src="docs/assets/cover.svg" alt="DouyinMind：收藏，成为你的知识" width="100%" />
+</p>
 
-> 把你的抖音收藏夹变成可搜索、可对话的个人知识库
+<p align="center">
+  <strong>把抖音收藏夹，变成可以搜索、回看和提问的个人知识库。</strong>
+</p>
 
-## 它能做什么
+<p align="center">
+  选择视频 · 保留完整文字稿 · 根据原文回答 · 回查引用来源
+</p>
 
-登录抖音 → 同步收藏夹 → 选择视频入库（音频提取 → 完整文字稿 → 可搜索资料）→ 对话问答
+<p align="center">
+  <a href="#界面预览">界面预览</a> ·
+  <a href="#它能帮你做什么">功能介绍</a> ·
+  <a href="#快速开始">快速开始</a> ·
+  <a href="docs/usage.md">使用指南</a> ·
+  <a href="docs/architecture.md">技术说明</a> ·
+  <a href="docs/evaluation.md">检索评测</a>
+</p>
 
-```
-收藏夹视频 → 提取音频 → Qwen3.8-Omni-Flash逐句转写 → 保存完整文字稿与时间信息 → 文字分段 → 资料检索数据转换 → ChromaDB → DeepSeek对话
-```
+---
+
+收藏了很多视频，却很难再找到当时讲过的那句话？
+
+DouyinMind 从你选择的视频中提取声音，保存带时间信息的完整文字稿，再从这些资料里找原文、生成回答。你可以按主题整理知识库，继续追问，并打开引用的视频核对内容。
+
+> 当前默认只分析声音，优先完善文字稿和问答。画面分析是可选配置；识别和回答仍可能出错，关键内容请结合原文及原视频核对。
+
+## 界面预览
+
+<p align="center">
+  <img src="docs/assets/workspace.png" alt="浅绿色工作台：知识库、历史对话、回答和引用来源" width="100%" />
+</p>
+
+<p align="center"><sub>实际项目界面，使用演示数据展示。图片不包含个人账号、收藏或聊天记录。</sub></p>
+
+<details>
+<summary><strong>选择视频，再决定放进哪个知识库</strong></summary>
+
+<br />
+
+支持跨收藏夹勾选、整夹导入和指定目标知识库。完整导入一个收藏夹时，默认用收藏夹名称创建或复用知识库；已经处理完成的视频会复用资料。
+
+<img src="docs/assets/import.png" alt="选择视频并使用浅绿色选择器指定目标知识库" width="100%" />
+
+</details>
+
+<details>
+<summary><strong>打开完整文字稿，回查时间和原文</strong></summary>
+
+<br />
+
+查看识别文字、逐段时间、警告和已记录的处理耗时，也可以导出原文或让 AI 整理成便于阅读的笔记。
+
+<img src="docs/assets/transcript.png" alt="视频详情中的完整文字稿和分段时间" width="100%" />
+
+</details>
+
+## 它能帮你做什么
+
+| 整理你的收藏 | 使用你的知识 |
+| --- | --- |
+| **按主题建库**<br />将课程、工具、读书或生活灵感归入不同知识库。一个视频可以属于多个库。 | **限定范围提问**<br />根据当前知识库中的已完成资料回答，历史对话保留原来的资料范围。 |
+| **选择性导入**<br />单选、跨收藏夹选择或整夹导入，处理完成的资料可以复用。 | **连续追问**<br />结合最近的问题查找资料，支持接着问步骤、原因和数字。模糊指代仍可能需要补充对象。 |
+| **保留完整文字稿**<br />声音分段并行识别，按视频原顺序合并，保留时间和识别警告。 | **回答可回查**<br />文字逐步出现，完成后显示实际引用来源；还能查看本次提供给 AI 的原文。 |
+| **查看处理情况**<br />查看下载、转写、保存状态、失败原因和已记录的各阶段耗时。 | **整理与导出**<br />管理历史对话，复制回答及来源；导出原文与时间，或生成 AI 整理笔记。 |
+
+**资料没写，就说明缺少依据。** 项目通过当前库范围、原文选择和回答规则减少无依据扩写；它不保证每次回答都正确。
+
+## 从收藏到提问
+
+1. **连接收藏**：扫码登录自己的抖音账号，同步收藏夹。
+2. **选好范围**：勾选视频，创建或选择目标知识库，确认导入。
+3. **等资料就绪**：查看处理进度，必要时检查识别警告和完整文字稿。
+4. **开始使用**：打开知识库提问、继续追问，或回到视频核对引用内容。
+
+没有登录抖音时，也可以在首页选择「先体验 AI 对话」。这需要配置回答服务；对收藏内容提问仍需先完成同步和入库。
 
 ## 快速开始
 
-### 前置条件
+### 1. 准备环境
 
-- Python 3.12+
-- Node.js 18+
-- ffmpeg（加入 PATH）
-- Chrome 或 Edge 浏览器
+| 环境 | 用途 |
+| --- | --- |
+| Python 3.12+ | 运行后台程序 |
+| Node.js 22+ | 安装和运行网页开发工具 |
+| ffmpeg，加入系统 PATH | 从视频提取声音并分段；PATH 是系统查找程序的位置列表 |
+| Chromium 浏览器 | 由下方 Playwright 安装命令准备，用于扫码和读取收藏 |
 
-### 1. 安装后端依赖
+以下命令以 **Windows PowerShell（命令窗口）** 为例。模型服务需要自行开通，模型名称和服务区域以自己的账号可用配置为准。
+
+### 2. 下载项目并安装后台
 
 ```powershell
-cd backend
-pip install uv
+git clone https://github.com/MQTQW/douyinmind.git
+cd douyinmind/backend
+
+python -m pip install uv
 uv sync --python 3.12
-playwright install chromium
+uv run playwright install chromium
+
+# 保留已有配置；首次运行才复制模板
+if (!(Test-Path .env)) { Copy-Item .env.example .env }
 ```
 
-### 2. 配置环境变量
+打开本地 `backend/.env`，填写自己的服务密钥：
+
+| 配置 | 用途 |
+| --- | --- |
+| `DEEPSEEK_API_KEY` | 生成文字回答 |
+| `DASHSCOPE_API_KEY` | 声音识别及将文字转换为可检索的数字表示 |
+| `QWEN_OMNI_API_KEY` | 可选；声音模型使用单独密钥时填写，否则复用百炼密钥 |
+| `QWEN_OMNI_BASE_URL`、`EMBEDDING_BASE_URL` | 与密钥所属服务区域保持一致 |
+
+模板使用 `deepseek-flash`、`qwen3.8-omni-flash` 和 `text-embedding-v4` 作为模型标识。请保留在本地配置中，按自己账号的可用模型调整；不要把实际密钥写进源码或提交记录。
+
+### 3. 安装网页依赖
 
 ```powershell
-cp .env.example .env
-# 编辑 .env，至少填入：
-#   DASHSCOPE_API_KEY=你的百炼密钥（声音/画面识别与资料检索使用）
-#   DEEPSEEK_API_KEY=你的DeepSeek API Key
-#   QWEN_OMNI_MODEL=qwen3.8-omni-flash
-#   QWEN_OMNI_BASE_URL 与 EMBEDDING_BASE_URL 按密钥所属区域填写
+# 从 backend 返回项目目录，再进入 frontend
+cd ../frontend
+npm ci
+cd ..
 ```
 
-### 3. 安装前端依赖
+### 4. 启动并打开
+
+Windows 下双击项目根目录的 **`启动项目.bat`**，然后打开：
+
+- 网页：[http://127.0.0.1:5173](http://127.0.0.1:5173)
+- 后台状态：[http://127.0.0.1:8000](http://127.0.0.1:8000)
+- 接口说明：[http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+
+保持启动窗口打开；已运行的本项目服务会被复用。日志保存在本地 `backend/app/storage/local_services/`。
+
+<details>
+<summary><strong>分别在两个终端启动</strong></summary>
 
 ```powershell
-cd frontend
-npm install
-```
-
-### 4. 启动
-
-Windows 本地依赖已安装后，可直接双击项目根目录的 `启动项目.bat`。请保持启动窗口打开；按 Ctrl+C 可停止该窗口启动的服务。已经运行的本项目服务会直接复用，其他程序占用端口时会提示，不会关闭其他程序。启动日志保存在 `backend/app/storage/local_services`，不会上传到 Git。
-
-也可分别在两个终端中启动：
-
-```powershell
-# 终端1：后端
+# 终端一：在项目根目录执行
 cd backend
-uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
 
-# 终端2：前端
+```powershell
+# 终端二：在项目根目录执行
 cd frontend
-npm run dev
+npm run dev -- --host 127.0.0.1 --port 5173 --strictPort
 ```
 
-打开 http://localhost:5173
+后台代码开发时可以自行加 `--reload`。正在导入视频时，先等任务完成再重新加载后台，避免中断处理。
 
-## 使用流程
+</details>
 
-1. 点击「扫码登录」→ 浏览器自动打开抖音登录页 → 扫码
-2. 登录成功后，点击「同步」拉取收藏夹
-3. 在「我的知识库」点击「新建」，输入主题名称；也可以在导入确认窗口中创建
-4. 展开收藏夹，勾选需要的视频（可跨收藏夹选择），点击「导入所选视频」，选择目标知识库再确认；点击「整夹导入」或选中当前收藏夹全部视频时，默认自动使用收藏夹名称创建知识库，已有同名库直接复用。只选部分或跨夹混选时仍手动选择目标库；「导入全部收藏」默认命名为「全部收藏」
-5. 选中知识库，在右侧对话区根据库内已完成的视频提问
+## 原文怎样变成回答
 
-一个视频可放入多个知识库。已完成识别的视频直接复用文字稿和检索资料，不再次调用 AI；新视频或失败重试才进行识别。旧的已入库视频仍保留在「全部已入库资料」，也可勾选加入新库。「移出」只删除当前知识库的归类，原文字稿保留；收藏夹中的「删除入库数据」会删除全局资料，并从所有知识库移除。
+**收藏视频 → 提取声音 → 完整文字稿 → 查找相关原文 → 生成带来源的回答**
 
-知识库检索、视频列表和总结均限定当前库中的已完成视频；空库不会从其他库补充资料。切换知识库会开始新的对话，历史对话记住所属知识库，重新打开时恢复对应范围。抖音取消收藏或再次同步不会清空已经归入知识库的资料。
+这叫 **RAG（检索增强生成）**：先找资料，再根据资料回答。当前组合使用按意思查找与关键词查找，并保留时间、资料范围和实际引用。
 
-回答会随着 AI 生成逐步显示，完成后显示来源和检索过程。连接中断或生成失败时，页面保留已收到的文字并显示提示；未完成的回答不会写入聊天记录。
+<details>
+<summary><strong>技术组成和检索规则</strong></summary>
 
-每个问题支持去掉首尾空白后最多2000个字符。普通中文或😀这类表情通常各计1，组合表情可能计多个单位，以输入框显示的计数为准。过长时保留输入并提示修改，不会悄悄截掉后半句。单纯问候可以直接交流；“你好，请解释视频中的步骤”仍会查找正文，英文单词中的 `hi` 也不会被当成问候。
+| 组件 | 在项目中做什么 |
+| --- | --- |
+| React、TypeScript、Vite | 构建和运行网页界面 |
+| FastAPI | 接收网页请求的后台开发工具 |
+| SQLite | 本地数据库，记录视频、知识库归类和聊天 |
+| ChromaDB | 保存查找资料所需的数字表示，帮助按意思找到原文 |
+| Qwen Omni | 听音频并生成完整文字稿；可选识别画面 |
+| DeepSeek | 根据提供的原文生成回答 |
+| Playwright、ffmpeg | 分别负责浏览器操作、声音提取与分段 |
 
-“那两个数字呢”“它为什么这样”等明确追问，会在查找前附带最近最多3条用户问题作为线索，历史线索总计不超过1000字符，当前问题保持完整。旧的助手回答不进入这一步，避免把之前的猜测当成事实；切换知识库仍需要新建对话。主体只在助手回答里出现或指代不明确时，这套规则不保证能自动识别，应明确写出想问的对象。
+检索默认最多合并 32 条语义候选与范围内的关键词结果，选取最多 8 个正文片段，原文总预算为 8000 个字符。这个预算限制的是本次交给回答模型的资料，不会截短已保存的完整文字稿。
 
-内容问答先排除仅有标题和作者的记录，再从候选中选择正文，直接保留原话、时间及声音/画面类型，不生成中间摘要来替代资料。默认将最多32条语义候选与当前范围内的正文关键词查找进行融合排序，优先覆盖不同子问题并减少重复片段；最多提供8个正文片段，仍受8000字符总预算限制。原文未提供的数字、路径、命令参数或功能要明确说明缺少依据，不主动用通用知识补齐；多项提问逐项回答，不限为3点。
+中间不生成摘要替代证据；相邻句补全只使用同一视频、同一来源的可靠原文。无答案、含糊追问和长视频覆盖仍需要实际评测。
 
-命中固定字符块后，只从同一视频、同一声音/画面来源且有可靠原文重叠的相邻块补齐句子，总新增最多350字符，不重写文字稿、不重建索引。超长候选放不下时继续检查后续较短候选；首块过长只在完整句/行边界截取并明确标记未提供的后文。实际参与补句的原始块编号会进入检索追踪和已引用来源记录。
+查看 [结构与检索规则](docs/architecture.md) · [声音识别与处理耗时](docs/audio.md)。
 
-问题转换为检索数字的网络请求使用独立超时配置 `QUERY_EMBEDDING_TIMEOUT_SECONDS=5`，不额外重试，也不改变视频入库的批量转换规则。它是网络阶段超时，不是完整回答必须在5秒内结束。明确的临时超时、连接故障、限流或服务端故障发生时，组合查找可以继续使用当前范围的关键词匹配；页面会标为“关键词查找（后备）”，这类来源不会显示虚假的语义相似分数。密钥权限、配置、无效数据或本地索引错误仍然报错，不会伪装成成功或空知识库。关键词后备也可能漏掉用词差别很大的资料，不代表与正常查找效果完全相同。
+</details>
 
-展开回答下方的查找过程，可查看理解问题、按含义查找、读取原文、合并关键词结果、补齐相邻句各自耗时，以及实际交给回答模型的片段数与字符数。细分耗时已包含在上方查找时间里，不重复相加；检索候选数与最终提供的片段数分别记录。服务报错只使用固定中文提示和错误码，不把第三方服务的原始异常返回到聊天页面或聊天错误日志。
+## 数据与费用
 
-每个片段可展开“查看本次提供的原文”，核对预览后面的限制、数字和时间；文字可选中，长片段可滚动查看。它展示这次实际交给AI的片段，不是整篇文字稿，也不表示每段都被回答引用；整篇文字稿仍从视频详情查看。旧的历史记录如果没有保存这些片段，不补造完整原文。
+**私人资料保留在本机，模型调用使用配置的外部服务。**
 
-来源在回答完成后，根据回答实际标注与本次正文白名单返回；没有引用时不会把所有检索结果自动追加为参考来源。对话历史保存相同的已引用来源，重新打开也不会将未使用的候选当作依据。历史助手回答仅作对话背景，不作为事实证据。
+`.env`、账号登录状态、数据库、收藏记录、聊天、文字稿、音视频及私人评测结果由忽略规则排除，不应提交 GitHub。转写会向识别服务发送所选音频；问答会向回答服务发送问题及选出的原文。保存在本地不代表模型服务从未接收资料。
 
-左侧「历史对话」可点击打开、查看之前的消息并继续提问，选中的对话会高亮。每行右侧可重命名或删除；删除需要确认，并会删除这一段对话中的全部消息。点击「新对话」可单独开始一次聊天。回答生成期间暂时不能切换或删除当前对话，避免未完成的回答进入其他会话。
+回答、声音识别和文字检索转换都可能产生服务费用，额外补听也可能计费。项目不读取实际账单，价格和额度以服务商控制台为准。
 
-首页的「先体验 AI 对话」可在未登录抖音时打开聊天，只需配置 DeepSeek 密钥即可。此时不会使用收藏视频；收藏内容问答仍需扫码登录、同步和入库。窄窗口可通过顶部「收藏夹」按钮切换资料面板与聊天。
+## 继续了解与参与
 
-本地 `.env` 配置中的 `LLM_MODEL=deepseek-flash` 对应 DeepSeek 4.1 Flash。`LLM_THINKING_ENABLED=false` 关闭深度思考，让回答更快开始显示。
+| 文档 | 内容 |
+| --- | --- |
+| [使用指南](docs/usage.md) | 导入、知识库范围、历史对话、导出与常见问题 |
+| [结构与检索规则](docs/architecture.md) | 技术分工、核心目录、连续追问和原文选择 |
+| [声音识别与耗时](docs/audio.md) | 分段并行、失败复用、交界补听和计时口径 |
+| [检索与回答评测](docs/evaluation.md) | 用自己的资料准备考卷，保留前后对比 |
+| [更新记录](CHANGELOG.md) | 已完成的功能和修复 |
 
-## 上传范围与本地隐私
+欢迎通过 [Issues](https://github.com/MQTQW/douyinmind/issues) 反馈问题。提交时请说明操作步骤和经过脱敏的错误提示，避免附上密钥、登录状态或私人文字稿。
 
-仓库只包含源码（应用的程序文件）、通用测试、依赖清单和配置模板。使用者需要填写自己的密钥，并扫码登录自己的账号。
-
-以下内容保留在使用者电脑上，不随 Git 上传：
-
-- `.env` 等本地配置中的实际密钥；`.env.example` 仅保留空值与示例。
-- Cookie（相当于已登录账号的通行证）、浏览器登录资料和登录状态文件。
-- `backend/app/storage/` 内的数据库、收藏记录、知识库归类、聊天历史、文字稿、音视频、检索索引和识别缓存。
-- 含实际问题、回答、原文或回听片段的评测结果、个人持续优化记录，以及绑定本机资料的实验脚本。
-- 本机截图、运行日志、依赖目录和编译缓存。
-
-不要将这些私人文件复制到 `frontend/public/` 或其他源码目录；网页静态目录中的文件可以被访问者读取。忽略规则不会清除已经上传过的 Git 历史，也不能代替提交前检查。
-
-模型调用的资料流与 Git 上传分开：正常转写会把所选音频发送给配置的识别服务，问答会把问题及检索到的原文发送给回答服务。以上忽略规则保护仓库上传范围，不表示模型服务从未接收资料。
-
-### 首版：完整音频文字稿
-
-当前默认 `KNOWLEDGE_ANALYSIS_MODE=audio`，使用 `qwen3.8-omni-flash`，只提取和识别音频。默认每 60 秒一段，同时识别最多 3 段（`AUDIO_TRANSCRIPTION_CONCURRENCY=3`，范围1–4，设1恢复逐段处理）。每段完整听写，全部片段处理完后按原时间合并，不用摘要替代文字稿。文字、原始响应和警告均按视频顺序保存，进度显示已成功完成的片段数，而非当前启动到第几段。
-
-识别结果格式错误、时间越界或返回被截断时，会先自动重试，再按需要拆成较短音频重新听写；每个原始分段最多进行10次识别尝试、最多拆分两层，权限和账户错误不触发分段重试。连接服务时的底层网络重试另计，实际网络请求次数不等同此处的识别尝试数。通过校验的进度与失败响应保存在音频旁的本地文件中，再次处理相同音频和配置时复用成功分段；所有分段完成后才标记入库成功，不跳过失败内容。
-
-拆成两半后，如果前半已成功、后半失败，重试也会读取并重新校验已保存的成功半段，不重复识别它。音频内容或模型、提示词等识别配置变化时不会混用旧结果；完整原始分段复用数与拆分子段复用数分别记录，缓存命中不算一次新的识别请求。
-
-默认采用打包并行补听：最多12个交界，各取前后5秒，放入至多两包互不连续的短原声；另用一包前后4秒的独立窗口确认最多4处重复汉字。最多3包同时处理，并受主音频并发设置约束（`AUDIO_BOUNDARY_BATCH_ENABLED=true`、`AUDIO_BOUNDARY_BATCH_MAX_WINDOWS=12`）。短视频可覆盖全部切点；更长视频在固定预算内兼顾明显症状和分散位置。补听文字必须与两侧足够长、唯一、顺序一致的原话对应，才允许改中心极小范围；窗口两端从不整段覆盖原稿。
-
-涉及数值、单位、否定、英文内容、删字或歧义仍保守回退。唯一新增的删字例外是：主切点左右恰好重复同一汉字，两个不同范围原声的识别都逐字支持同一结果，且只删除这个交界重复字，其他字母、数值字符、单位和符号没有任何别的改动。正常复述或两次识别不一致时保留原稿。模型提示“短窗开头/结尾可能截断”会保留在记录中；只有这类明确边缘提示可继续核对中心，“听不清”和未知警告仍拒改。补听只返回文字，用实际原声窗口定位；最终合并保留原主稿的时间包络，不让模型重新估计句子时间。
-
-这会增加音频输入与识别成本。一段相同12分34秒音频的旧实测为13主段+4逐窗补听，81.563秒、补听16.172秒；打包新实测为13主段+3包，55.172秒、补听12.656秒，检查4→12个交界。两次主转写和网络有随机波动，不能把全部总耗时差异归因于新补听，也不代表固定提速。新实测当时采用5处；随后仅修正边缘提示分类，对同批全部响应离线重放采用9处（7处字词、2处断句），没有重抽模型。请求数减少不代表费用下降：新检查覆盖更多原声，补听输入量增加，未读取账单。每个补听网络阶段20秒、无SDK重试；60秒后停止发新请求，流读取也检查截止并关闭。这并非严格60秒整硬取消。异常时保留原稿。`AUDIO_BOUNDARY_REVIEW_ENABLED=false`关闭所有补听；`AUDIO_BOUNDARY_BATCH_ENABLED=false`退回最多4窗的旧方式。
-
-原主段响应、补听响应、原记录、锚点与接受/回退理由分别保留；补听缓存独立于主段缓存，并绑定音源、模型、提示词、策略和本次主段原文。`audio_processing` 分开记录主段/恢复识别次数、补听次数、补听复用数及总识别次数；普通生产记录不冒称精确网络次数。合并记录沿用完整原记录的时间包络，因此时间可能较粗，不代表逐字对齐。已有完成的正式文字稿不会因升级自动重写。
-
-并行处理不改变分段长度、听写提示或识别校验规则，已有成功片段仍可复用。某段失败时停止继续提交新片段，等已经开始的片段保存结果后整体报错，重试只处理尚未成功的片段。程序还会检查分段是否连续覆盖完整音频；这能防止处理流程漏段，但模型是否听错或漏听仍需对照原声检查。并发度和尝试次数随识别结果保存在 `audio_processing` 中，便于比较耗时。升级时先等当前导入结束，再重启服务加载新代码，避免中断正在处理的视频。
-
-意外关闭后台后，卡在“下载中/识别中/保存中”的视频可使用“重置失败/卡住的视频”恢复为待处理，再手动勾选导入；这不会删除已有文字稿或成功分段。重置后列表会刷新，服务忙碌时会明确提示，恢复动作本身不调用AI。准备提交、排队或执行入库时不允许重置；重置期间也不接受新的入库提交，避免误改活跃状态。
-
-上述任务协调面向本项目的单后台进程，不提供多后台进程共用资料目录的保证。数据库归类与内存任务队列仍是两次提交：如果极少见的队列发布异常发生在归类完成后，归类可能已保存而任务未排队；程序不会为掩盖错误自动补发任务。
-
-抖音媒体下载复用项目中已登录的浏览器，从所选视频网页取得当前播放资源。平台只提供完整视频文件时，会先下载到本地再提取声音，不进行画面分析。下载会核验视频编号、完整文件和音轨，残缺缓存不会当作成功下载；若抖音页面要求人工验证，应在正常浏览器中完成后重试。失败视频旁的「查看原因」会显示中文说明及可展开的技术详情。
-
-- 保存完整文字稿、逐段时间记录和原始模型返回。
-- 模型返回被截断、时间越界或结果格式不完整时，任务报错，不将其标记为成功。
-- 首版没有可识别人声的视频暂无文字稿可入库；画面分析不自动作为替代处理。
-- 点击视频标题可查看「完整文字稿」和时间记录，并导出完整结果。
-- 文字稿进入资料检索，后续问答继续使用已配置的 DeepSeek。
-- 资料检索转换失败时，已完成的文字稿仍保留，可查看后重试。
-
-画面分析保留为后续可开启功能：将 `KNOWLEDGE_ANALYSIS_MODE` 改为 `audio_visual` 后，新入库视频会同时进行声音转写与画面分析。已保存的旧画面结果仍可查看和导出，切换模式不清除已有资料。
-
-模型识别可能存在听不清或看不清的内容；相关不确定性会保存在结果中。实际模型支持范围与分段限制见[千问官方文档](https://www.alibabacloud.com/help/en/model-studio/qwen-omni)。
-
-### 流式回答验证
-
-```powershell
-# 前端：验证分批消息解析、中文和表情、收藏夹参数、断线处理
-cd frontend
-npm test
-npm run build
-
-# 后端：使用模拟 AI 服务和临时数据库验证逐步输出、聊天记录和错误处理
-cd ../backend
-python -m pytest tests/test_chat_stream.py
-```
-
-## 检索考卷：用同一套问题比较优化前后
-
-`backend/scripts/evaluate_retrieval.py` 用已标注的问题、正确视频、原话和时间检查检索。评分区分“找到正确视频”“找到至少一条支持答案的原文”和“找到全部标注依据”；只找到标题不算找到答案依据。还会单独记录问题是否被分到只查标题等流程。
-
-提问时，只有明确索要视频或标题清单（例如「有哪些视频」「关于 Git 的视频有哪些」）才只列标题。「有哪些原因」「列出操作步骤」「初始化后出现什么目录」以及列视频后还要求解释细节的提问，进入原文检索；不会因单独出现「哪些、清单、目录」就跳过正文。
-
-题库和实测结果保存在本地 `backend/app/storage/retrieval_eval/`，该目录已被 Git 忽略，仓库不附带个人题库。请根据自己的已入库资料标注有答案题与无答案/范围隔离题；答案以可核实的原话为准，并回看原视频核对识别不清的内容。
-
-在 `backend` 目录执行，先免费检查题库中的引用和范围，再运行实测：
-
-```powershell
-# 只检查题库，不调用模型服务
-.\.venv\Scripts\python.exe scripts/evaluate_retrieval.py --dataset app/storage/retrieval_eval/retrieval-exam-v1.json --output app/storage/retrieval_eval/validation-v1.json
-
-# 实测：只调用将问题转换为检索数字的服务，不生成回答，也不写聊天记录
-.\.venv\Scripts\python.exe scripts/evaluate_retrieval.py --dataset app/storage/retrieval_eval/retrieval-exam-v1.json --output app/storage/retrieval_eval/baseline-v1.json --run
-
-# 生成可打开阅读的报告和 Excel 可读的考卷
-.\.venv\Scripts\python.exe scripts/render_retrieval_report.py --dataset app/storage/retrieval_eval/retrieval-exam-v1.json --results app/storage/retrieval_eval/baseline-v1.json --output app/storage/retrieval_eval/检索考卷与基线报告.html --csv app/storage/retrieval_eval/检索考卷.csv
-```
-
-实测使用资料与索引的临时副本，保留题库、资料内容和检索参数的版本指纹，方便以后对照。当前只评“找资料”和问题分流，不评资料压缩后的内容或最终回答质量。无答案题保留人工检查项，不把“返回了几个相似片段”当成回答正确。
-
-改动后使用新的结果文件，保留第一次成绩，再生成前后对比：
-
-```powershell
-.\.venv\Scripts\python.exe scripts/evaluate_retrieval.py --dataset app/storage/retrieval_eval/retrieval-exam-v1.json --output app/storage/retrieval_eval/after-routing-v1.json --run
-.\.venv\Scripts\python.exe scripts/render_retrieval_report.py --dataset app/storage/retrieval_eval/retrieval-exam-v1.json --before app/storage/retrieval_eval/baseline-v1.json --results app/storage/retrieval_eval/after-routing-v1.json --output app/storage/retrieval_eval/问题分流修复前后对比.html
-```
-
-对比报告仅在前后考卷、资料范围及模型和检索参数一致时生成；无答案题不计入内容问题的误判率。
-
-### 最终回答：是否答全、是否有据
-
-`evaluate_answers.py` 使用同一套题，按网页真实流程执行资料检索、原文上下文和流式回答。会调用真实模型服务；每题只记录一次生成，不反复挑选较好的答案。旧版本中的摘要调用按实际记录保留，当前版本不再调用中间摘要。检索资料与数据库均使用临时副本，测试聊天不会写入用户历史；正确答案和评分依据不会传给回答模型。
-
-```powershell
-# 先免费核对考卷、资料、模型与检索基线是否一致
-.\.venv\Scripts\python.exe scripts/evaluate_answers.py --dataset app/storage/retrieval_eval/retrieval-exam-v1.json --reference app/storage/retrieval_eval/after-routing-v1.json --output app/storage/retrieval_eval/answers-validation-v1.json
-
-# 真实生成；已有输出不会被覆盖，原始检索、摘要输入输出与最终模型输入分别记录
-.\.venv\Scripts\python.exe scripts/evaluate_answers.py --dataset app/storage/retrieval_eval/retrieval-exam-v1.json --reference app/storage/retrieval_eval/after-routing-v1.json --output app/storage/retrieval_eval/answers-v1.json --run
-
-# 逐题人工核对后，将评阅记录与一次生成的回答一起输出为报告
-.\.venv\Scripts\python.exe scripts/render_answer_report.py --dataset app/storage/retrieval_eval/retrieval-exam-v1.json --answers app/storage/retrieval_eval/answers-v1.json --review app/storage/retrieval_eval/answer-review-v1.json --output app/storage/retrieval_eval/最终回答准确性与依据报告.html --csv app/storage/retrieval_eval/最终回答逐题核查.csv
-```
-
-人工评阅分别检查必要知识点是否覆盖、具体事实是否有原文依据、引用是否支持对应说法。合理同义解释及清楚区分的通用建议不当作捏造；核心点答到了但夹带无据产品能力、数字、文件路径等，仍不能视为完整有据。无答案题独立检查是否承认当前范围没有依据。报告基于本次生成与当前文字稿，不把一次测试的比例当作长期准确率。
-
-修复后使用新的回答及评阅文件名，不覆盖旧样本。`render_answer_report.py` 可加 `--before-answers` 和 `--before-review` 生成前后逐题对照；只有题库、资料、索引及模型配置一致时才允许比较。源码变化单独展示，实际模型调用次数也按记录统计。
-
-### 长视频测试流程（约 7–30 分钟）
-
-本地测试目录可设为 `backend/app/storage/long_video_tests/my-test-run/`，测试数据和回听音频均被 Git 忽略。手动导入并确认准备好后再执行质量检查，评测命令不会定时自动运行。
-
-新处理任务会在 `app/storage/ingestion_runs/视频编号/` 保存每次尝试的下载/音轨提取、分段转写、整理入库与总处理时间。失败和重试分别记录，总时间不含排队。视频详情可展开“本次处理耗时”；以前的视频若没有计时，不用数据库创建时间或文件时间倒算。回答评测另外记录首段文字出现和完整回答耗时。
-
-测试准备时当前批次已在旧服务运行，不能为它补造精确计时。`observe_ingestion.py` 只给这批保存轮询观察记录，明确标为有误差、已开始阶段起点未知；不做内容评测、不重启服务。等本批结束且用户通知后，先安全加载更新。`LONG_VIDEO_TEST_KEEP_AUDIO=true` 已在本地配置开启：更新加载后的约6–31分钟音频会为回听保留，覆盖7–30分钟边界，测试结束可关闭。旧批次若WAV已清理，可从保留的本地原视频提取音轨，不自动下载或重新识别。
-
-在 `backend` 目录执行：
-
-```powershell
-# 准备时冻结旧视频清单；已有baseline不会被覆盖
-.\.venv\Scripts\python.exe scripts/long_video_test.py init --run-dir app/storage/long_video_tests/my-test-run
-
-# 用户确认导入完成后：只读检查新增/状态改变/指定本批视频，生成报告和待标注考卷，不调用模型
-.\.venv\Scripts\python.exe scripts/long_video_test.py inspect --run-dir app/storage/long_video_tests/my-test-run
-
-# 根据实际inspection路径与视频编号生成原声抽样（不调用AI）；以下占位值需替换
-.\.venv\Scripts\python.exe scripts/long_video_test.py clips --run-dir app/storage/long_video_tests/my-test-run --inspection 检查目录/inspection.json --video-id 视频编号
-
-# 回听后填写question-worksheet：正例source_audio_verified=true，负例scope_absence_verified=true，status=ready
-.\.venv\Scripts\python.exe scripts/long_video_test.py compile --run-dir app/storage/long_video_tests/my-test-run --worksheet 检查目录/question-worksheet.json
-```
-
-回听开头、中间、结尾及每分钟交界，并检查长无文字间隔、重复句与专有名词；静音、音乐和真实复述不能自动判漏听。程序能检查分段请求是否覆盖整个音频、时间范围与完整文字稿是否一致；这些通过也不等于每句话都听对。每片准备6道可回答题和2道无答案/知识库范围对照，参考原话和时间必须核实；未标注完或引用不在当前库的题目不能执行。
-
-生成 `long-video-exam.json` 后，用前面的 `evaluate_retrieval.py` 冻结本批检索基线，再用 `evaluate_answers.py` 完整生成并逐项核查。测试始终使用资料副本，不把测试对话混进用户历史；不改变原题/原话来追求好成绩。
-
-## 技术栈
-
-| 层级 | 技术 |
-|------|------|
-| 后端 | FastAPI + SQLAlchemy + SQLite |
-| 向量库 | ChromaDB |
-| LLM | DeepSeek（OpenAI 兼容） |
-| Embedding | DashScope text-embedding-v4 |
-| 音频识别；后续画面分析 | Qwen3.8-Omni-Flash（阿里云百炼） |
-| 视频下载和分段 | 抖音已登录网页播放资源；其他网站 yt-dlp；ffmpeg 提取和分段 |
-| 浏览器 | Playwright + Chromium |
-| 前端 | React 19 + Vite + TypeScript + Tailwind CSS |
-
-## 项目结构
-
-```
-douyinrag/
-├── backend/
-│   ├── app/
-│   │   ├── main.py                 # FastAPI 入口
-│   │   ├── core/config.py          # Pydantic 配置
-│   │   ├── db/                     # SQLAlchemy ORM
-│   │   ├── models/entities.py      # 数据表实体
-│   │   ├── api/routes/             # 14 个 API 接口
-│   │   └── services/
-│   │       ├── douyin_collector.py # Playwright 登录 + 数据抓取
-│   │       ├── favorites_service.py # 收藏夹同步
-│   │       ├── media_service.py    # yt-dlp 音频下载
-│   │       ├── asr_service.py      # DashScope 语音转写
-│   │       ├── text_processing.py  # 文本清洗 + 切块
-│   │       ├── chroma_service.py   # 向量库操作
-│   │       ├── llm_service.py      # DeepSeek + DashScope Embedding
-│   │       ├── rag_service.py      # RAG 问答引擎
-│   │       ├── knowledge_service.py # 入库编排
-│   │       └── worker.py           # 后台任务队列
-│   ├── pyproject.toml
-│   └── tests/
-├── frontend/
-│   └── src/
-│       ├── App.tsx                 # 根组件
-│       ├── api.ts                  # API 封装
-│       ├── pages/                  # Landing + Workspace
-│       └── components/             # LoginModal + SourcesPanel + ChatPanel
-└── DEVELOPMENT_PLAN.md             # 完整开发方案
-```
-
-## API 接口
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/auth/douyin/login/start` | 启动扫码登录 |
-| GET  | `/api/auth/douyin/login/status` | 查询登录状态 |
-| POST | `/api/auth/douyin/logout` | 退出登录 |
-| POST | `/api/favorites/sync` | 同步收藏夹 |
-| GET  | `/api/favorites/collections` | 收藏夹列表 |
-| GET  | `/api/favorites/collections/{id}/videos` | 视频列表 |
-| POST | `/api/knowledge/sync` | 选择视频或全部待入库视频入库 |
-| GET  | `/api/knowledge/sync/{id}` | 入库进度 |
-| GET  | `/api/knowledge/stats` | 知识库统计 |
-| POST | `/api/chat/ask` | 非流式问答 |
-| POST | `/api/chat/ask/stream` | SSE 流式问答 |
-| GET  | `/api/chat/sessions` | 会话列表 |
-| GET  | `/api/chat/sessions/{id}/messages` | 消息历史 |
-| DELETE | `/api/chat/sessions/{id}` | 删除会话 |
-
-## 费用说明
-
-| 服务 | 计费方式 | 说明 |
-|------|---------|------|
-| 回答模型 | 按所选服务的计费规则 | 对话问题与参考原文会产生输入量 |
-| 声音识别 | 按所选模型的计费规则 | 完整主音频与额外补听均可能计费 |
-| 检索转换 | 按所选服务的计费规则 | 入库文本和查询文本均可能产生用量 |
-
-价格与免费额度以服务商当前控制台、所选模型及区域为准。项目没有读取账单；模型请求次数减少不代表费用一定下降。
+当前主要用于本地个人使用；多人权限、长期任务管理和更大规模资料检索仍有待完善。
 
 ## License
 

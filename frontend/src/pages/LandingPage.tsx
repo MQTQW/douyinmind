@@ -1,3 +1,5 @@
+import { BookOpen, ScanLine } from 'lucide-react';
+
 interface Props { onStartLogin: () => void; onTryChat: () => void; busy: boolean; }
 
 export default function LandingPage({ onStartLogin, onTryChat, busy }: Props) {
@@ -6,9 +8,7 @@ export default function LandingPage({ onStartLogin, onTryChat, busy }: Props) {
       {/* Top Bar */}
       <header className="flex items-center justify-between px-8 py-4 bg-white/50 backdrop-blur">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-xl flex items-center justify-center bg-gradient-to-br from-accent to-amber">
-            <span className="font-display text-white text-xl font-bold">D</span>
-          </div>
+          <div className="brand-mark"><BookOpen size={20} /></div>
           <span className="font-display text-lg text-[var(--color-ink)]">DouyinMind</span>
         </div>
       </header>
@@ -31,11 +31,9 @@ export default function LandingPage({ onStartLogin, onTryChat, busy }: Props) {
         <button
           onClick={onStartLogin}
           disabled={busy}
-          className="px-10 py-4 rounded-full bg-gradient-to-r from-accent to-accent-hover text-white font-bold text-base
-                     shadow-lg shadow-accent/25 hover:shadow-xl hover:shadow-accent/30
-                     transition-all hover:-translate-y-0.5 disabled:opacity-60 disabled:cursor-wait"
+          className="inline-flex items-center gap-3 px-8 py-3.5 rounded-xl bg-accent text-white font-medium text-base hover:bg-accent-hover transition-colors disabled:opacity-60 disabled:cursor-wait"
         >
-          {busy ? '启动中...' : '扫码登录 · 开始构建'}
+          <ScanLine size={20} />{busy ? '启动中...' : '扫码登录 · 开始构建'}
         </button>
 
         <div className="-mt-5">

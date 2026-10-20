@@ -49,11 +49,7 @@ export default function ExecutionTrace({ trace, latency_ms }: { trace: TraceData
       >
         <span className={`w-2 h-2 rounded-full ${open ? 'bg-accent' : 'bg-success'}`} />
         <span className="font-semibold text-[var(--color-ink-soft)]">
-          {routeLabel}
-        </span>
-        <span className="basis-full order-last sm:basis-auto sm:order-none sm:flex-1 min-w-0 text-[var(--color-ink-muted)] font-mono">
-          {trace.steps.map(s => `${s.time_ms}ms`).join(' + ')}
-          {validNumber(latency_ms) ? `；回答耗时 ${latency_ms}ms` : ''}
+          查找过程 · {routeLabel}
         </span>
         {hasChunks && (
           <span className="text-[var(--color-ink-muted)] ml-auto">
@@ -73,6 +69,7 @@ export default function ExecutionTrace({ trace, latency_ms }: { trace: TraceData
       {/* Body */}
       {open && (
         <div className="border-t border-dashed border-[var(--color-border)] px-3 py-2 space-y-2">
+          {validNumber(latency_ms) && <p className="text-[var(--color-ink-muted)]">本次回答耗时 {latency_ms}ms</p>}
           {/* Steps */}
           <div className="space-y-1">
             {trace.steps.map((step, i) => (

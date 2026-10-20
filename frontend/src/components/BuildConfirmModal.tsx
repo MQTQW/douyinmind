@@ -1,6 +1,7 @@
 import { useState, useEffect, useId, useMemo, useRef, type FormEvent } from 'react';
 import * as api from '../api';
 import { collectionLibraryName, isWholeCollectionSelected, type CollectionImportSource } from '../collectionImport';
+import KnowledgeBaseSelect from './KnowledgeBaseSelect';
 
 interface Props {
   onClose: () => void;
@@ -211,16 +212,13 @@ export default function BuildConfirmModal({
             <button type="button" onClick={() => setAutomaticTarget(false)} disabled={building || creating} className="mt-2 text-xs text-accent hover:underline disabled:opacity-40">改为手动选择知识库</button>
           </div> : <div className="rounded-xl border border-[var(--color-border)] bg-white/50 p-3">
             <div className="flex items-center justify-between gap-2">
-              <label htmlFor={targetSelectId} className="text-xs font-semibold text-[var(--color-ink)]">导入到知识库</label>
+              <label id={`${targetSelectId}-label`} htmlFor={targetSelectId} className="text-xs font-semibold text-[var(--color-ink)]">导入到知识库</label>
               {!showCreate && <button type="button" onClick={() => { setAutomaticTarget(false); setShowCreate(true); setCreateError(''); }} disabled={building || creating}
                 className="text-xs text-accent hover:underline disabled:opacity-40">＋ 新建知识库</button>}
             </div>
-            <select id={targetSelectId} value={targetId ?? ''} onChange={event => { setAutomaticTarget(false); setTargetId(event.target.value ? Number(event.target.value) : null); setSubmitError(''); }}
+            <KnowledgeBaseSelect id={targetSelectId} labelId={`${targetSelectId}-label`} value={targetId} options={bases}
               disabled={building || creating || showCreate}
-              className="mt-2 h-10 w-full min-w-0 rounded-lg border border-[var(--color-border)] bg-white px-2 text-sm text-[var(--color-ink)] outline-none focus:border-accent disabled:opacity-50">
-              <option value="">{bases.length ? '请选择知识库' : '请先新建一个知识库'}</option>
-              {bases.map(base => <option key={base.id} value={base.id}>{base.name}</option>)}
-            </select>
+              onChange={value => { setAutomaticTarget(false); setTargetId(value); setSubmitError(''); }} />
             {showCreate && <form onSubmit={handleCreate} className="mt-3 border-t border-[var(--color-border)] pt-3">
               <label className="block text-xs text-[var(--color-ink-soft)]">新知识库名称
                 <input ref={createInputRef} value={newName} onChange={event => setNewName(event.target.value)} maxLength={128} required

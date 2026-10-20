@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="430" viewBox="0 0 1440 430" role="img" aria-labelledby="title desc">
+  <title id="title">DouyinMind 收藏成为你的知识</title>
+  <desc id="desc">浅绿色封面，展示整理知识库、保留文字稿和根据原文提问三个步骤。</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#F3F7EC"/><stop offset="1" stop-color="#E4EEDB"/></linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="160%"><feDropShadow dx="0" dy="12" stdDeviation="18" flood-color="#274A32" flood-opacity=".07"/></filter>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" fill="#719466" opacity=".13"/></pattern>
+  </defs>
+  <rect width="1440" height="430" rx="24" fill="url(#bg)"/>
+  <rect x="760" width="680" height="430" rx="24" fill="url(#dots)"/>
+  <circle cx="1330" cy="30" r="180" fill="#D8E6CB" opacity=".55"/>
+  <g font-family="Segoe UI,Microsoft YaHei,PingFang SC,sans-serif">
+    <rect x="62" y="48" width="48" height="48" rx="14" fill="#365B3F"/>
+    <g fill="none" stroke="#F3F7ED" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M75 62c4-2 8-2 12 1v20c-4-3-8-3-12-1zM87 63c4-3 8-3 12-1v20c-4-2-8-2-12 1"/>
+    </g>
+    <text x="126" y="78" font-size="14" font-weight="600" letter-spacing="2" fill="#65805C">SAVE · LEARN · ASK</text>
+    <text x="62" y="164" font-size="56" font-weight="700" letter-spacing="-2" fill="#253F2B">DouyinMind</text>
+    <text x="62" y="233" font-size="43" font-weight="600" fill="#253F2B">收藏，成为你的知识。</text>
+    <text x="64" y="276" font-size="20" fill="#687C60">从抖音收藏出发，把看过的内容变成可回查的答案。</text>
+    <g font-size="15" fill="#46643D">
+      <rect x="64" y="313" width="143" height="37" rx="18.5" fill="#FFFFFF" fill-opacity=".7" stroke="#D5E1CC"/>
+      <text x="135.5" y="337" text-anchor="middle">按主题整理</text>
+      <rect x="217" y="313" width="143" height="37" rx="18.5" fill="#FFFFFF" fill-opacity=".7" stroke="#D5E1CC"/>
+      <text x="288.5" y="337" text-anchor="middle">保留完整原文</text>
+      <rect x="370" y="313" width="143" height="37" rx="18.5" fill="#FFFFFF" fill-opacity=".7" stroke="#D5E1CC"/>
+      <text x="441.5" y="337" text-anchor="middle">根据资料提问</text>
+    </g>
+    <text x="65" y="393" font-size="11" letter-spacing="2.4" fill="#839076">PERSONAL VIDEO KNOWLEDGE WORKSPACE</text>
+    <rect x="869" y="51" width="505" height="328" rx="24" fill="#FFFEF9" stroke="#D5E1CD" filter="url(#shadow)"/>
+    <circle cx="894" cy="78" r="4" fill="#BFCFAF"/><circle cx="909" cy="78" r="4" fill="#D2DEC7"/><circle cx="924" cy="78" r="4" fill="#E2E9D9"/>
+    <text x="894" y="122" font-size="22" font-weight="600" fill="#2E4B34">每一份收藏，都可以再用一次</text>
+    <path d="M914 185v105" stroke="#DAE4D1" stroke-width="2" stroke-dasharray="4 5"/>
+    <g>
+      <rect x="894" y="149" width="40" height="40" rx="12" fill="#E8F0E0"/>
+      <path d="M903 162h8l3 3h11v13h-22z" fill="none" stroke="#53774A" stroke-width="1.8" stroke-linejoin="round"/>
+      <text x="952" y="166" font-size="17" font-weight="600" fill="#345239">整理为主题知识库</text>
+      <text x="952" y="187" font-size="13" fill="#809076">选择视频，确认资料范围</text>
+      <rect x="894" y="211" width="40" height="40" rx="12" fill="#EEF2E7"/>
+      <g fill="none" stroke="#53774A" stroke-width="1.8" stroke-linecap="round"><rect x="905" y="220" width="18" height="23" rx="2"/><path d="M910 226h8m-8 5h8m-8 5h5"/></g>
+      <text x="952" y="228" font-size="17" font-weight="600" fill="#345239">保存声音中的完整文字</text>
+      <text x="952" y="249" font-size="13" fill="#809076">保留原文与时间，便于回看</text>
+      <rect x="894" y="273" width="40" height="40" rx="12" fill="#365B3F"/>
+      <path d="M903 283h22v15h-12l-5 4v-4h-5z" fill="none" stroke="#F4F8ED" stroke-width="1.8" stroke-linejoin="round"/>
+      <text x="952" y="290" font-size="17" font-weight="600" fill="#345239">提问、追问、回查来源</text>
+      <text x="952" y="311" font-size="13" fill="#809076">先找资料，再根据原文回答</text>
+    </g>
+    <path d="M894 335h454" stroke="#E5EBDD"/>
+    <circle cx="900" cy="355" r="3.5" fill="#729665"/>
+    <text x="911" y="360" font-size="12" fill="#75896B">AUDIO FIRST</text>
+    <text x="1348" y="360" text-anchor="end" font-size="12" fill="#8C9983">Local workspace</text>
+  </g>
+</svg>
