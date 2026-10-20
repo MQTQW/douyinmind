@@ -6,6 +6,7 @@ import * as api from './api';
 
 export default function App() {
   const [loggedIn, setLoggedIn] = useState(false);
+  const [chatOnly, setChatOnly] = useState(false);
   const [showLogin, setShowLogin] = useState(false);
   const [loginBusy, setLoginBusy] = useState(false);
 
@@ -41,14 +42,17 @@ export default function App() {
   }, []);
 
   const handleLogout = useCallback(async () => {
-    try { await api.logout(); } catch {}
+    if (loggedIn) {
+      try { await api.logout(); } catch {}
+    }
     setLoggedIn(false);
-  }, []);
+    setChatOnly(false);
+  }, [loggedIn]);
 
-  if (!loggedIn) {
+  if (!loggedIn && !chatOnly) {
     return (
       <>
-        <LandingPage onStartLogin={handleLogin} busy={loginBusy} />
+        <LandingPage onStartLogin={handleLogin} onTryChat={() => setChatOnly(true)} busy={loginBusy} />
         {showLogin && (
           <LoginModal
             onClose={() => setShowLogin(false)}
@@ -59,5 +63,5 @@ export default function App() {
     );
   }
 
-  return <Workspace onLogout={handleLogout} />;
+  return <Workspace onLogout={handleLogout} loggedIn={loggedIn} />;
 }

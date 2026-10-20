@@ -14,7 +14,7 @@ from collections import OrderedDict
 from sqlalchemy import delete, desc, func, select
 from sqlalchemy.orm import Session
 
-from app.models.entities import FavoriteCollection, FavoriteVideo, VideoCache
+from app.models.entities import FavoriteCollection, FavoriteVideo, KnowledgeBaseVideo, VideoCache
 from app.services.douyin_collector import (
     FavoriteScrapeSnapshot,
     collector,
@@ -276,7 +276,13 @@ class FavoritesService:
                     )
                 ).all()
             }
-            orphan_ids = sorted(removed_ids - still_used)
+            # Removing a Douyin favorite must not erase material in a named library.
+            saved_in_library = set(db.scalars(
+                select(KnowledgeBaseVideo.platform_item_id).where(
+                    KnowledgeBaseVideo.platform_item_id.in_(removed_ids)
+                )
+            ).all())
+            orphan_ids = sorted(removed_ids - still_used - saved_in_library)
             if orphan_ids:
                 db.execute(
                     delete(VideoCache).where(

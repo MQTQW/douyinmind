@@ -5,6 +5,8 @@
 所有配置项从 .env 文件和环境变量读取，提供类型验证和默认值。
 """
 from pathlib import Path
+from typing import Literal
+from pydantic import Field
 
 from pydantic_settings import BaseSettings
 
@@ -23,6 +25,26 @@ class Settings(BaseSettings):
     dashscope_api_key: str = ""
     """DashScope API Key，用于 ASR 语音转写和 Embedding 向量化"""
 
+    qwen_omni_api_key: str = ""
+    qwen_omni_model: str = "qwen3.8-omni-flash"
+    qwen_omni_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    qwen_omni_timeout: int = Field(default=180, ge=10, le=600)
+    qwen_omni_max_tokens: int = Field(default=8192, ge=1024, le=32768)
+    knowledge_analysis_mode: Literal["audio", "audio_visual"] = "audio"
+    video_segment_seconds: int = Field(default=60, ge=5, le=120)
+    audio_transcription_concurrency: int = Field(default=3, ge=1, le=4)
+    audio_boundary_review_enabled: bool = True
+    audio_boundary_review_max_windows: int = Field(default=4, ge=0, le=4)
+    audio_boundary_review_radius_seconds: int = Field(default=8, ge=4, le=12)
+    audio_boundary_review_timeout_seconds: float = Field(default=20, ge=5, le=30)
+    audio_boundary_review_budget_seconds: float = Field(default=60, ge=10, le=120)
+    audio_boundary_batch_enabled: bool = True
+    audio_boundary_batch_radius_seconds: int = Field(default=5, ge=4, le=8)
+    audio_boundary_batch_max_windows: int = Field(default=12, ge=0, le=12)
+    video_cache_dir: str = "app/storage/video_cache"
+    ingestion_metrics_dir: str = "app/storage/ingestion_runs"
+    long_video_test_keep_audio: bool = False
+
     # ===== LLM 配置 =====
     llm_model: str = "deepseek-chat"
     """LLM 模型名称"""
@@ -30,9 +52,15 @@ class Settings(BaseSettings):
     llm_base_url: str = "https://api.deepseek.com"
     """LLM API 地址，兼容 OpenAI 协议"""
 
+    llm_thinking_enabled: bool = False
+    """DeepSeek 是否启用深度思考；默认关闭以更快开始显示回答"""
+
     # ===== Embedding 配置 =====
     embedding_model: str = "text-embedding-v4"
     """DashScope Embedding 模型名称"""
+    embedding_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    query_embedding_timeout_seconds: float = Field(default=5.0, ge=0.5, le=30)
+    """Query-only transport timeout; ingestion keeps its existing batch policy."""
 
     # ===== ASR 配置 =====
     asr_model: str = "paraformer-v2"
@@ -48,7 +76,16 @@ class Settings(BaseSettings):
     retrieval_mmr_lambda: float = 0.55
     """MMR 多样性系数（0=最大多样性，1=最大相关性）"""
 
-    rag_context_count: int = 5
+    retrieval_hybrid_enabled: bool = True
+    """Combine semantic and local lexical retrieval without generating evidence."""
+
+    retrieval_candidate_k: int = Field(default=32, ge=8, le=128)
+    """Semantic candidate pool before lexical fusion and coverage selection."""
+
+    retrieval_neighbor_chars: int = Field(default=350, ge=0, le=1000)
+    """Maximum original characters added to restore neighboring sentence boundaries."""
+
+    rag_context_count: int = 8
     """注入 LLM 的上下文 chunk 数量"""
 
     rag_prompt_max_context_chars: int = 8000

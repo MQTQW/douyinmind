@@ -16,6 +16,7 @@ from app.core.config import settings
 from app.core.logging import setup_logging
 from app.db.base import Base
 from app.db.session import engine
+from app.db.migrations import ensure_chat_knowledge_base_column, ensure_video_analysis_columns
 
 
 @asynccontextmanager
@@ -39,6 +40,7 @@ async def lifespan(app: FastAPI):
     storage_dirs = [
         settings.chroma_persist_dir,
         settings.audio_cache_dir,
+        settings.video_cache_dir,
         settings.playwright_user_data_dir,
         settings.playwright_browsers_path,
         "logs",
@@ -49,6 +51,8 @@ async def lifespan(app: FastAPI):
 
     # 创建数据库表（同步引擎）
     Base.metadata.create_all(bind=engine)
+    ensure_video_analysis_columns(engine)
+    ensure_chat_knowledge_base_column(engine)
     logger.info("数据库表初始化完成")
 
     # 启动后台 worker

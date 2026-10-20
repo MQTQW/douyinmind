@@ -111,6 +111,7 @@ class ChromaService:
     def search(
         self, query_vector: list[float], top_k: int = 20,
         use_mmr: bool = True, fetch_k: int = 32, lambda_mult: float = 0.55,
+        allowed_video_ids: set[str] | None = None,
     ) -> list[dict]:
         """
         向量语义检索（支持 MMR 多样性）
@@ -122,12 +123,20 @@ class ChromaService:
         :param lambda_mult: MMR 相关性权重
         :return: 检索结果列表
         """
+        if allowed_video_ids is not None and not allowed_video_ids:
+            return []
+        count = self._collection.count()
+        if not count:
+            return []
         n_fetch = max(fetch_k, top_k * 3)
-        result = self._collection.query(
+        query_kwargs = dict(
             query_embeddings=[query_vector],
-            n_results=min(n_fetch, self._collection.count()),
+            n_results=min(n_fetch, count),
             include=["metadatas", "distances", "documents"],
         )
+        if allowed_video_ids is not None:
+            query_kwargs["where"] = {"platform_item_id": {"$in": sorted(allowed_video_ids)}}
+        result = self._collection.query(**query_kwargs)
 
         ids = (result.get("ids") or [[]])[0]
         distances = (result.get("distances") or [[]])[0]
@@ -151,6 +160,7 @@ class ChromaService:
                 "title": str(title),
                 "score": score,
                 "text": str(text),
+                "chunk_index": metadata.get("chunk_index"),
             })
 
         if not candidates or not use_mmr or len(candidates) <= top_k:
@@ -182,6 +192,41 @@ class ChromaService:
             selected.append(remaining.pop(best_idx))
 
         return selected
+
+    def get_documents(self, allowed_video_ids: set[str] | None = None) -> list[dict]:
+        """Read original text for lexical retrieval and neighboring sentences.
+
+        Apply the same scope inside the index read, not after retrieving global
+        results. No embeddings are created or returned by this read-only path.
+        """
+        if allowed_video_ids is not None and not allowed_video_ids:
+            return []
+        documents = []
+        offset = 0
+        batch_size = 500
+        while True:
+            kwargs = {"include": ["metadatas", "documents"], "limit": batch_size, "offset": offset}
+            if allowed_video_ids is not None:
+                kwargs["where"] = {"platform_item_id": {"$in": sorted(allowed_video_ids)}}
+            result = self._collection.get(**kwargs)
+            identifiers = result.get("ids") or []
+            metadatas = result.get("metadatas") or []
+            texts = result.get("documents") or []
+            for index, identifier in enumerate(identifiers):
+                metadata = metadatas[index] if index < len(metadatas) else None
+                if not metadata or not metadata.get("platform_item_id") or index >= len(texts):
+                    continue
+                video_id = str(metadata["platform_item_id"])
+                if allowed_video_ids is not None and video_id not in allowed_video_ids:
+                    continue
+                documents.append({"chunk_id": str(identifier), "platform_item_id": video_id,
+                                  "chunk_index": metadata.get("chunk_index"),
+                                  "title": str(metadata.get("title", "")),
+                                  "text": str(texts[index] or ""), "score": 0.0})
+            if len(identifiers) < batch_size:
+                break
+            offset += len(identifiers)
+        return documents
 
     def delete_by_video(self, platform_item_id: str) -> None:
         """

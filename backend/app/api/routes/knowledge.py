@@ -4,10 +4,11 @@
 提供收藏夹一键入库、入库进度查询、知识库统计、视频内容导出等接口。
 """
 import logging
+import json
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -15,7 +16,8 @@ from app.db.session import get_db
 from app.models.entities import VideoCache
 from app.services.knowledge_service import knowledge_service
 from app.services.markdown_export import export_ai_organized, export_original
-from app.services.worker import worker
+from app.services.worker import WorkerBusyError, worker
+from app.services.ingestion_metrics import latest_ingestion_run
 
 logger = logging.getLogger(__name__)
 
@@ -23,21 +25,28 @@ router = APIRouter(prefix="/knowledge", tags=["知识库"])
 
 
 class SyncRequest(BaseModel):
-    selected_ids: list[str] = []
+    # Omission/null keeps the existing all-pending action. An explicit empty
+    # selection must never become an all-video job.
+    selected_ids: list[str] | None = None
+    knowledge_base_id: int | None = Field(default=None, gt=0)
 
 @router.post("/sync")
 async def sync_knowledge(body: SyncRequest, db: Session = Depends(get_db)):
     """
     触发知识库入库任务
 
-    将 pending 状态的视频（或指定的视频）提交到后台 worker，
-    逐个执行：下载音频 → ASR 转写 → 切块 → 向量化 → 存入 ChromaDB。
+    默认提交全部 pending 视频；指定 selected_ids 时仅提交其中的
+    pending/failed 视频。空选择与未知编号不会提交任务。
 
     :param body: 请求体，可指定 selected_ids 限定入库范围
     :param db: 数据库会话
     :return: 任务 ID 和待处理数量
     """
-    result = knowledge_service.start_sync(db, body.selected_ids or None)
+    try:
+        result = knowledge_service.start_sync(db, body.selected_ids, body.knowledge_base_id)
+    except (RuntimeError, ValueError) as exc:
+        db.rollback()
+        return {"success": False, "message": str(exc)}
     return {"success": True, **result}
 
 
@@ -59,7 +68,7 @@ async def get_sync_progress(task_id: str):
 
 
 @router.post("/reset-failed")
-async def reset_failed_videos(db: Session = Depends(get_db)):
+def reset_failed_videos(db: Session = Depends(get_db)):
     """
     将所有失败/卡住的视频重置为 pending
 
@@ -71,14 +80,23 @@ async def reset_failed_videos(db: Session = Depends(get_db)):
     :return: 重置数量
     """
     from sqlalchemy import update as sql_update
-    reset_statuses = ["failed", "downloading", "transcribing"]
-    result = db.execute(
-        sql_update(VideoCache)
-        .where(VideoCache.status.in_(reset_statuses))
-        .values(status="pending", error_message="")
-    )
-    db.commit()
-    count = result.rowcount
+    reset_statuses = ["failed", "downloading", "transcribing", "embedding"]
+    try:
+        with worker.maintenance_guard():
+            try:
+                result = db.execute(
+                    sql_update(VideoCache)
+                    .where(VideoCache.status.in_(reset_statuses))
+                    .values(status="pending", error_message="")
+                )
+                db.commit()
+                count = result.rowcount
+            except BaseException:
+                db.rollback()
+                raise
+    except WorkerBusyError as error:
+        db.rollback()
+        return {"success": False, "message": str(error)}
     return {"success": True, "reset_count": count}
 
 
@@ -111,6 +129,31 @@ async def get_knowledge_stats(db: Session = Depends(get_db)):
     """
     stats = knowledge_service.get_stats(db)
     return {"success": True, **stats}
+
+
+@router.get("/videos/{platform_item_id}/content")
+async def get_video_content(platform_item_id: str, db: Session = Depends(get_db)):
+    cache = db.scalar(select(VideoCache).where(VideoCache.platform_item_id == platform_item_id))
+    if cache is None:
+        return {"success": False, "message": "未找到这个视频，请先同步收藏夹。"}
+    try:
+        analysis = json.loads(cache.analysis_json or "{}")
+        if not isinstance(analysis, dict):
+            analysis = {}
+    except (ValueError, TypeError):
+        analysis = {}
+    return {"success": True, "platform_item_id": cache.platform_item_id,
+            "title": cache.title, "status": cache.status,
+            "transcript_text": cache.transcript_text,
+            "visual_analysis_text": cache.visual_analysis_text,
+            "analysis_model": cache.analysis_model,
+            "analysis_mode": analysis.get("analysis_mode", "audio_visual" if cache.visual_analysis_text else "audio"),
+            "duration_seconds": cache.analysis_duration_seconds,
+            "transcript_segments": analysis.get("transcript_segments", []),
+            "visual_segments": analysis.get("visual_segments", []),
+            "warnings": analysis.get("warnings", []), "error_message": cache.error_message,
+            "audio_processing": analysis.get("audio_processing"),
+            "processing_metrics": latest_ingestion_run(platform_item_id)}
 
 
 @router.get("/export/{platform_item_id}", response_class=PlainTextResponse)

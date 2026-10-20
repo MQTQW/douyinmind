@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 import subprocess
+import tempfile
+import wave
 from pathlib import Path
 
 from yt_dlp import YoutubeDL
 
 from app.core.config import settings
+from app.services.douyin_media import DouyinMediaError, download_douyin_media, is_douyin_video_url
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +43,8 @@ def _resolve_ffmpeg_path() -> str:
 
     依次尝试：
     1. PATH 环境变量
-    2. Windows 常见安装路径
+    2. 缓存旁与项目中已准备的工具
+    3. Windows 常见安装路径
 
     :return: ffmpeg 可执行文件路径
     :raises MediaPipelineError: 未找到 ffmpeg
@@ -49,11 +54,15 @@ def _resolve_ffmpeg_path() -> str:
         return ffmpeg_path
 
     common_paths = [
+        Path(settings.audio_cache_dir).parent / "tools" / "ffmpeg.exe",
+        # Moving only the audio cache must not hide the project's installed
+        # tool. Resolve from this module rather than the current directory.
+        Path(__file__).resolve().parents[1] / "storage" / "tools" / "ffmpeg.exe",
         Path("C:/ffmpeg/bin/ffmpeg.exe"),
         Path.home() / "ffmpeg" / "bin" / "ffmpeg.exe",
     ]
     for candidate in common_paths:
-        if candidate.exists():
+        if candidate.is_file():
             return str(candidate)
 
     raise MediaPipelineError(
@@ -127,90 +136,81 @@ def _export_cookiefile() -> Path:
     return cookie_file
 
 
-def download_audio(
-    video_url: str, platform_item_id: str
-) -> Path:
-    """
-    下载抖音视频的音频流
-
-    使用 yt-dlp 下载最佳音频流，通过 ffmpeg 后处理提取为 mp3。
-    抖音视频自动使用 Playwright 登录态 Cookie 绕过鉴权。
-
-    :param video_url: 视频页面 URL（如 https://www.douyin.com/video/xxx）
-    :param platform_item_id: 抖音视频 ID
-    :return: 下载后的音频文件路径
-    :raises MediaPipelineError: 下载或转码失败
-    """
-    audio_dir = Path(settings.audio_cache_dir)
-    audio_dir.mkdir(parents=True, exist_ok=True)
-    output_template = str(audio_dir / f"{platform_item_id}.%(ext)s")
-
-    # yt-dlp 配置
-    options: dict = {
-        "outtmpl": output_template,
-        "format": "bestaudio/best",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "96",
-            }
-        ],
-        "retries": 3,
-        "ffmpeg_location": _resolve_ffmpeg_path(),
-    }
-
-    # 抖音视频使用 Cookie
-    if "douyin.com" in video_url:
-        try:
-            options["cookiefile"] = str(_export_cookiefile())
-        except MediaPipelineError:
-            logger.warning("无法导出 Cookie，尝试无 Cookie 下载")
-        options["http_headers"] = {
-            "Referer": DOUYIN_REFERER,
-            "User-Agent": USER_AGENT,
-        }
-
-    logger.info("开始下载音频: %s", platform_item_id)
+def _valid_wav(path: Path) -> bool:
+    """Read bounded chunks to verify the entire cached PCM recording."""
     try:
-        with YoutubeDL(options) as ydl:
-            ydl.extract_info(video_url, download=True)
-    except Exception as exc:
-        raise MediaPipelineError(
-            f"音频下载失败 [{platform_item_id}]: {exc}"
-        ) from exc
+        with wave.open(str(path), "rb") as recording:
+            if recording.getparams()[:3] != (1, 2, 16000) or recording.getcomptype() != "NONE":
+                return False
+            expected = recording.getnframes() * 2
+            if not 0 < expected <= 10800 * 16000 * 2:
+                return False
+            actual = 0
+            while chunk := recording.readframes(16000 * 60):
+                actual += len(chunk)
+            return actual == expected
+    except (OSError, EOFError, wave.Error):
+        return False
 
-    # 查找下载的文件
-    audio_path = audio_dir / f"{platform_item_id}.mp3"
-    if not audio_path.exists():
-        matches = sorted(audio_dir.glob(f"{platform_item_id}.*"))
-        if not matches:
-            raise MediaPipelineError(
-                f"未找到下载的音频文件: {platform_item_id}"
-            )
-        audio_path = matches[0]
 
-    # 用 ffmpeg 转码为 16kHz 单声道 WAV（DashScope 兼容格式）
-    wav_path = audio_dir / f"{platform_item_id}.wav"
-    ffmpeg = _resolve_ffmpeg_path()
-    cmd = [
-        ffmpeg, "-y", "-i", str(audio_path),
-        "-ac", "1", "-ar", "16000", "-sample_fmt", "s16",
-        str(wav_path),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        logger.warning("ffmpeg 转码 WAV 失败: %s，回退原始文件", result.stderr[:200])
-        return audio_path
-
-    # 删除原始文件，返回 WAV
-    try:
-        audio_path.unlink(missing_ok=True)
-    except Exception:
+class _QuietDownloaderLogger:
+    # yt-dlp errors can include signed URLs. The caller provides safe errors.
+    def debug(self, message):
         pass
 
-    logger.info("音频下载+转码完成: %s (%d bytes)", platform_item_id, wav_path.stat().st_size)
-    return wav_path
+    def warning(self, message):
+        pass
+
+    def error(self, message):
+        pass
+
+
+def download_audio(video_url: str, platform_item_id: str) -> Path:
+    """Download the complete soundtrack and atomically save a verified WAV.
+
+    Douyin uses the existing logged-in webpage instead of yt-dlp's unsigned
+    detail endpoint. Other supported sites continue to use yt-dlp.
+    """
+    audio_dir = Path(settings.audio_cache_dir)
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", platform_item_id):
+        raise MediaPipelineError("视频编号无效")
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    cached = audio_dir / f"{platform_item_id}.wav"
+    if cached.is_file() and _valid_wav(cached):
+        return cached
+    ffmpeg = _resolve_ffmpeg_path()
+    with tempfile.TemporaryDirectory(prefix=f"audio-{platform_item_id}-", dir=audio_dir) as folder:
+        temporary = Path(folder)
+        if is_douyin_video_url(video_url):
+            try:
+                source = download_douyin_media(video_url, platform_item_id, audio_dir / "source_media", ffmpeg)
+            except DouyinMediaError as exc:
+                raise MediaPipelineError(str(exc)) from None
+        else:
+            options = {
+                "outtmpl": str(temporary / "source.%(ext)s"), "format": "bestaudio/best",
+                "noplaylist": True, "quiet": True, "no_warnings": True,
+                "retries": 3, "socket_timeout": 30, "ffmpeg_location": ffmpeg,
+                "logger": _QuietDownloaderLogger(),
+            }
+            try:
+                with YoutubeDL(options) as downloader:
+                    info = downloader.extract_info(video_url, download=True)
+                    source = Path(downloader.prepare_filename(info))
+                if not source.is_file() or not source.stat().st_size:
+                    raise MediaPipelineError("未获得完整音频文件。")
+            except Exception:
+                raise MediaPipelineError("音频下载失败，请确认视频仍可访问后重试。") from None
+        output = temporary / "complete.wav"
+        try:
+            result = subprocess.run([
+                ffmpeg, "-hide_banner", "-loglevel", "error", "-xerror", "-y", "-i", str(source),
+                "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(output),
+            ], capture_output=True, timeout=300)
+        except Exception:
+            raise MediaPipelineError("完整音轨提取超时或音视频处理工具不可用。") from None
+        if result.returncode or not _valid_wav(output):
+            raise MediaPipelineError("未获得完整可读取的音轨，未将视频作为入库成功处理。")
+        output.replace(cached)
+    logger.info("完整音频已下载并核验: %s", platform_item_id)
+    return cached

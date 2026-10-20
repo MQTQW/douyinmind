@@ -22,6 +22,7 @@ from typing import Optional
 from playwright.sync_api import sync_playwright
 
 from app.core.config import settings
+from app.services.browser_profile import persistent_profile_lock
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,10 @@ class DouyinCollector:
         await asyncio.to_thread(self._login_and_fetch_sync)
 
     def _login_and_fetch_sync(self) -> None:
+        with persistent_profile_lock:
+            self._login_and_fetch_sync_locked()
+
+    def _login_and_fetch_sync_locked(self) -> None:
         """
         在同一个持久化浏览器上下文中完成：登录检测 → 数据抓取
 
@@ -352,6 +357,14 @@ class DouyinCollector:
     # ------------------------------------------------------------------
 
     def logout(self) -> tuple[bool, str]:
+        if not persistent_profile_lock.acquire(blocking=False):
+            return False, "抖音登录或视频下载正在使用浏览器，请完成后再退出登录。"
+        try:
+            return self._logout_locked()
+        finally:
+            persistent_profile_lock.release()
+
+    def _logout_locked(self) -> tuple[bool, str]:
         if self._login_task and not self._login_task.done():
             self._login_task.cancel()
             self._login_task = None

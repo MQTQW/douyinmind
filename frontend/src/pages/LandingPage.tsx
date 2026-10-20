@@ -1,6 +1,6 @@
-interface Props { onStartLogin: () => void; busy: boolean; }
+interface Props { onStartLogin: () => void; onTryChat: () => void; busy: boolean; }
 
-export default function LandingPage({ onStartLogin, busy }: Props) {
+export default function LandingPage({ onStartLogin, onTryChat, busy }: Props) {
   return (
     <div className="min-h-screen flex flex-col bg-[var(--color-bg)]">
       {/* Top Bar */}
@@ -38,8 +38,13 @@ export default function LandingPage({ onStartLogin, busy }: Props) {
           {busy ? '启动中...' : '扫码登录 · 开始构建'}
         </button>
 
+        <div className="-mt-5">
+          <button onClick={onTryChat} className="text-sm text-accent underline underline-offset-4">先体验 AI 对话</button>
+          <p className="mt-2 text-xs text-[var(--color-ink-muted)]">无需登录抖音；根据收藏视频回答需要先同步并入库</p>
+        </div>
+
         {/* Pipeline */}
-        <div className="flex gap-10 mt-6">
+        <div className="flex flex-wrap justify-center gap-5 md:gap-10 mt-6">
           {[['1', '同步', '接入收藏夹'], ['2', '提炼', 'AI 转写整理'], ['3', '检索', '语义搜索'], ['4', '对话', '问答回顾']].map(([n, label, desc]) => (
             <div key={n} className="flex flex-col items-center gap-2 w-20">
               <div className="w-9 h-9 rounded-full bg-accent-light flex items-center justify-center text-accent font-bold text-sm">{n}</div>

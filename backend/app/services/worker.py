@@ -9,9 +9,14 @@ import logging
 import queue
 import threading
 import time
+from contextlib import contextmanager
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+
+class WorkerBusyError(ValueError):
+    """A local submission or maintenance action cannot safely start yet."""
 
 
 class Worker:
@@ -38,6 +43,42 @@ class Worker:
         self._tasks: dict[str, dict] = {}
         self._lock = threading.Lock()
         self._running = False
+        self._submission_reservations = 0
+        self._maintenance_active = False
+
+    @contextmanager
+    def submission_guard(self):
+        """Reserve a submission before DB work; never hold the lock over SQL."""
+        with self._lock:
+            if self._maintenance_active:
+                raise WorkerBusyError("正在恢复入库状态，请稍后重新提交。")
+            self._submission_reservations += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._submission_reservations -= 1
+
+    @contextmanager
+    def maintenance_guard(self):
+        """Exclude local submissions/jobs while explicit recovery owns SQL.
+
+        A dequeued job stays queued in the registry until _run assigns current
+        under this same lock, so that scheduling window is not mistaken for idle.
+        This coordinates one backend process, not other servers sharing its DB.
+        """
+        with self._lock:
+            busy = (self._maintenance_active or self._submission_reservations
+                    or self._current_task_id is not None
+                    or any(task["status"] in {"queued", "running"} for task in self._tasks.values()))
+            if busy:
+                raise WorkerBusyError("有任务正在处理或排队，请等待任务结束后再重置。")
+            self._maintenance_active = True
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._maintenance_active = False
 
     def start(self) -> None:
         """
@@ -70,13 +111,22 @@ class Worker:
         :param kwargs: 关键字参数
         """
         with self._lock:
+            if self._maintenance_active:
+                raise WorkerBusyError("正在恢复入库状态，请稍后重新提交。")
+            if task_id in self._tasks:
+                raise ValueError("任务编号已存在，请重新提交。")
             self._tasks[task_id] = {
                 "status": "queued",
                 "progress": 0,
                 "total": 0,
                 "message": "等待处理...",
             }
-        self._queue.put((task_id, func, args, kwargs))
+            try:
+                # The unbounded queue publishes without waiting for a consumer.
+                self._queue.put_nowait((task_id, func, args, kwargs))
+            except BaseException:
+                self._tasks.pop(task_id, None)
+                raise
         logger.info("任务已提交: %s", task_id)
 
     def get_progress(self, task_id: str) -> Optional[dict]:
@@ -111,9 +161,18 @@ class Worker:
                 continue
 
             with self._lock:
-                self._current_task_id = task_id
-                self._tasks[task_id]["status"] = "running"
-                self._tasks[task_id]["message"] = "正在处理..."
+                task = self._tasks.get(task_id)
+                valid = task is not None and task["status"] == "queued"
+                if valid:
+                    self._current_task_id = task_id
+                    task["status"] = "running"
+                    task["message"] = "正在处理..."
+            if not valid:
+                # Defensively discard stale/unregistered entries. The supported
+                # publisher is standard Queue; this is not a transactional
+                # delivery guarantee for custom queue implementations.
+                self._queue.task_done()
+                continue
 
             try:
                 # 执行任务

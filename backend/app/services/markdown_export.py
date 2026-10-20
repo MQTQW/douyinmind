@@ -8,6 +8,7 @@ Markdown 导出服务模块
 from __future__ import annotations
 
 import logging
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -15,6 +16,7 @@ from typing import Optional
 from app.core.config import settings
 from app.models.entities import VideoCache
 from app.services.llm_service import llm_client
+from app.services.omni_service import timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,33 @@ SUMMARY_PROMPT = """请输出以下 Markdown 小节，不要添加一级标题�
 """
 
 
+def _saved_analysis(video: VideoCache) -> dict:
+    try:
+        value = json.loads(video.analysis_json or "{}")
+        return value if isinstance(value, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def _original_sections(video: VideoCache) -> str:
+    speech = (video.transcript_text or "").strip()
+    visuals = (video.visual_analysis_text or "").strip()
+    if not speech and not visuals:
+        raise ValueError(f"视频「{video.title}」暂无识别结果，请先入库")
+    lines = ["## 完整语音文字稿", "", speech or "本视频没有可识别的语音。", ""]
+    saved = _saved_analysis(video)
+    if saved.get("transcript_segments"):
+        lines += ["## 语音时间记录", ""]
+        for item in saved["transcript_segments"]:
+            lines.append(f"- [{timestamp(item['start_seconds'])}–{timestamp(item['end_seconds'])}] {item['text']}")
+        lines.append("")
+    if visuals:
+        lines += ["## 画面分析", "", visuals, ""]
+    if saved.get("warnings"):
+        lines += ["## 识别中的不确定内容", "", *[f"- {item}" for item in saved["warnings"]], ""]
+    return "\n".join(lines)
+
+
 def export_original(video: VideoCache) -> str:
     """
     导出原始转写内容
@@ -37,20 +66,17 @@ def export_original(video: VideoCache) -> str:
     :return: Markdown 格式的原始转写
     :raises ValueError: 视频无转写内容
     """
-    content = (video.transcript_text or "").strip()
-    if not content:
-        raise ValueError(f"视频「{video.title}」暂无转写内容，请先入库")
+    content = _original_sections(video)
 
     lines = [
         f"# {video.title}",
         "",
-        f"> 作者：{video.platform_item_id}",
+        f"> 视频编号：{video.platform_item_id}",
         f"> 链接：https://www.douyin.com/video/{video.platform_item_id}",
         f"> 导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"> 识别模型：{video.analysis_model or '原语音识别流程'}",
         "",
         "---",
-        "",
-        "## 完整转写",
         "",
         content,
         "",
@@ -68,9 +94,7 @@ def export_ai_organized(video: VideoCache) -> str:
     :return: Markdown 格式的结构化笔记
     :raises ValueError: 视频无转写内容
     """
-    content = (video.transcript_text or "").strip()
-    if not content:
-        raise ValueError(f"视频「{video.title}」暂无转写内容，请先入库")
+    content = _original_sections(video)
 
     # 长文本分段
     chunk_size = 12000
@@ -122,7 +146,7 @@ def export_ai_organized(video: VideoCache) -> str:
         "",
         "---",
         "",
-        "## 原始转写",
+        "## 原始识别结果（完整保留）",
         "",
         content,
         "",

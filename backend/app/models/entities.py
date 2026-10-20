@@ -124,8 +124,8 @@ class VideoCache(Base):
     """
     视频入库缓存
 
-    记录每个视频的入库处理状态和 ASR 转写结果。
-    入库流程：pending → downloading → transcribing → done
+    记录完整语音文字稿、画面分析、原始识别返回和入库状态。
+    入库流程：pending → downloading → transcribing → embedding → done
     异常状态：failed
     """
 
@@ -143,7 +143,12 @@ class VideoCache(Base):
     """视频标题（缓存副本，避免关联查询）"""
 
     transcript_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    """ASR 转写全文"""
+    """完整语音文字稿，不用摘要替代"""
+
+    visual_analysis_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    analysis_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    analysis_model: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    analysis_duration_seconds: Mapped[float] = mapped_column(nullable=False, default=0.0)
 
     summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
     """AI 摘要（预留）"""
@@ -154,8 +159,9 @@ class VideoCache(Base):
     """
     处理状态：
     - pending: 等待处理
-    - downloading: 正在下载音频
-    - transcribing: 正在语音转写
+    - downloading: 正在下载完整视频
+    - transcribing: 正在识别声音与画面
+    - embedding: 正在生成可搜索资料
     - done: 处理完成
     - failed: 处理失败
     """
@@ -178,8 +184,49 @@ class VideoCache(Base):
     )
     """更新时间"""
 
+    knowledge_base_links: Mapped[list["KnowledgeBaseVideo"]] = relationship(
+        "KnowledgeBaseVideo", back_populates="video", cascade="all, delete-orphan"
+    )
+
     def __repr__(self) -> str:
         return f"<VideoCache platform_item_id='{self.platform_item_id}' status='{self.status}'>"
+
+
+class KnowledgeBase(Base):
+    """用户自建的知识库，独立于抖音收藏夹。"""
+
+    __tablename__ = "knowledge_bases"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    # A normalized private key prevents names differing only by case or edge spaces.
+    name_key: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+    videos: Mapped[list["KnowledgeBaseVideo"]] = relationship(
+        "KnowledgeBaseVideo", back_populates="knowledge_base", cascade="all, delete-orphan"
+    )
+
+
+class KnowledgeBaseVideo(Base):
+    """一个视频可归入多个库，原始识别结果始终共用 VideoCache。"""
+
+    __tablename__ = "knowledge_base_videos"
+
+    knowledge_base_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("knowledge_bases.id", ondelete="CASCADE"), primary_key=True
+    )
+    platform_item_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("video_cache.platform_item_id", ondelete="CASCADE"),
+        primary_key=True, index=True,
+    )
+    added_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now())
+    knowledge_base: Mapped["KnowledgeBase"] = relationship(
+        "KnowledgeBase", back_populates="videos"
+    )
+    video: Mapped["VideoCache"] = relationship("VideoCache", back_populates="knowledge_base_links")
 
 
 class ChatSession(Base):
@@ -196,6 +243,11 @@ class ChatSession(Base):
 
     title: Mapped[str] = mapped_column(String(128), nullable=False, default="New Chat")
     """会话标题（默认取首条用户消息前 40 字）"""
+
+    knowledge_base_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("knowledge_bases.id"), nullable=True, index=True
+    )
+    """对话使用的知识库；旧对话保持 None，即原有全部资料范围。"""
 
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, server_default=func.now()

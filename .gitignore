@@ -1,7 +1,25 @@
 # 敏感信息
 .env
+.env.*
+!.env.example
 *.pem
 *.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+**/cookies*.txt
+**/*cookies*.txt
+**/*cookies*.json
+**/storage_state*.json
+**/playwright_user_data/
+**/Cookies
+**/Cookies-journal
+**/Login Data*
+**/Local State
 
 # Python
 __pycache__/
@@ -14,10 +32,27 @@ dist/
 # Node
 node_modules/
 frontend/dist/
+*.tsbuildinfo
+*.log
 
 # 本地数据
 backend/app/storage/
 logs/
+
+# 本机实验、私人考卷/验收脚本不发布；保留可复用的通用工具
+backend/scripts/*
+!backend/scripts/__init__.py
+!backend/scripts/evaluate_retrieval.py
+!backend/scripts/evaluate_answers.py
+!backend/scripts/evaluate_conversations.py
+!backend/scripts/render_retrieval_report.py
+!backend/scripts/render_answer_report.py
+!backend/scripts/long_video_test.py
+!backend/scripts/observe_ingestion.py
+backend/tests/test_journal*.py
+
+# 原本机界面截图含实际收藏夹名称；原图留在本地
+/douyinmind.png
 
 # IDE
 .idea/
