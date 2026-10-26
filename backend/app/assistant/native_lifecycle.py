@@ -12,7 +12,7 @@ import re
 import threading
 import time
 
-from app.assistant.native_transport import NativeTransport, SecretSession, decimal_id
+from app.assistant.native_transport import NativeTransport, SecretSession, decimal_id, project_native_transport_facts
 
 _URLS = (
     "https://www.douyin.com/aweme/v1/web/query/user/",
@@ -33,14 +33,25 @@ _CODES = frozenset({
     "session_cookie_expiring", "session_metadata_unavailable", "session_candidate_invalid",
     "session_identity_mismatch", "session_refresh_unavailable", "session_expired",
     "tls_error", "network_timeout", "network_error", "redirect_denied", "rate_limited",
-    "empty_response", "response_not_json", "invalid_response_shape", "invalid_response_status",
+    "empty_response", "empty_nonterminal", "response_not_json", "invalid_response_shape", "invalid_response_status",
     "identity_schema_unknown", "invalid_parameters", "api_error", "http_error",
     "response_too_large", "duplicate_json_key", "json_integer_limit", "invalid_json_constant",
     "session_cooldown", "session_transient_retry_exhausted",
     "invalid_native_session_status",
 })
-_TRANSIENT_CODES = frozenset({"network_timeout", "network_error", "rate_limited", "http_error", "empty_response", "session_cookie_expiring"})
+_TRANSIENT_CODES = frozenset({"network_timeout", "network_error", "rate_limited", "http_error", "empty_response", "empty_nonterminal", "session_cookie_expiring"})
 _TRANSIENT_DELAYS = (45.0, 90.0)
+
+
+def _project_status_transport_facts(value):
+    """Strict optional public projection; never inspect unknown extra values."""
+    if type(value) is not dict:
+        _fail("invalid_native_session_status")
+    known = {key: value[key] for key in ("endpoint_role", "http_status", "api_status_code") if key in value}
+    clean = project_native_transport_facts(known)
+    if "endpoint_role" not in clean or clean != known:
+        _fail("invalid_native_session_status")
+    return clean
 
 
 def project_native_session_status(value):
@@ -76,6 +87,8 @@ def project_native_session_status(value):
     if result["state"] == "cooldown" and (last is None or result["transient_failures"] not in (1, 2)
                                             or result["retry_after_seconds"] == 0):
         _fail("invalid_native_session_status")
+    if "transport_facts" in value:
+        result["transport_facts"] = _project_status_transport_facts(value["transport_facts"])
     return result
 
 
@@ -112,9 +125,14 @@ def visible_draft_is_empty(adapter):
 
 class SessionLifecycleError(RuntimeError):
     """Fixed safe code only; no path, raw response, headers or exception text."""
-    def __init__(self, code):
+    def __init__(self, code, *, transport_facts=None):
+        self._transport_facts = tuple(project_native_transport_facts(transport_facts).items())
         self.code = code if type(code) is str and code in _CODES else "session_refresh_unavailable"
         super().__init__(self.code)
+
+    @property
+    def transport_facts(self):
+        return dict(self._transport_facts)
 
 
 def _fail(code):
@@ -122,7 +140,8 @@ def _fail(code):
 
 
 def _translated(error):
-    return SessionLifecycleError(getattr(error, "code", None))
+    return SessionLifecycleError(getattr(error, "code", None),
+        transport_facts=getattr(error, "transport_facts", None))
 
 
 def _path_matches(request_path, cookie_path):
@@ -289,9 +308,35 @@ class NativeSessionLifecycle:
         self._last_transient = None
         self._cooldown_until = 0.0
         self._failure_sequence = 0
+        self._last_transport_facts = {}
+        self._meaning_claim_lock = threading.RLock()
+        self._poll_cycle_in_progress = False
 
     def __repr__(self):
         return "<NativeSessionLifecycle redacted>"
+
+    @contextmanager
+    def native_meaning_claim_window(self):
+        """Local scheduling only; hold across a SQLite claim, never a model.
+
+        A poll owns its in-progress marker before prepare/network begins and
+        until its failure budget has been recorded. Only a strictly ready
+        lifecycle permits entering the unchanged Source/Registry claim gate.
+        Other states veto a new claim; this grants no recovery or permission.
+        """
+        with self._meaning_claim_lock:
+            can_claim = False
+            if self._poll_cycle_in_progress is False:
+                try:
+                    status = project_native_session_status(self.safe_status())
+                    can_claim = (status['state'] == 'ready'
+                        and status['reason_code'] is None
+                        and status['transient_failures'] == 0
+                        and status['last_transient_code'] is None
+                        and status['retry_after_seconds'] == 0)
+                except SessionLifecycleError:
+                    pass  # Unknown health denies a claim; it is not a retry.
+            yield can_claim
 
     def _owner_guard(self):
         if threading.get_ident() != self._owner:
@@ -301,10 +346,11 @@ class NativeSessionLifecycle:
         if self._cooldown_clock() < self._cooldown_until:
             _fail("session_cooldown")
 
-    def _record_poll_failure(self, code):
+    def _record_poll_failure(self, code, *, transport_facts=None):
         """Exactly one failed cycle; no automatic auth/draft/vault recovery."""
         if threading.get_ident() != self._owner:
             _fail("session_owner_required")
+        self._last_transport_facts = project_native_transport_facts(transport_facts)
         self._pinned = None
         if self._blocked or code == "session_cooldown":
             return
@@ -323,6 +369,7 @@ class NativeSessionLifecycle:
         self._cooldown_until = 0.0
 
     def _record_poll_success(self):
+        self._last_transport_facts = {}
         self._transient_failures = 0
         self._last_transient = None
         self._cooldown_until = 0.0
@@ -385,11 +432,14 @@ class NativeSessionLifecycle:
                 self._active, self._source = candidate, source
                 self._generation += 1
             self._pinned = self._active
+            # A successful identity prepare clears old diagnostics without
+            # resetting the separate downstream-poll retry budget.
+            self._last_transport_facts = {}
             return self.safe_status()
         except Exception as error:
             translated = _translated(error)
             self._pinned = None
-            self._record_poll_failure(translated.code)
+            self._record_poll_failure(translated.code, transport_facts=translated.transport_facts)
             raise translated from None
 
     def provider(self):
@@ -414,6 +464,7 @@ class NativeSessionLifecycle:
             _fail("session_owner_required")
         if self._pinned is not None:
             _fail("session_cycle_active")
+        self._last_transport_facts = {}
         self._blocked = SessionLifecycleError(code).code
         self._active = None
 
@@ -447,6 +498,8 @@ class NativeSessionLifecycle:
             _fail("session_owner_required")
         if self._pinned is not None:
             _fail("session_cycle_active")
+        with self._meaning_claim_lock:
+            self._poll_cycle_in_progress = True
         previous_failure = self._failure_sequence
         try:
             self.prepare_cycle()
@@ -456,7 +509,8 @@ class NativeSessionLifecycle:
             # NativeReceiver error is recorded here exactly once after unpinning.
             self._pinned = None
             if self._failure_sequence == previous_failure:
-                self._record_poll_failure(getattr(error, "code", None))
+                self._record_poll_failure(getattr(error, "code", None),
+                    transport_facts=getattr(error, "transport_facts", None))
             raise
         else:
             # An identity prepare alone does not reset the retry budget; only
@@ -465,12 +519,19 @@ class NativeSessionLifecycle:
             if reset_failures_on_success:
                 self._record_poll_success()
         finally:
-            self.end_cycle()
+            try:
+                self.end_cycle()
+            finally:
+                with self._meaning_claim_lock:
+                    self._poll_cycle_in_progress = False
 
     def safe_status(self):
-        return {"state": "paused" if self._blocked else "cooldown" if self._cooldown_clock() < self._cooldown_until else "cycle_active" if self._pinned is not None else "ready" if self._active is not None else "not_started",
+        result = {"state": "paused" if self._blocked else "cooldown" if self._cooldown_clock() < self._cooldown_until else "cycle_active" if self._pinned is not None else "ready" if self._active is not None else "not_started",
                 "reason_code": self._blocked, "generation": self._generation,
                 "refresh_count": self._refreshes, "source": self._source,
                 "seal_state": self._seal_state, "transient_failures": self._transient_failures,
                 "last_transient_code": self._last_transient,
                 "retry_after_seconds": max(0, math.ceil(self._cooldown_until - self._cooldown_clock()))}
+        if self._last_transport_facts:
+            result["transport_facts"] = dict(self._last_transport_facts)
+        return result

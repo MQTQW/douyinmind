@@ -22,7 +22,7 @@ def run_error(arguments, *, comment='请根据测试库回答这个问题', muta
 @pytest.mark.parametrize('arguments,expected', [
     ({'text': '合成回答。', 'source_ids': ['not-a-source']}, 'invalid_source_ids'),
     ({'text': '合成回答。', 'source_ids': ['资料1'], 'unexpected': 'synthetic-secret-marker'}, 'invalid_tool_arguments'),
-    ({'text': '长' * 281, 'source_ids': ['资料1']}, 'invalid_public_reply'),
+    ({'text': '长' * 321, 'source_ids': ['资料1']}, 'invalid_public_reply'),
     ({'text': '资料2说明了测试步骤。', 'source_ids': ['资料1']}, 'undeclared_source_reference'),
 ])
 def test_validation_error_audit_persists_only_fixed_code(arguments, expected):

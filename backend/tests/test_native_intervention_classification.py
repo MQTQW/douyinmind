@@ -9,6 +9,14 @@ from app.assistant.native_receiver import NativeReceiverError
 from app.mention_receiver.browser import ReceiverInterventionRequired
 
 
+def current_status(code):
+    # Actual lifecycle status is a complete safe projection, never a bare state.
+    reason='session_refresh_unavailable' if code in {'invalid_native_visibility','group_schema_unknown'} else code
+    return {'state':'paused','reason_code':reason,'generation':1,'refresh_count':1,
+        'source':'same_context','seal_state':'sealed','transient_failures':0,
+        'last_transient_code':None,'retry_after_seconds':0}
+
+
 def test_real_browser_intervention_is_not_downgraded_by_old_native_status():
     error=ReceiverInterventionRequired('网页要求人工验证或访问受限')
     error.native_session_status={'state':'paused','reason_code':'session_refresh_unavailable'}
@@ -30,7 +38,7 @@ def test_native_poll_attaches_data_provenance_to_the_actual_failure(code):
     fake=SimpleNamespace(_owner=lambda:None,should_stop=lambda:False,
        source_store=SimpleNamespace(safe_status=lambda:{'armed':True},pause=pauses.append),
        native_receiver=SimpleNamespace(poll_once=fail),
-       session_lifecycle=SimpleNamespace(cycle=cycle,safe_status=lambda:{'state':'paused'}),
+       session_lifecycle=SimpleNamespace(cycle=cycle,safe_status=lambda:current_status(code)),
        _with_native_session_status=lambda error:error)
     with pytest.raises(ReceiverInterventionRequired) as caught:
         NativeLane.poll_native(fake)
@@ -46,8 +54,8 @@ def test_native_identity_failure_never_becomes_a_data_format_problem():
     fake=SimpleNamespace(_owner=lambda:None,should_stop=lambda:False,
        source_store=SimpleNamespace(safe_status=lambda:{'armed':True},pause=lambda code:None),
        native_receiver=SimpleNamespace(poll_once=fail),
-       session_lifecycle=SimpleNamespace(cycle=cycle,safe_status=lambda:{'state':'paused'}),
+       session_lifecycle=SimpleNamespace(cycle=cycle,safe_status=lambda:current_status('session_identity_mismatch')),
        _with_native_session_status=lambda error:error)
     with pytest.raises(ReceiverInterventionRequired) as caught:NativeLane.poll_native(fake)
     assert not hasattr(caught.value,'native_intake_data_code')
-    assert intervention_health(caught.value)[0]=='verification_required'
+    assert intervention_health(caught.value)==('login_required','native_identity_mismatch')

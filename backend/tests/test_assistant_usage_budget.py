@@ -199,8 +199,9 @@ def test_multiple_python_processes_share_atomic_admission(budget):
     budget.set_limits(daily_tokens=70)
     script = textwrap.dedent("""
         import sys
+        from datetime import datetime
         from app.assistant.usage_budget import UsageBudget, UsageBudgetExceeded
-        value=UsageBudget(sys.argv[1])
+        value=UsageBudget(sys.argv[1], clock=lambda: datetime.fromisoformat(sys.argv[3]))
         admitted=0
         for index in range(8):
             try:
@@ -210,7 +211,9 @@ def test_multiple_python_processes_share_atomic_admission(budget):
         print(admitted)
     """)
     options = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
-    children = [subprocess.Popen([sys.executable, "-c", script, str(budget.path), "process"+str(i)],
+    # Child admission and parent summary must use the same accounting day;
+    # wall-clock children would test a different day after this fixture date.
+    children = [subprocess.Popen([sys.executable, "-c", script, str(budget.path), "process"+str(i), budget.fixture_clock[0].isoformat()],
                 cwd=str(Path(__file__).resolve().parents[1]), stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, **options) for i in range(3)]
     outputs = [child.communicate(timeout=30) for child in children]

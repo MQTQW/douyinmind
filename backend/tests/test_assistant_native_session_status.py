@@ -219,7 +219,29 @@ class LaneAndMainTests(unittest.TestCase):
         calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
                  and isinstance(node.func, ast.Attribute) and node.func.attr == "heartbeat"]
         status_calls = [call for call in calls if any(item.arg == "native_session_status" for item in call.keywords)]
-        self.assertEqual(len(status_calls), 4)
+        # Heartbeats may grow independently of this contract. Every forwarded
+        # value must be a current projection, never the raw error or cached lane.
+        self.assertTrue(status_calls)
+        self.assertEqual({ast.unparse(item.value) for call in status_calls for item in call.keywords
+            if item.arg=='native_session_status'}, {'status','session_status'})
+        owner=next(node for node in ast.walk(tree) if isinstance(node,ast.FunctionDef) and node.name=='run_registered')
+        parent={child:node for node in ast.walk(owner) for child in ast.iter_child_nodes(node)}
+        def error_branch(node):
+            while node in parent:
+                node=parent[node]
+                if isinstance(node,ast.ExceptHandler):return ast.unparse(node.type)
+            return None
+        # Native intervention, expected page failure, and unexpected failure all
+        # forward only the safe status attached to that particular observation.
+        branches={error_branch(call) for call in status_calls}
+        self.assertTrue({'ReceiverInterventionRequired',
+            '(ReceiverPageError, ReceiverDetailError, BrowserError)','Exception'} <= branches)
+        assignments=[node for node in ast.walk(owner) if isinstance(node,ast.Assign)
+            and any(isinstance(target,ast.Name) and target.id in {'status','session_status'} for target in node.targets)]
+        self.assertEqual({ast.unparse(node.value) for node in assignments},{
+            'verify_registered_receiver(adapter, lane)',
+            "observation.get('native_session_status') if isinstance(observation, dict) else None",
+            "getattr(error, 'native_session_status', None)"})
         self.assertTrue(any(not call.keywords for call in calls))
         self.assertNotIn("lane.last_native_session_status", source)
         self.assertIn("observation.get('native_session_status')", source)

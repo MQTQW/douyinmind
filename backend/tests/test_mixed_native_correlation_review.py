@@ -132,6 +132,16 @@ def controller(selected,pending,*,stop=lambda:False):
     fresh=[]; staged=[]
     value._fresh_root=lambda row:fresh.append(row['choice_id']) or ('synthetic-fresh-root','synthetic-resolution')
     value._stage=lambda row,run:staged.append(row['choice_id']) or ['only-target-handoff']
+    # These are target-dispatch unit tests, not selected-source authorization
+    # tests. Current handoff admission delegates to the fresh-UI recheck gate;
+    # the previous minimal session did not implement that full ledger contract.
+    # Real selection/UI/revocation behavior is covered with temporary ledgers
+    # in test_assistant_native_selected_recovery.py.
+    value.rechecked=[]
+    def recheck(adapter,row,run_id,source_checkpoint):
+        value.rechecked.append(row['choice_id'])
+        return value._stage(row,run_id)
+    value._recheck_selected_handoff=recheck
     return value,store,fresh,staged
 
 
@@ -151,6 +161,7 @@ def test_targeted_handoff_stages_only_same_choice_id():
     adapter=Adapter()
     assert value.collect_pending(adapter,'synthetic-run',choice_id=wanted['choice_id'])==['only-target-handoff']
     assert staged==[wanted['choice_id']] and adapter.reads==[] and fresh==[]
+    assert value.rechecked==[wanted['choice_id']]
 
 
 def test_targeted_handoff_is_not_starved_by_global_pending_prefix_limit():
@@ -161,6 +172,16 @@ def test_targeted_handoff_is_not_starved_by_global_pending_prefix_limit():
     adapter=Adapter()
     assert value.collect_pending(adapter,'synthetic-run',choice_id=wanted['choice_id'])==['only-target-handoff']
     assert staged==[wanted['choice_id']] and adapter.reads==[]
+    assert value.rechecked==[wanted['choice_id']]
+
+
+def test_targeted_handoff_recheck_refusal_never_falls_back_to_staging():
+    wanted=session('b'*64,'selected'); old=session('a'*64,'selected')
+    value,store,fresh,staged=controller(wanted,[old,wanted])
+    seen=[]
+    value._recheck_selected_handoff=lambda adapter,row,run,checkpoint:seen.append(row['choice_id']) or []
+    assert value.collect_pending(Adapter(),'synthetic-run',choice_id=wanted['choice_id'])==[]
+    assert seen==[wanted['choice_id']] and staged==[]
 
 
 def test_missing_or_foreign_receiver_target_never_falls_back_to_old_sessions():

@@ -267,6 +267,10 @@ class MentionIngestionService:
                 count = sum(1 for item in documents if isinstance(item, dict)
                     and item.get("platform_item_id") == payload["video_id"]
                     and isinstance(item.get("text"), str) and item["text"].strip()
+                    and not (isinstance(item.get('title'), str)
+                             and item['text'].strip() == item['title'].strip())
+                    and any(line.strip() and not line.strip().startswith(
+                        ('视频标题：', '视频标题:', '作者：', '作者:')) for line in item['text'].splitlines())
                     and item.get("chunk_index") not in (0, "0")
                     and not (isinstance(item.get("chunk_id"), str) and item["chunk_id"].endswith(":0"))
                     and not item["text"].lstrip().startswith(("视频标题：", "视频标题:")))

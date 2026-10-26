@@ -159,6 +159,17 @@ export function assistantHeartbeat(overview: AssistantOverview | null, now = Dat
   return { state: now - stamp > 180000 ? 'stale' : 'fresh', at: at! };
 }
 
+// Current typed receiver reason only; a prior native-session snapshot is not evidence.
+export function isNativeSessionCooldown(overview: AssistantOverview | null, now = Date.now(), checkHeartbeat = true): boolean {
+  if (!overview || !['running', 'listening'].includes(overview.control.state)
+    || ['paused', 'stopped'].includes(overview.control.desired_state || '')
+    || overview.control.worker_state === 'error'
+    || overview.configuration?.state === 'unavailable'
+    || overview.control.receiver_state !== 'page_unavailable'
+    || overview.control.reason_code !== 'native_session_cooldown') return false;
+  return !checkHeartbeat || assistantHeartbeat(overview, now).state === 'fresh';
+}
+
 export function controlLabel(overview: AssistantOverview | null, now = Date.now(), checkHeartbeat = true): AssistantStage {
   if (!overview) return { label: '尚未连接', tone: 'neutral' };
   const state = overview.control.state;
@@ -167,15 +178,18 @@ export function controlLabel(overview: AssistantOverview | null, now = Date.now(
   if (state === 'interrupted') return { label: '进程已中断', tone: 'attention' };
   if (state === 'launch_unknown') return { label: '启动结果待核对', tone: 'attention' };
   if (state === 'pausing') return { label: '正在暂停', tone: 'neutral' };
+  if (overview.control.desired_state === 'stopped') return { label: '正在停止', tone: 'neutral' };
   if (overview.control.worker_state === 'error') return { label: '处理需要核对', tone: 'attention' };
   const receiver = overview.control.receiver_state;
   if (receiver === 'login_required') return { label: '等待助手登录', tone: 'attention' };
-  if (receiver === 'verification_required' || state === 'verification_required') return { label: '等待本人核验', tone: 'attention' };
-  if (receiver === 'page_unavailable') return { label: '页面待恢复', tone: 'attention' };
+  if (receiver === 'verification_required' || state === 'verification_required' || overview.control.reason_code === 'verification_required') return { label: '等待本人核验', tone: 'attention' };
   const heartbeat = checkHeartbeat ? assistantHeartbeat(overview, now) : { state: 'not_expected' };
   if (heartbeat.state === 'stale') return { label: '最近报告已过期', tone: 'attention' };
   if (heartbeat.state === 'missing') return { label: '等待助手报告', tone: 'neutral' };
-  if (state === 'paused') return { label: '已暂停', tone: 'attention' };
+  if (state === 'paused' || overview.control.desired_state === 'paused') return { label: '已暂停', tone: 'attention' };
+  if (overview.configuration?.state === 'unavailable') return { label: '设置需核对', tone: 'attention' };
+  if (isNativeSessionCooldown(overview, now, checkHeartbeat)) return { label: '接口暂时等待', tone: 'attention' };
+  if (receiver === 'page_unavailable') return { label: '收件暂时受阻', tone: 'attention' };
   if (state === 'starting' || receiver === 'starting') return { label: '正在准备页面', tone: 'active' };
   if (['running', 'listening'].includes(state)) return receiver === 'ready' ? { label: '正在收件', tone: 'active' } : { label: '进程运行中', tone: 'neutral' };
   return { label: '等待配置', tone: 'neutral' };

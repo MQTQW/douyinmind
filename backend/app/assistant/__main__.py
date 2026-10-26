@@ -39,6 +39,61 @@ def receive_bounded_batch(runtime, lane, admission_lock, should_stop):
             clear()
 
 
+def signal_native_ui_wakeup(event, outcome):
+    """Internal worker completion may wake the owner, never authorize effects."""
+    if isinstance(outcome, dict) and outcome.get('state') == 'understood':
+        event.set()
+
+
+def native_ui_receipt_current(interpreter, candidate):
+    """RO private native receipt/current owner check for a scheduling hint."""
+    try:
+        from .native_semantic_inbox import native_message_source_key
+        from .semantic_plan_store import decision_metadata
+        from .semantic_resolution import catalog_snapshot_from_grants
+        key = native_message_source_key(candidate)
+        row = interpreter.native_inbox.lookup(key)
+        if row is None or row['state'] != 'understood':
+            return False
+        receipt = interpreter.store.get_native_decision(key)
+        if receipt is None:
+            return False
+        meta = decision_metadata(receipt)
+        message = row['message']
+        fields = ('namespace','recipient_uid','sender_uid','sender_sec_uid','sender_profile_url',
+                  'receiver_profile_url','video_id','native_comment_id','content','notice_type','at_sub_type')
+        if (any(candidate.get(k) != message.get(k) for k in fields)
+                or meta.get('mode') != 'native' or meta.get('source_key') != key
+                or meta.get('plan_id') != row.get('plan_id')
+                or meta.get('native_facts_digest') != row.get('facts_digest')
+                or meta.get('action') not in {'query','save','clarify','cancel'}
+                or interpreter.native_source_authorizer(message) is not True):
+            return False
+        context = interpreter._context(message)
+        if context is None:
+            return False
+        user, device, grants = context
+        owner = {k: message[k] for k in ('sender_profile_url','receiver_profile_url','video_id')}
+        owner.update(user_id=user['user_id'],device_id=device['device_id'],instance_id=device['instance_id'],
+                     reference_id=key,root_reference_id=key)
+        return (meta['owner_scope'] == owner and meta['catalog_snapshot'] == catalog_snapshot_from_grants(grants)
+                and not interpreter.should_stop())
+    except Exception:
+        return False
+
+
+def receive_native_ui_wakeup(event, runtime, lane, admission_lock, should_stop):
+    """Consume a lossy hint without polling the API or marking capture fresh."""
+    if not event.is_set():
+        return []
+    event.clear()
+    ready = getattr(lane, 'ready_persisted_ui_source', None)
+    if should_stop() or not callable(ready) or ready() is not True:
+        return []
+    # All durable once-claim/source/Registry/UI gates remain in this same path.
+    return receive_bounded_batch(runtime, lane, admission_lock, should_stop)
+
+
 def worker_health_state(control_snapshot, counts):
     if control_snapshot.get('desired_state')!='running':
         return 'idle'
@@ -50,11 +105,52 @@ def manual_needs_owner(server):
 
 
 def intervention_health(error):
-    if getattr(error,'native_intake_data_code',None) in {
-        'invalid_native_visibility','invalid_notice_page','invalid_notice_schema','invalid_notice_type',
-        'invalid_notice_time','unknown_comment_type','group_schema_unknown'}:
-        return 'page_unavailable','native_notice_format_unavailable'
+    from .native_lane import NativeSessionPaused
+    if isinstance(error, NativeSessionPaused):
+        from .native_lifecycle import project_native_session_status
+        try:
+            status = project_native_session_status(error.native_session_status)
+            if status['state'] != 'paused' or status['reason_code'] != error.native_failure_code:
+                raise ValueError('native_pause_status_changed')
+        except Exception:
+            return 'page_unavailable','native_failure_unconfirmed'
+        reason = status['reason_code']
+        if getattr(error,'native_intake_data_code',None) in {
+                'invalid_native_visibility','invalid_notice_page','invalid_notice_schema','invalid_notice_type',
+                'invalid_notice_time','unknown_comment_type','group_schema_unknown'}:
+            return 'page_unavailable','native_notice_format_unavailable'
+        if reason == 'api_error':
+            return 'page_unavailable','native_api_error'
+        if reason == 'verification_required':
+            return 'verification_required','native_verification_required'
+        if reason in {'session_invalid','session_expired','authorization_expired','session_cookie_expired'}:
+            return 'login_required','native_session_invalid'
+        if reason == 'session_identity_mismatch':
+            return 'login_required','native_identity_mismatch'
+        if reason in {'invalid_native_visibility','invalid_notice_page','invalid_notice_schema','invalid_notice_type',
+                      'invalid_notice_time','unknown_comment_type','group_schema_unknown'}:
+            return 'page_unavailable','native_notice_format_unavailable'
+        return 'page_unavailable','native_session_needs_review'
     return ('login_required' if '登录' in str(error) else 'verification_required','human_intervention_required')
+
+
+def receiver_page_health(error):
+    """Keep a current typed native cooldown distinct from a DOM failure.
+
+    This changes reporting only: the existing capture delay, source pause and
+    all UI/identity/send gates remain unchanged. Old status attached to a real
+    browser exception cannot reclassify that exception as native transport.
+    """
+    from .native_lane import NativeLaneError
+    from .native_lifecycle import project_native_session_status
+    if isinstance(error,NativeLaneError) and error.code=='native_session_cooldown':
+        try:
+            status=project_native_session_status(getattr(error,'native_session_status',None))
+        except Exception:
+            status=None
+        if status is not None and status['state']=='cooldown':
+            return 'page_unavailable','native_session_cooldown'
+    return 'page_unavailable','page_not_ready'
 
 
 def record_manual_verification(control, run_id, server):
@@ -174,10 +270,12 @@ def run_registered(queue, control, *, poll_seconds=45, publish_gap_seconds=30):
                             protected_paths=(*protected_semantic_paths,semantic_store.path))
                         native_inbox.enable_new_messages()
                         interpreter.configure_native(native_inbox,native_source.native_meaning_checkpoint,
-                            source_store=native_source,hint_store=getattr(lane,'visibility_hint_store',None))
+                            source_store=native_source,hint_store=getattr(lane,'visibility_hint_store',None),
+                            session_lifecycle=getattr(lane,'session_lifecycle',None))
                         native_receiver.semantic_message_sink=native_inbox.record_messages
                         lane.semantic_intake_ready=interpreter.native_intake_ready
                         lane.semantic_candidate_action=interpreter.native_candidate_action
+                        lane.semantic_ui_source_ready=lambda candidate:native_ui_receipt_current(interpreter,candidate)
                 source_authority=getattr(lane,'authority_current',None)
                 if interpreter is not None and callable(source_authority):
                     base_source_authority=source_authority
@@ -242,6 +340,7 @@ def run_registered(queue, control, *, poll_seconds=45, publish_gap_seconds=30):
                 recovery_mailbox=NativeRecoveryMailbox(queue.path.parent,run_id,control)
                 recovery_owner=NativeRecoveryOwner(lane,control,queue,run_id,admission_lock,manual_hold,
                     owner_review,worker_inflight,lambda:manual_needs_owner(manual_server),reply_inspector=bridge.inspect_existing_reply)
+                native_ui_wakeup=threading.Event()
 
                 def work():
                     last_health=None
@@ -263,7 +362,8 @@ def run_registered(queue, control, *, poll_seconds=45, publish_gap_seconds=30):
                             if worker_inflight.is_set():
                                 try:
                                     if interpreter is not None:
-                                        interpreter.process_native_once(run_id)
+                                        meaning=interpreter.process_native_once(run_id)
+                                        signal_native_ui_wakeup(native_ui_wakeup,meaning)
                                     runtime.execute_once()
                                     runtime.poll_waiting_once()
                                 finally:
@@ -358,6 +458,15 @@ def run_registered(queue, control, *, poll_seconds=45, publish_gap_seconds=30):
                             control.set_receiver_health(run_id,'ready' if native_ready else 'starting',
                                 reason_code=None if native_ready else 'native_history_baseline_in_progress')
                             next_capture=time.monotonic()+poll_seconds
+                        elif native_ui_wakeup.is_set():
+                            try:
+                                receive_native_ui_wakeup(native_ui_wakeup,runtime,lane,admission_lock,page_operations_stop)
+                            except ReceiverInterventionRequired:
+                                raise
+                            except Exception:
+                                # No new API capture, lease retry or timer reset.
+                                # Unknown read outcomes retain their original ledger.
+                                control.set_receiver_health(run_id,'page_unavailable',reason_code='native_ui_wakeup_unconfirmed')
                         runtime.process_action_once()
                         # This lane only reads already attempted public replies.
                         # Unknown send reservations never become publish jobs.
@@ -397,7 +506,8 @@ def run_registered(queue, control, *, poll_seconds=45, publish_gap_seconds=30):
                         session_status = getattr(error, 'native_session_status', None)
                         if session_status is not None:
                             control.heartbeat(run_id, native_session_status=session_status)
-                        control.set_receiver_health(run_id,'page_unavailable',reason_code='page_not_ready')
+                        health_state,health_code=receiver_page_health(error)
+                        control.set_receiver_health(run_id,health_state,reason_code=health_code)
                         next_capture=time.monotonic()+poll_seconds
                     except Exception as error:
                         session_status = getattr(error, 'native_session_status', None)

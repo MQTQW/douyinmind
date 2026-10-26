@@ -283,7 +283,7 @@ test('legacy detail markup leaves unmeasured phases missing rather than showing 
 });
 
 test('source links remain exact string video IDs and cannot open arbitrary endpoints', () => {
-  const id = '7529030669884853530';
+  const id = '7900000000000000001';
   assert.equal(view.safeAssistantLink(`https://douyin.com/video/${id}?tracking=discarded`), `https://www.douyin.com/video/${id}`);
   for (const link of ['javascript:alert(1)', 'https://example.com/video/12345', 'https://www.douyin.com:8443/video/12345',
     'https://user:password@www.douyin.com/video/12345', 'https://www.douyin.com/user/self', 'http://www.douyin.com/video/12345']) {
@@ -393,4 +393,63 @@ test('management authorization is sent only in the header, never in the URL or b
   await withFetch(() => assert.fail('no management token means no request'), async () => {
     await assert.rejects(api.updateAssistantRegistry('/users', '', {}), /先确认本机管理/);
   });
+});
+
+
+test('current typed native cooldown is a receive wait, never inferred from a stale session snapshot', () => {
+  const now = Date.parse('2030-01-02T10:00:00Z');
+  const overview = { control: { state: 'running', desired_state: 'running', receiver_state: 'page_unavailable',
+    reason_code: 'native_session_cooldown', heartbeat_at: '2030-01-02T09:59:59Z' } };
+  assert.equal(view.isNativeSessionCooldown(overview, now), true);
+  assert.equal(view.controlLabel(overview, now).label, '接口暂时等待');
+  for (const reason_code of ['page_not_ready', 'intake_result_unconfirmed', null, undefined]) {
+    const ordinary = { control: { ...overview.control, reason_code, native_session_status: { state: 'cooldown' } } };
+    assert.equal(view.isNativeSessionCooldown(ordinary, now), false);
+    assert.equal(view.controlLabel(ordinary, now).label, '收件暂时受阻');
+  }
+});
+
+test('stop, manual pause, real authentication, worker errors and heartbeat outrank a stale cooldown reason', () => {
+  const now = Date.parse('2030-01-02T10:00:00Z');
+  const base = { state: 'running', desired_state: 'running', receiver_state: 'page_unavailable',
+    reason_code: 'native_session_cooldown', heartbeat_at: '2030-01-02T09:59:59Z' };
+  for (const [delta, label] of [
+    [{ state: 'stopped' }, '已停止'], [{ state: 'stopping' }, '正在停止'],
+    [{ desired_state: 'stopped' }, '正在停止'], [{ state: 'pausing' }, '正在暂停'],
+    [{ state: 'paused', desired_state: 'paused' }, '已暂停'], [{ desired_state: 'paused' }, '已暂停'],
+    [{ receiver_state: 'login_required' }, '等待助手登录'],
+    [{ receiver_state: 'verification_required' }, '等待本人核验'],
+    [{ reason_code: 'verification_required' }, '等待本人核验'],
+    [{ worker_state: 'error' }, '处理需要核对'],
+    [{ heartbeat_at: '2030-01-02T09:56:59Z' }, '最近报告已过期'],
+    [{ heartbeat_at: null }, '等待助手报告'],
+  ]) {
+    const overview = { control: { ...base, ...delta } };
+    assert.equal(view.controlLabel(overview, now).label, label, JSON.stringify(delta));
+    assert.equal(view.isNativeSessionCooldown(overview, now), false, JSON.stringify(delta));
+  }
+});
+
+
+test('configuration unavailable cannot be called a receive cooldown and keeps higher-priority states', () => {
+  const now = Date.parse('2030-01-02T10:00:00Z');
+  const base = { control: { state: 'running', desired_state: 'running', receiver_state: 'page_unavailable',
+    reason_code: 'native_session_cooldown', heartbeat_at: '2030-01-02T09:59:59Z' },
+    configuration: { state: 'unavailable', reason_code: 'registry_missing_after_initialization' } };
+  assert.equal(view.isNativeSessionCooldown(base, now), false);
+  assert.equal(view.controlLabel(base, now).label, '设置需核对');
+  for (const [delta, label] of [
+    [{ state: 'stopped' }, '已停止'], [{ state: 'stopping' }, '正在停止'],
+    [{ desired_state: 'stopped' }, '正在停止'], [{ state: 'pausing' }, '正在暂停'],
+    [{ state: 'paused', desired_state: 'paused' }, '已暂停'],
+    [{ receiver_state: 'login_required' }, '等待助手登录'],
+    [{ receiver_state: 'verification_required' }, '等待本人核验'],
+    [{ worker_state: 'error' }, '处理需要核对'],
+    [{ heartbeat_at: '2030-01-02T09:56:59Z' }, '最近报告已过期'],
+    [{ heartbeat_at: null }, '等待助手报告'],
+  ]) {
+    const overview = { ...base, control: { ...base.control, ...delta } };
+    assert.equal(view.controlLabel(overview, now).label, label, JSON.stringify(delta));
+    assert.equal(view.isNativeSessionCooldown(overview, now), false);
+  }
 });

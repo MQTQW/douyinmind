@@ -120,10 +120,20 @@ class BackendKnowledgeTools:
         return self._description.describe()
 
     def query(self, question):
+        return self._query(question)
+
+    def query_with_focus(self, question, *, focus='auto'):
+        if not isinstance(focus, str) or focus not in {'auto', 'current_video', 'authorized_scope'}:
+            raise ValueError('invalid_evidence_focus_mode')
+        return self._query(question, focus=focus, explicit_focus=True)
+
+    def _query(self, question, *, focus='auto', explicit_focus=False):
         if not isinstance(question, str) or not question.strip() or len(question) > MAX_QUESTION_CHARS:
             raise ValueError("invalid_evidence_question")
         body = {"task_id": self.task_id, "question": question.strip()}
-        if self.focus_video_id is not None:
+        if explicit_focus:
+            body['focus'] = focus
+        if focus == 'auto' and self.focus_video_id is not None:
             body["focus_video_id"] = self.focus_video_id
         raw = json.dumps(body, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
         if len(raw) > MAX_REQUEST_BYTES:
@@ -143,7 +153,8 @@ class BackendKnowledgeTools:
                 if len(raw_response) > MAX_RESPONSE_BYTES:
                     raise BackendEvidenceError("backend_evidence_response_too_large")
             result = normalized_evidence_result(decode_json(raw_response), self.knowledge_base_id,
-                allowed_video_ids={self.focus_video_id} if self.focus_video_id else None, query_scope=self.query_scope)
+                allowed_video_ids={self.focus_video_id} if focus == 'auto' and self.focus_video_id else None,
+                query_scope=self.query_scope)
         except BackendEvidenceError:
             raise
         except Exception:

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowDownToLine, ArrowLeft, ArrowRight, BookOpen, Check, ChevronRight, CircleHelp, Clock3, ExternalLink, Inbox, LoaderCircle, Pause, Play, RefreshCw, Search, Settings2, ShieldCheck, Square, Users, X } from 'lucide-react';
 import * as api from '../api';
-import { actionFeedback, assistantCounts, assistantDuration, assistantHeartbeat, assistantNoticeCoveredByAction, assistantScopeLabel, assistantSourceTime, assistantTime, assistantTimingRows, assistantTokenUsage, canResumeTask, canRetryQueryTask, captureSummary, controlLabel, hasActiveAction, hasSendBarrier, intakeStage, libraryChoiceStage, processingStage, replyStage, safeAssistantLink, taskStepLabel, taskIssueExplanation } from '../assistantView';
+import { actionFeedback, assistantCounts, assistantDuration, assistantHeartbeat, assistantNoticeCoveredByAction, assistantScopeLabel, assistantSourceTime, assistantTime, assistantTimingRows, assistantTokenUsage, canResumeTask, canRetryQueryTask, captureSummary, controlLabel, hasActiveAction, hasSendBarrier, intakeStage, isNativeSessionCooldown, libraryChoiceStage, processingStage, replyStage, safeAssistantLink, taskStepLabel, taskIssueExplanation } from '../assistantView';
 import type { AssistantNoticeSource, AssistantStage } from '../assistantView';
 import { demoOverview, demoTaskDetail, demoTasks } from '../assistantDemo';
 import AssistantSettings from './AssistantSettings';
@@ -142,17 +142,20 @@ export default function AssistantPanel() {
   const configurationError = overview?.configuration?.state === 'unavailable'
     ? api.assistantErrorMessage(overview.configuration.reason_code, '助手设置暂时无法读取，已保留原记录。请核对原有授权和助手设置。') : '';
   const receiverState = overview?.control.receiver_state;
+  const receiverCoolingDown = isNativeSessionCooldown(overview, healthNow, !demo);
   const workerError = overview?.control.worker_state === 'error';
   const manual = overview?.control.manual_verification;
   const manualAvailable = !demo && manual?.available === true && manual.url === 'http://127.0.0.1:8767/' && overview?.control.process_alive === true;
   const manualNeeded = ['login_required', 'verification_required'].includes(receiverState || '');
   const receiverHelp = workerError ? '工具处理出现问题，任务记录已保留。请先查看任务详情，再核对处理状态。' : manualAvailable && manualNeeded ? '请打开“本人登录/核验”，直接在核验页处理，不要把密码或验证码发到聊天。检查通过后助手仍暂停，再明确开启并核对原任务，不会自动重发。' : receiverState === 'login_required' ? '后台助手需要重新登录，相关操作已暂停；任务已保留，不会自动重发。登录入口当前不可用，请保留暂停状态。'
     : receiverState === 'verification_required' || overview?.control.reason_code === 'verification_required' ? '后台助手需要本人核验，相关操作已暂停；任务已保留，不会自动重发。核验入口当前不可用，请保留暂停状态。'
+      : heartbeat.state === 'stale' ? '超过 3 分钟没有新的助手报告，请核对运行状态；这不代表已经断线，不会自动重启。'
+        : heartbeat.state === 'missing' ? '尚未收到有效的助手运行报告，请核对运行状态。读取到网页不等于助手正在收件。'
+          : configurationError ? '助手设置暂时无法读取，原指令和任务已保留。请先核对原有设置，确认后再开启助手，不会自动重发。'
+          : receiverCoolingDown ? '收件接口正在短暂等待，稍后继续读取通知。原指令和任务已保留，无需重发评论，也不用为这次接口等待输入验证码。'
       : overview?.control.reason_code === 'native_notice_format_unavailable' ? '通知数据的格式需要核对，收件已暂停，原指令和任务都保留。无需重新发送评论，也不用为这个数据问题输入验证码。'
         : receiverState === 'page_unavailable' ? '后台通知或页面暂时无法读取，原指令和任务已保留。请先核对运行提示，不要重复发送评论。'
-        : heartbeat.state === 'stale' ? '超过 3 分钟没有新的助手报告，请核对运行状态和助手窗口；这不代表已经断线，不会自动重启。'
-          : heartbeat.state === 'missing' ? '尚未收到有效的助手运行报告，请核对助手窗口。读取到网页不等于助手正在收件。'
-            : '暂停处理时，新指令继续排队；停止后不再收件。后台已受理的入库会继续，任务记录保留。';
+        : '暂停处理时，新指令继续排队；停止后不再收件。后台已受理的入库会继续，任务记录保留。';
   const receiverHealthy = !workerError && !configurationError && receiverState === 'ready'
     && overview?.control.state === 'running' && !overview.control.reason_code && (demo || heartbeat.state === 'fresh');
   const counters = assistantCounts(overview?.counts ?? {});
@@ -167,7 +170,7 @@ export default function AssistantPanel() {
     {demo && <div className="assistant-demo-banner"><div><strong>演示数据</strong><span>这些账号和任务是示例；操作只改变本页，不会启动账号、调用模型或发送评论。</span></div><button className="text-button" onClick={() => switchDemo(false)}>返回本机状态<ArrowRight size={14} /></button></div>}
     {configurationError && <div className="assistant-feedback attention assistant-configuration-error" role="alert"><ShieldCheck size={18} /><div><strong>原有助手设置暂不可读</strong><p>{configurationError}</p><button className="text-button" onClick={() => setTab('settings')}>核对原有设置</button></div></div>}
     <section className="assistant-control-card" aria-label="助手运行状态">
-      <div className="assistant-control-copy"><Stage value={receiver} /><h4>{workerError ? '工具处理出现问题，任务记录已保留' : configurationError ? '先核对原有设置，任务记录会保留' : receiver.label === '最近报告已过期' || receiver.label === '等待助手报告' ? '助手运行状态需要核对' : receiver.label === '已暂停' ? '处理已暂停，新指令继续排队' : receiverState === 'ready' && overview?.control.state === 'running' ? '助手正在留意新指令' : ['login_required', 'verification_required', 'page_unavailable'].includes(receiverState || '') ? '先恢复助手页面，再接收新指令' : binding ? '开启后接收新的 @ 指令' : '先确认账号与知识库，再开启收件'}</h4>{!receiverHealthy && <p>{receiverHelp}</p>}<p className="assistant-muted assistant-capture-observation">最近核对抖音通知：{capture.time}<br />仅反映可见通知，不代表全部提醒已收齐。</p></div>
+      <div className="assistant-control-copy"><Stage value={receiver} /><h4>{workerError ? '工具处理出现问题，任务记录已保留' : configurationError ? '先核对原有设置，任务记录会保留' : receiver.label === '最近报告已过期' || receiver.label === '等待助手报告' ? '助手运行状态需要核对' : receiver.label === '已停止' ? '助手已停止，开启后再接收新指令' : receiver.label === '正在停止' ? '助手正在停止，任务记录会保留' : receiver.label === '正在暂停' ? '正在暂停处理，任务记录会保留' : receiver.label === '已暂停' ? '处理已暂停，新指令继续排队' : receiverCoolingDown ? '稍后继续读取通知' : receiverState === 'ready' && overview?.control.state === 'running' ? '助手正在留意新指令' : ['login_required', 'verification_required'].includes(receiverState || '') || overview?.control.reason_code === 'verification_required' ? '先完成本人登录或核验，再接收新指令' : receiverState === 'page_unavailable' ? '收件暂时受阻，请核对通知状态' : binding ? '开启后接收新的 @ 指令' : '先确认账号与知识库，再开启收件'}</h4>{!receiverHealthy && <p>{receiverHelp}</p>}<p className="assistant-muted assistant-capture-observation">最近核对抖音通知：{capture.time}<br />仅反映可见通知，不代表全部提醒已收齐。</p></div>
       <div className="assistant-control-buttons">{manualAvailable && manualNeeded && <a className="ui-button ui-button-primary" href="http://127.0.0.1:8767/" target="_blank" rel="noreferrer"><ShieldCheck size={15} />本人登录/核验</a>}<button className="ui-button ui-button-primary" onClick={() => void control('start')} disabled={Boolean(pending) || !overview?.capabilities.start || Boolean(configurationError) || (manualAvailable && manual?.active === true)}>{pending === 'start' ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />}开启助手</button><button className="ui-button" onClick={() => void control('pause')} disabled={Boolean(pending) || !overview?.capabilities.pause}><Pause size={15} />暂停处理</button><button className="ui-button" onClick={() => void control('stop')} disabled={Boolean(pending) || !overview?.capabilities.stop}><Square size={13} />停止</button></div>
     </section>
     <AssistantOperations diagnostics={demo ? undefined : overview?.diagnostics} demo={demo} heartbeatAt={overview?.control.heartbeat_at} captureCycles={capture.cycles} />

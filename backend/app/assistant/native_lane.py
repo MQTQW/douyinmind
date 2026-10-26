@@ -42,6 +42,20 @@ class NativeLaneError(ReceiverPageError):
         super().__init__(code)
 
 
+class NativeSessionPaused(ReceiverInterventionRequired):
+    """Current native failure provenance, for reporting only; never a retry."""
+    def __init__(self, session_status):
+        try:
+            status = project_native_session_status(session_status)
+            if status['state'] != 'paused':
+                raise ValueError('native_pause_status_required')
+        except Exception:
+            status = None  # Unknown health still travels through the pause path.
+        self.native_session_status = status
+        self.native_failure_code = status['reason_code'] if status is not None else None
+        super().__init__('本机会话或接口需要核对，自动操作已暂停；任务和草稿保留')
+
+
 def _normal(value):
     return re.sub(r'\s+', '', value)
 
@@ -92,6 +106,7 @@ class NativeLane:
         self.visibility_hint_store = None  # Explicit local factory opt-in only.
         self.semantic_intake_ready = None
         self.semantic_candidate_action = None
+        self.semantic_ui_source_ready = None
         self.followup_coordinator = None
 
     @property
@@ -159,13 +174,13 @@ class NativeLane:
                 self.source_store.pause(code if type(code) is str and re.fullmatch(r'[a-z_]{1,80}', code)
                     else 'native_session_unavailable')
                 if session_status['state'] == 'paused':
-                    failure=ReceiverInterventionRequired('本机会话或接口需要核对，自动操作已暂停；任务和草稿保留')
+                    failure=NativeSessionPaused(session_status)
                     # Provenance belongs to THIS failure, never an older store
                     # pause or a visible string that might belong to a comment.
                     if code in {'invalid_native_visibility','invalid_notice_page','invalid_notice_schema',
                                 'invalid_notice_type','invalid_notice_time','unknown_comment_type','group_schema_unknown'}:
                         failure.native_intake_data_code=code
-                    raise self._with_native_session_status(failure) from None
+                    raise failure from None
                 if session_status['state'] == 'cooldown':
                     raise self._with_native_session_status(NativeLaneError('native_session_cooldown')) from None
             if type(code) is str and code in _LOGIN:
@@ -1231,6 +1246,28 @@ class NativeLane:
             return []
         self._plan(claim, rows[0], thread, correlation)
         return rows
+
+    def ready_persisted_ui_source(self):
+        """A lossy scheduling hint only; no claim, API, page or authority grant."""
+        self._owner()
+        try:
+            if (self.should_stop() or self._pending
+                    or not callable(self.semantic_ui_source_ready)):
+                return False
+            control = self.queue.get_control()
+            if (not self.run_id or control.get('run_id') != self.run_id
+                    or control.get('state') != 'running' or control.get('desired_state') != 'running'):
+                return False
+            candidate = self.source_store.peek_ui_candidate()
+            if not isinstance(candidate, dict) or candidate.get('source_kind') != 'native_notice_candidate':
+                return False
+            candidate = self._candidate(candidate)
+            return (self._visibility_scope_current(candidate) is True
+                    and self.semantic_ui_source_ready(deepcopy(candidate)) is True
+                    and not self.should_stop())
+        except Exception:
+            # Races/changed owned stores fall back to the ordinary poll gate.
+            return False
 
     def collect(self):
         self._owner()

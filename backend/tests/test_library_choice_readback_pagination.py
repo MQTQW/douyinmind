@@ -206,9 +206,34 @@ def test_initial_collapsed_root_and_later_more_share_two_click_total_budget(surf
         else{button.before(receipt);button.remove();}
       };
     }''')
-    result=module.observe_existing_choice_reply(adapter(surface,state,monkeypatch),frozen,TEXT)
-    assert result['outcome']=='b_view_visible'
+    receiver=adapter(surface,state,monkeypatch)
+    result=module.observe_existing_choice_reply(receiver,frozen,TEXT)
+    assert result['outcome']=='b_view_visible', (result,receiver.last_choice_readback_diagnostics,
+        surface.page.evaluate('window.readbackClickCount'))
     assert surface.page.evaluate('window.readbackClickCount')==2
+    assert surface.page.evaluate('window.sendCount')==0
+
+
+@pytest.mark.parametrize('change',['actor','duplicate','plain_more','loaded_row','foreign_row'])
+def test_initial_empty_reply_container_does_not_bypass_identity_unique_or_first_page_scope(surface,monkeypatch,change):
+    state=complete(surface);frozen=target(surface,state)
+    surface.page.evaluate('''change=>{
+      const root=document.getElementById('root'),ask=document.getElementById('ask'),
+        selection=document.getElementById('selection'),receipt=document.getElementById('receipt');
+      const group=ask.parentElement;ask.remove();selection.remove();receipt.remove();
+      const button=document.createElement('button');button.textContent='展开5条回复';group.append(button);
+      window.readbackClickCount=0;button.onclick=()=>window.readbackClickCount++;
+      if(change==='actor')document.body.insertAdjacentHTML('beforeend',
+        '<div id="comment-input-container"><a href="https://www.douyin.com/user/wrong-B"><img width="20" height="20"></a></div>');
+      if(change==='duplicate')button.after(button.cloneNode(true));
+      if(change==='plain_more')button.textContent='展开更多';
+      if(change==='loaded_row')group.prepend(ask);
+      if(change==='foreign_row'){const row=document.createElement('article');row.setAttribute('data-e2e','comment-item');group.append(row);row.append(button);}
+    }''',change)
+    result=module.observe_existing_choice_reply(adapter(surface,state,monkeypatch),frozen,TEXT)
+    assert result['outcome']=='delivery_unknown' and result['verification'] is None
+    assert surface.page.evaluate('window.readbackClickCount')==0
+    assert surface.page.evaluate('window.sendCount')==0
 
 
 @pytest.mark.parametrize('noavatar',[False,True])

@@ -351,7 +351,10 @@ class LegacyBridge:
                 'root_envelope':deepcopy(ancestor), 'prior_reply_text':text,
                 'prior_reply_sha256':hashlib.sha256(text.encode()).hexdigest(),
                 'prior_reply_native_comment_id':None, 'instance_id':binding.instance_id,
-                'user_id':task['user_id'], 'device_id':task['device_id']}
+                'user_id':task['user_id'], 'device_id':task['device_id'],
+                'anchor_source_kind':proof.get('source_kind'),
+                'predecessor_task_id':proof.get('root_task_id')
+                    if proof.get('source_kind') == 'conversation_followup' else None}
         except Exception:
             return None
         finally:
@@ -363,8 +366,38 @@ class LegacyBridge:
         anchor = self._followup_root_anchor(root_task_id)
         return anchor is not None and anchor['prior_reply_sha256'] == prior_reply_sha256
 
+    def _followup_origin_anchor(self, task_id):
+        """Collapse only an explicit persisted derivation, never guess a DOM parent.
+
+        The origin's public reply proves participation in the verified Root.
+        A fresh reader must still establish the new A reply and its actual
+        direct/flat parent quality; native parent hints are not rewritten here.
+        """
+        seen, family = set(), None
+        for _ in range(8):
+            if task_id in seen:
+                return None
+            seen.add(task_id)
+            anchor = self._followup_root_anchor(task_id)
+            if anchor is None or any(type(anchor.get(key)) is not str or not anchor[key]
+                    for key in ('user_id', 'device_id', 'instance_id')):
+                return None
+            scope = {key: deepcopy(anchor[key]) for key in
+                ('user_id', 'device_id', 'instance_id', 'root_envelope')}
+            if family is None:
+                family = scope
+            elif scope != family:
+                return None
+            kind, predecessor = anchor.get('anchor_source_kind'), anchor.get('predecessor_task_id')
+            if kind != 'conversation_followup':
+                return anchor if kind in (None, 'library_choice_reply') and predecessor is None else None
+            if type(predecessor) is not str or not re.fullmatch(r'[a-f0-9]{32}', predecessor):
+                return None
+            task_id = predecessor
+        return None
+
     def followup_anchors(self, candidate):
-        """At most three same-owner published locators; never infer DOM parent."""
+        """At most three published origins; distinct derivations stay ambiguous."""
         try:
             if type(candidate) is not dict or candidate.get('source_kind') != 'native_reply_notice_candidate':
                 return []
@@ -388,8 +421,9 @@ class LegacyBridge:
                 roots = [self.queue._raw(r) for r in db.execute("SELECT * FROM assistant_tasks WHERE state='b_view_visible' AND user_id=? AND device_id=? AND json_extract(binding,'$.instance_id')=? AND json_extract(envelope,'$.sender_profile_url')=? AND json_extract(envelope,'$.receiver_profile_url')=? AND json_extract(envelope,'$.video_id')=? ORDER BY updated_at DESC LIMIT 24",
                     (user['user_id'], device['device_id'], device['instance_id'], sender, receiver, video))]
             result = []
+            origins = {}
             for task in roots:
-                anchor = self._followup_root_anchor(task['id'])
+                anchor = self._followup_origin_anchor(task['id'])
                 if anchor is None:
                     continue
                 native = anchor['root_envelope'].get('native_comment_id')
@@ -409,6 +443,12 @@ class LegacyBridge:
                                    and json.loads(r[1]).get('video_id') == video]
                         if len(matches) != 1:
                             continue
+                origin = (anchor['root_task_id'], anchor['root_agent_task_id'])
+                if origin in origins:
+                    if origins[origin] != anchor:
+                        return []
+                    continue
+                origins[origin] = anchor
                 result.append(anchor)
                 if len(result) == 3:
                     break

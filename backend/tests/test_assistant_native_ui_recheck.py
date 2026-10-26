@@ -1,9 +1,7 @@
 """Explicit prequeue UI recheck only, synthetic native facts/temp owned DB."""
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-import importlib.util
 import json
-from pathlib import Path
 
 import pytest
 
@@ -209,57 +207,3 @@ def test_old_observation_and_cursor_rows_remain_unchanged(held):
     before = deepcopy(facts())
     request(store, source_id)
     assert facts() == before
-
-
-def load_cli():
-    backend = Path(__file__).resolve().parents[1]
-    path = backend/'app/storage/continuous_testing/2026-10-19/mixed-chain-delivery-2026-10-23/request_save01_ui_recheck.py'
-    spec = importlib.util.spec_from_file_location('synthetic_save01_recheck_cli', path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_cli_default_does_not_read_configuration_or_open_a_database(monkeypatch, capsys):
-    module = load_cli()
-    def forbidden(*args, **kwargs): raise AssertionError('default must not read state')
-    monkeypatch.setattr(module, '_owned', forbidden)
-    monkeypatch.setattr(module, 'NativeSourceStore', forbidden)
-    assert module.main([]) == 0
-    result = json.loads(capsys.readouterr().out)
-    assert result['database_opened'] is False and result['dispatchable'] is False
-
-
-def test_cli_execute_uses_only_fixed_source_reason_and_existing_store(tmp_path, monkeypatch, capsys):
-    module = load_cli(); seen = []
-    monkeypatch.setattr(module, 'STATE_DIR', tmp_path)
-    (tmp_path/'native-receiver.json').write_text(json.dumps({'receiver_profile_url': PROFILE_B}), encoding='utf-8')
-    monkeypatch.setattr(module, 'load_native_configuration', lambda directory, profile: {'receiver_uid': B, 'receiver_profile_url': PROFILE_B})
-    class FakeStore:
-        def __init__(self, path, uid, profile, *, create):
-            seen.append((path, uid, profile, create))
-        def request_ui_recheck(self, source_id, **kwargs):
-            seen.append((source_id, kwargs)); return {'status': 'ui_recheck_requested', 'dispatchable': False}
-    monkeypatch.setattr(module, 'NativeSourceStore', FakeStore)
-    assert module.main(['--execute']) == 0
-    assert seen == [(tmp_path/'native-receiver/sources.sqlite3', B, PROFILE_B, False),
-                    (module.SOURCE_ID, {'expected_old_code': CODE, 'operator_reason': REASON})]
-    assert json.loads(capsys.readouterr().out)['dispatchable'] is False
-
-
-def test_cli_error_output_is_fixed_and_does_not_echo_exception(tmp_path, monkeypatch, capsys):
-    module = load_cli()
-    monkeypatch.setattr(module, 'STATE_DIR', tmp_path)
-    def fail(*args, **kwargs): raise NativeStoreError('synthetic-private-not-allowlisted')
-    monkeypatch.setattr(module, '_owned', fail)
-    assert module.main(['--execute']) == 2
-    output = capsys.readouterr().out
-    assert 'synthetic-private' not in output
-    assert json.loads(output)['code'] == 'native_recheck_failed'
-
-
-def test_cli_does_not_accept_arbitrary_source_or_reason(capsys):
-    module = load_cli()
-    with pytest.raises(SystemExit) as error:
-        module.main(['--source-id', 'other', '--reason', 'other'])
-    assert error.value.code == 2

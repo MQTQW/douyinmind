@@ -709,15 +709,17 @@ CHOICE_REPLY_STATE_JS = r"""args => {
 CHOICE_READBACK_EXPAND_HANDLE_JS = r"""params => {
  const state=(""" + CHOICE_REPLY_STATE_JS + r""")(params.args);
  if(state.ok&&state.current_receiver_verified===true)return (""" + CHOICE_EXPAND_HANDLE_JS + r""")(params);
- // Real B collapsed layout has no loaded replyContainer yet. This exception
- // only reads the unique numeric native control one wrapper below the exact
- // original Root; later pages still need full selected-parent verification.
+ // The first page can keep an empty, Root-owned replyContainer or expose a
+ // numeric native control one wrapper below the exact original Root. This
+ // read-only opening still needs current B identity; later pages need the
+ // complete selected-parent proof. No partly loaded thread uses this path.
  const thread=(""" + CHOICE_THREAD_JS + r""")(params.args),selector='[data-e2e="comment-item"]';
  if(!thread.ok||thread.details.length!==0||thread.counts.descendant_count!==0||thread.counts.ask_count!==0)return null;
  const node=(""" + CHOICE_EXPAND_HANDLE_JS + r""")(params);
  const root=document.querySelectorAll(selector)[thread.root_index];
  if(!node||node.tagName!=='BUTTON'||node.parentElement?.closest(selector)!==root||
-    node.parentElement.parentElement!==root||!/^(?:展开|查看)\d+(?:\.\d+)?[万wW]?条回复$/.test((node.innerText||'').replace(/\s+/gu,'')))return null;
+    !(node.parentElement.matches('.replyContainer')||node.parentElement.parentElement===root)||
+    !/^(?:展开|查看)\d+(?:\.\d+)?[万wW]?条回复$/.test((node.innerText||'').replace(/\s+/gu,'')))return null;
  const rendered=e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0;};
  const profile=a=>{try{const u=new URL(a.getAttribute('href'),location.href);return u.protocol==='https:'&&
    u.hostname==='www.douyin.com'&&!u.username&&!u.password&&!u.port&&/^\/user\/[^/?#]+$/.test(u.pathname)&&

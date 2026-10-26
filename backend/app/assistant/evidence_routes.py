@@ -6,6 +6,7 @@ import json
 import math
 import re
 import time
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -29,6 +30,7 @@ class EvidenceBody(BaseModel):
     task_id: str = Field(strict=True, pattern=r"^[a-f0-9]{32}$")
     question: str = Field(strict=True, min_length=1, max_length=MAX_QUESTION_CHARS)
     focus_video_id: str | None = Field(default=None, strict=True, pattern=r"^[0-9]{5,30}$")
+    focus: Literal['auto', 'current_video', 'authorized_scope'] = 'auto'
 
 
 def original_comment_focus(envelope):
@@ -83,9 +85,18 @@ class EvidenceService:
         task, binding = self._scope(body.task_id, execution_token)
         if body.focus_video_id is not None and body.focus_video_id != task["envelope"]["video_id"]:
             raise EvidenceError("evidence_focus_scope_mismatch", 403)
-        # A caller may narrow to the original video, never remove a hard focus
-        # already required by the frozen original comment.
-        focus = original_comment_focus(task["envelope"]) or body.focus_video_id
+        # Focus only selects an intersection inside the independently verified
+        # Binding. The model cannot choose a user, library or arbitrary video.
+        # Explicit intent may search that authorized scope for cross-video
+        # questions; old callers retain the original-comment auto heuristic.
+        if body.focus == 'authorized_scope':
+            if body.focus_video_id is not None:
+                raise EvidenceError('evidence_focus_conflict', 422)
+            focus = None
+        elif body.focus == 'current_video':
+            focus = task['envelope']['video_id']
+        else:
+            focus = original_comment_focus(task["envelope"]) or body.focus_video_id
         scope_options = {'query_scope':'all_local'} if binding.is_all_local else {}
         try:
             tools = self.knowledge_factory(self.database, binding.knowledge_base_id, focus_video_id=focus, **scope_options)

@@ -122,7 +122,8 @@ class ImportTools:
         expected = {"request_id": job["job_id"], "binding_id": self.binding.binding_id,
                     "instance_id": self.binding.instance_id, "video_id": self.envelope["video_id"],
                     "knowledge_base_id": self.binding.knowledge_base_id}
-        if any(response.get(key) != value for key, value in expected.items()):
+        if (not isinstance(response, dict) or any(type(response.get(key)) is not type(value)
+                or response.get(key) != value for key, value in expected.items())):
             raise ValueError("import_response_scope_mismatch")
         state = response.get("state")
         if state not in {"pending", "accepted", "processing", "succeeded", "failed", "unknown"}:
@@ -213,9 +214,12 @@ class ImportTools:
         self.observed = True
         return self._result(job)
 
-    @staticmethod
-    def _result(job):
-        return {"status": job["state"], "import_job_id": job["job_id"],
+    def _result(self, job):
+        # A historical success remains durable, but a failed current GET must
+        # not tell the model it has just reverified that success. The final
+        # proposal gate still performs its own fresh read before publication.
+        state = 'unknown' if job['state'] == 'succeeded' and not self.confirmed_succeeded else job['state']
+        return {"status": state, "import_job_id": job["job_id"],
                 "video_id": job["video_id"], "knowledge_base_id": job["knowledge_base_id"]}
 
     def proposal(self):

@@ -17,6 +17,29 @@ from .store import AgentStoreError
 from app.mention_receiver.browser import ReceiverInterventionRequired
 
 
+_LOOKUP_REASONS=frozenset({'invalid_original_target','native_correlation_requires_source_id',
+    'receiver_binding_mismatch','original_lookup_stopped','original_identity_not_ready',
+    'original_notifications_unavailable','original_notification_not_found',
+    'original_notification_candidates_exceed_limit','original_notification_not_unique',
+    'original_notification_changed','original_candidate_unreadable','original_target_not_unique',
+    'original_target_changed','original_native_semantic_ambiguous','original_lookup_unavailable',
+    'matched','intervention_required'})
+
+
+def _fresh_lookup_failure(adapter,previous):
+    lookup=getattr(adapter,'last_original_lookup',None)
+    # The shared opener replaces this dict at the start of each lookup. A
+    # different preparation path must never inherit an earlier task's result.
+    if not isinstance(lookup,dict) or lookup is previous:return {},None
+    counts={key:lookup[key] for key in ('candidate_limit','candidate_count','checked_count',
+        'match_count','unreadable_count','final_rechecks','final_verified','snapshot_changes','page_open_count')
+        if type(lookup.get(key)) is int and 0<=lookup[key]<=100000}
+    stage=lookup.get('lookup_stage_index')
+    if type(stage) is int and 0<=stage<=10:counts['lookup_stage_index']=stage
+    reason=lookup.get('reason_code')
+    return counts,reason if type(reason) is str and reason in _LOOKUP_REASONS else None
+
+
 class ReplyPreflightError(RuntimeError):
     def __init__(self, code: str):
         if not re.fullmatch(r"[a-z][a-z0-9_]{0,127}", code):
@@ -101,6 +124,7 @@ class ReplyPublisher:
                     "attempted": prepared, "submitted": False, "reason_code": "publication_paused"}
 
         directory = None
+        previous_lookup=getattr(self.adapter,'last_original_lookup',None)
         try:
             paused = pause_before_reservation(prepared=False)
             if paused is not None:
@@ -132,14 +156,12 @@ class ReplyPublisher:
             self._hold(task_id, code)
             # Keep only bounded scalar diagnostics. Never persist a page,
             # notification body, signed media URL or arbitrary exception text.
-            lookup = getattr(self.adapter, 'last_original_lookup', {})
-            safe_counts = {key: lookup[key] for key in (
-                'candidate_limit','candidate_count','checked_count','match_count','unreadable_count',
-                'final_rechecks','final_verified','snapshot_changes','page_open_count')
-                if isinstance(lookup, dict) and type(lookup.get(key)) is int and 0 <= lookup[key] <= 100000}
-            if directory is not None and safe_counts:
+            safe_counts,lookup_reason=_fresh_lookup_failure(self.adapter,previous_lookup)
+            if directory is not None and (safe_counts or lookup_reason is not None):
                 try:
-                    self._write(directory, 'preflight_failure.json', {'reason_code': code, 'original_lookup': safe_counts})
+                    self._write(directory, 'preflight_failure.json', {'reason_code': code,
+                        'original_lookup': safe_counts,
+                        **({'lookup_reason_code':lookup_reason} if lookup_reason is not None else {})})
                 except Exception:
                     pass
             return {"state": "preflight_blocked", "task_id": task_id, "attempted": True,

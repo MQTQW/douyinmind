@@ -255,3 +255,59 @@ test('a local action failure survives the next durable action update and is not 
     assert.deepEqual(fakeAPI.calls.filter(c => c[0] === 'action'), [['action', base.id, 'reconcile']]);
   });
 });
+
+
+test('native cooldown heading and help describe notification wait without requesting verification', async () => {
+  await withPanel({ control: { state: 'running', desired_state: 'running', receiver_state: 'page_unavailable',
+    reason_code: 'native_session_cooldown', heartbeat_at: new Date().toISOString() } }, async ({ tree }) => {
+    const copy = nodes(tree, n => n.props.className === 'assistant-control-copy')[0];
+    assert.match(renderToStaticMarkup(copy), /接口暂时等待/);
+    assert.match(text(copy), /稍后继续读取通知/);
+    assert.match(text(copy), /无需重发评论，也不用为这次接口等待输入验证码/);
+    assert.doesNotMatch(text(copy), /先恢复助手页面|等待本人核验|助手窗口/);
+    assert.equal(buttons(tree).filter(n => ['开启助手', '暂停处理', '停止'].includes(text(n))).length, 3);
+    assert.equal(nodes(tree, n => n.type === 'a' && n.props.href === 'http:\/\/127.0.0.1:8767/').length, 0);
+    assert.equal(fakeAPI.calls.some(c => c[0] === 'control'), false);
+  });
+});
+
+test('generic page failure stays uncertain and cannot be relabelled by old native session metadata', async () => {
+  await withPanel({ control: { state: 'running', receiver_state: 'page_unavailable', reason_code: 'page_not_ready',
+    native_session_status: { state: 'cooldown' }, heartbeat_at: new Date().toISOString() } }, async ({ tree }) => {
+    const copy = nodes(tree, n => n.props.className === 'assistant-control-copy')[0];
+    assert.match(text(copy), /收件暂时受阻，请核对通知状态/);
+    assert.match(text(copy), /后台通知或页面暂时无法读取/);
+    assert.match(text(copy), /不要重复发送评论/);
+    assert.doesNotMatch(text(copy), /接口暂时等待|稍后继续读取通知|先恢复助手页面/);
+  });
+});
+
+test('manual pause, stop and expired reports keep priority over receive-wait heading and help', async () => {
+  for (const [delta, expected] of [
+    [{ state: 'paused', desired_state: 'paused' }, /处理已暂停，新指令继续排队/],
+    [{ state: 'stopped', desired_state: 'stopped' }, /助手已停止/],
+    [{ heartbeat_at: '2000-01-01T00:00:00Z' }, /助手运行状态需要核对/],
+  ]) await withPanel({ control: { state: 'running', desired_state: 'running', receiver_state: 'page_unavailable',
+    reason_code: 'native_session_cooldown', heartbeat_at: new Date().toISOString(), ...delta } }, async ({ tree }) => {
+    const copy = nodes(tree, n => n.props.className === 'assistant-control-copy')[0];
+    assert.match(text(copy), expected);
+    assert.doesNotMatch(text(copy), /接口暂时等待|稍后继续读取通知/);
+  });
+});
+
+
+test('configuration failure controls badge and help while preserving the recovery alert and disabled Start', async () => {
+  await withPanel({ configuration: { state: 'unavailable', reason_code: 'registry_missing_after_initialization' },
+    control: { state: 'running', desired_state: 'running', receiver_state: 'page_unavailable',
+      reason_code: 'native_session_cooldown', heartbeat_at: new Date().toISOString() } }, async ({ tree }) => {
+    const copy = nodes(tree, n => n.props.className === 'assistant-control-copy')[0];
+    assert.ok(nodes(tree, n => n.props.className?.includes('assistant-configuration-error'))[0]);
+    assert.match(renderToStaticMarkup(copy), /设置需核对/);
+    assert.match(text(copy), /先核对原有设置，任务记录会保留/);
+    assert.match(text(copy), /请先核对原有设置，确认后再开启助手/);
+    assert.doesNotMatch(renderToStaticMarkup(copy), /接口暂时等待|稍后继续读取通知|收件接口正在短暂等待/);
+    assert.equal(buttons(tree).find(n => text(n) === '开启助手').props.disabled, true);
+    assert.equal(nodes(tree, n => n.type === 'a' && n.props.href === 'http:\/\/127.0.0.1:8767/').length, 0);
+    assert.equal(fakeAPI.calls.some(c => ['control', 'action'].includes(c[0])), false);
+  });
+});

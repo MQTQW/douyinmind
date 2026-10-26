@@ -19,15 +19,60 @@ SELF_URL = "https://www.douyin.com/user/self?from_tab_name=main&showTab=like"
 NOTICE_JS = r"""() => {
   const visible = el => { const r = el.getBoundingClientRect();
     return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight; };
+  // Narrow only a positively identified notification widget. The explicit
+  // listDlgTest-container marker is emitted by the observed public NoticeEntry
+  // component; an alternative widget needs a real expanded-control ARIA link.
+  // Text or floating positioning alone is not ownership. Unknown layouts keep
+  // the conservative legacy whole-page scan.
+  const mains = Array.from(document.querySelectorAll('h1,main,[role="main"]')).filter(visible);
+  const controls = Array.from(document.querySelectorAll('button,[role="button"]')).filter(el =>
+    visible(el) && el.getAttribute('aria-expanded') === 'true' &&
+    ((el.getAttribute('aria-label') || '').trim() === '通知' || (el.innerText || '').trim() === '通知'));
+  const tokens = value => (value || '').trim().split(/\s+/).filter(Boolean);
+  const uniqueId = el => el.id && Array.from(document.querySelectorAll('[id]')).filter(n => n.id === el.id).length === 1;
+  const linked = panel => {
+    if (!uniqueId(panel) || !['dialog','region','menu'].includes(panel.getAttribute('role'))) return false;
+    const parents = controls.filter(control =>
+      tokens(control.getAttribute('aria-controls')).includes(panel.id) ||
+      (uniqueId(control) && tokens(panel.getAttribute('aria-labelledby')).includes(control.id)));
+    return parents.length === 1;
+  };
+  const titles = Array.from(document.querySelectorAll('span,p,div,h1,h2,h3')).filter(el =>
+    visible(el) && (el.innerText || '').trim() === '互动消息' &&
+    !Array.from(el.children).some(child => visible(child) && (child.innerText || '').trim() === '互动消息'));
+  const floatingBoundary = root => {
+    for (let node=root,depth=0;node&&node!==document.body&&node!==document.documentElement&&depth<7;node=node.parentElement,depth++) {
+      if(visible(node)&&/^(absolute|fixed)$/.test(getComputedStyle(node).position)&&!mains.some(main=>node.contains(main)))return true;
+    }
+    return false;
+  };
+  const nativePanels = Array.from(document.querySelectorAll('[data-e2e="listDlgTest-container"]')).filter(panel =>
+    visible(panel) && !mains.some(main=>panel.contains(main)) && floatingBoundary(panel) &&
+    titles.some(title=>panel.contains(title)));
+  const panels = new Set(nativePanels);
+  for (const title of titles) {
+    if(nativePanels.some(panel=>panel.contains(title)))continue;
+    for (let panel = title, depth = 0; panel && panel !== document.body && panel !== document.documentElement && depth < 7; panel = panel.parentElement, depth++) {
+      if (visible(panel) && /^(absolute|fixed)$/.test(getComputedStyle(panel).position) &&
+          !mains.some(main => panel.contains(main)) && linked(panel)) { panels.add(panel); break; }
+    }
+  }
+  // Nested wrappers of one widget are one owner; distinct notification widgets
+  // are not resolved by DOM order or by whichever empty marker renders first.
+  const outerPanels = Array.from(panels).filter(panel=>!Array.from(panels).some(other=>other!==panel&&other.contains(panel)));
+  const ambiguous = nativePanels.length>1 || outerPanels.length>1;
+  const scope = !ambiguous && outerPanels.length === 1 ? outerPanels[0] : document;
+  const inside = el => scope === document || scope.contains(el);
   const profile = href => { try { const u = new URL(href, location.href);
     if (u.hostname !== 'www.douyin.com' || !/^\/user\/[^/?#]+$/.test(u.pathname)) return '';
     return u.origin + u.pathname; } catch { return ''; } };
   const items = [];
   Array.from(document.querySelectorAll('pre')).forEach((pre, index) => {
-    if (!visible(pre)) return;
+    if (!visible(pre) || !inside(pre)) return;
     let row = pre;
     let fallback = null;
     for (let depth = 0; row && depth < 7; depth++, row = row.parentElement) {
+      if (!inside(row)) break;
       if (row !== pre && row.querySelectorAll('pre').length !== 1) break;
       const text = row.innerText || '';
       const sender = Array.from(row.querySelectorAll('a[href]')).find(a =>
@@ -46,17 +91,19 @@ NOTICE_JS = r"""() => {
     if (fallback) items.push(fallback);
   });
   const mentionNodes = Array.from(document.querySelectorAll('span,p,div')).filter(el =>
-    visible(el) && Array.from(el.childNodes).some(n => n.nodeType === 3 && (n.textContent || '').includes('在评论中提到了你')));
+    visible(el) && inside(el) && Array.from(el.childNodes).some(n => n.nodeType === 3 && (n.textContent || '').includes('在评论中提到了你')));
   const emptyNodes = Array.from(document.querySelectorAll('span,p,div')).filter(el =>
-    visible(el) && /^(暂时没有更多了|暂无.*消息)$/.test((el.innerText || '').trim()));
-  const potentialMentions = Array.from(document.querySelectorAll('pre')).filter(el=>visible(el)&&/^@/.test((el.innerText||'').trim()));
-  return {items, visible_mention_count: mentionNodes.length, potential_mention_count:potentialMentions.length, known_end_or_empty: emptyNodes.length > 0};
+    visible(el) && inside(el) && /^(暂时没有更多了|暂无.*消息)$/.test((el.innerText || '').trim()));
+  const potentialMentions = Array.from(document.querySelectorAll('pre')).filter(el=>visible(el)&&inside(el)&&/^@/.test((el.innerText||'').trim()));
+  return {items, visible_mention_count: mentionNodes.length, potential_mention_count:potentialMentions.length,
+    known_end_or_empty: emptyNodes.length > 0, notification_scope_ambiguous: ambiguous};
 }"""
 
 # Return the snapshot that satisfied readiness, rather than waiting on a title
 # and then taking a second snapshot in the middle of a render transition.
 NOTICE_READY_JS = """() => {
   const value = (""" + NOTICE_JS + """)();
+  if (value.notification_scope_ambiguous) return false;
   if (value.visible_mention_count > value.items.length || value.potential_mention_count > value.items.length) return false;
   // Text can render before the cover. Never persist a temporary empty card
   // identity that changes as soon as the image element receives its source.

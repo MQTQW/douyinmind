@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import sync_playwright
 
-from app.mention_receiver.browser import NormalPageReceiver, ReceiverIdentity, REPLY_STATE_JS
+from app.mention_receiver.browser import NormalPageReceiver, ReceiverIdentity, REPLY_STATE_JS, DETAIL_JS
 from app.mention_agent.publisher import ReplyPreflightError
 
 
@@ -53,14 +53,15 @@ def document(body=None, *, actor=B, **kwargs):
 @pytest.fixture(scope='module')
 def installed_browser():
     with sync_playwright() as p:
-        browser = p.chromium.launch(channel='msedge', headless=True)
+        browser = p.chromium.launch(channel='msedge', headless=True,proxy={'server':'http://127.0.0.1:9'},
+            args=['--disable-background-networking','--disable-component-update','--disable-sync','--disable-quic'])
         yield browser
         browser.close()
 
 
 @pytest.fixture
 def page(installed_browser):
-    context = installed_browser.new_context(viewport={'width':1100,'height':1000}, service_workers='block')
+    context = installed_browser.new_context(viewport={'width':1100,'height':1000}, service_workers='block',offline=True)
     context.route('**/*', lambda route: route.abort())
     page = context.new_page()
     yield page
@@ -77,9 +78,12 @@ def adapter(page, monkeypatch, content):
     value = NormalPageReceiver(page, '123456789', B)
     monkeypatch.setattr(value, 'identity', lambda: ReceiverIdentity('123456789', '助手'))
     monkeypatch.setattr(page, 'goto', lambda *a, **k: None)
-    monkeypatch.setattr(value, 'notifications', lambda:[{'source_profile_url':A,'exact_text':QUESTION}])
-    monkeypatch.setattr(value, 'detail', lambda notice,**kwargs:dict(sender_profile_url=A,receiver_profile_url=B,
-        video_id=VID,native_comment_id=None,command_text=QUESTION))
+    monkeypatch.setattr(value, 'notifications', lambda:[{'source_profile_url':A,'exact_text':QUESTION,
+        'semantic_fingerprint':'synthetic-reply-notification','pre_index':0}])
+    # This suite starts at an inline fake DOM, rather than an actual notice
+    # click. Still use the unchanged product detail reader to prove that DOM.
+    monkeypatch.setattr(value, 'detail', lambda notice,**kwargs:page.evaluate(DETAIL_JS,
+        {'sender':A,'wanted':QUESTION,'receiver':B}))
     return value
 
 
@@ -185,3 +189,12 @@ def test_gate_failure_prevents_actual_submit(page, monkeypatch):
     with pytest.raises(ReplyPreflightError,match='run_stopped'):
         value.submit_reply(TARGET,ANSWER,before_submit=gate)
     assert page.evaluate('window.submitCount') == 0
+
+
+def test_missing_notice_fingerprint_still_rejects_before_touching_inline_draft(page,monkeypatch):
+    value=adapter(page,monkeypatch,document(draft='原有未发文字'))
+    monkeypatch.setattr(value,'notifications',lambda:[{'source_profile_url':A,'exact_text':QUESTION}])
+    with pytest.raises(ReplyPreflightError,match='original_notifications_unavailable'):
+        value.prepare_reply(TARGET,ANSWER)
+    assert page.get_by_role('combobox',include_hidden=True).inner_text()=='原有未发文字'
+    assert page.evaluate('window.submitCount')==0

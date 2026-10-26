@@ -2,6 +2,8 @@
 from .commands import CommandResolver
 from .semantic_resolution import (catalog_snapshot_from_grants,owner_scope_from_envelope,semantic_source_key)
 from .semantic_plan_store import SemanticPlanError,ui_semantic_digest
+from .native_lifecycle import NativeSessionLifecycle
+from .native_source_store import NativeSourceStore
 
 
 class SemanticIntentInterpreter:
@@ -13,13 +15,21 @@ class SemanticIntentInterpreter:
         self.native_source_authorizer=None
         self.native_source_store=None
         self.native_hint_store=None
+        self.native_session_lifecycle=None
 
-    def configure_native(self,inbox,source_authorizer,*,source_store=None,hint_store=None):
+    def configure_native(self,inbox,source_authorizer,*,source_store=None,hint_store=None,session_lifecycle=None):
         if not callable(source_authorizer):raise SemanticPlanError('semantic_scope_unavailable')
+        if session_lifecycle is not None and (type(session_lifecycle) is not NativeSessionLifecycle
+                or type(source_store) is not NativeSourceStore
+                or session_lifecycle.expected_uid != inbox.receiver_uid
+                or source_store.receiver_uid != inbox.receiver_uid
+                or source_store.receiver_profile_url != inbox.receiver_profile_url):
+            raise SemanticPlanError('semantic_scope_unavailable')
         self.native_inbox=inbox
         self.native_source_authorizer=source_authorizer
         self.native_source_store=source_store
         self.native_hint_store=hint_store
+        self.native_session_lifecycle=session_lifecycle
 
     def native_intake_ready(self):
         if self.native_inbox is None:return True
@@ -67,7 +77,12 @@ class SemanticIntentInterpreter:
     def process_native_once(self,owner='semantic-tools-worker'):
         """Tools thread only: never calls a browser, RAG, import or publisher."""
         if self.native_inbox is None or self.should_stop():return None
-        claim=self.native_inbox.claim_next(owner,lease_seconds=300)
+        if self.native_session_lifecycle is None:
+            claim=self.native_inbox.claim_next(owner,lease_seconds=300)
+        else:
+            with self.native_session_lifecycle.native_meaning_claim_window() as can_claim:
+                if can_claim is not True:return None
+                claim=self.native_inbox.claim_next(owner,lease_seconds=300)
         if claim is None:return None
         message=claim['message'];key=claim['source_key'];token=claim['claim_token']
         try:

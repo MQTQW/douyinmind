@@ -19,10 +19,53 @@ from .answer_requirements import (AnswerRequirementError, QUOTE_CODES, parse_ans
     tools_for_requirements, requirement_instruction, quote_error_hint, validate_quotes)
 
 
+MAX_REPLY_SOURCES = 8  # Existing retrieval and product task-source bound.
+_PUBLIC_QUOTATIONS = re.compile(r'“(.*?)”|「(.*?)」|『(.*?)』|‘(.*?)’|"(.*?)"', re.S)
+
+
+def _literal_quote_support(text, source_ids, provided_texts, *, labels=(), attributed_spans=None):
+    """Check identifiable literal citations, not general semantic entailment.
+
+    Names, short terminology and ordinary rhetorical quotation are not assumed
+    to be transcript citations. Explicit excerpt introductions and complete
+    quoted sentences are checked only against text actually shown this run.
+    Matching IDs remain a subset of the model's declaration, never all hits.
+    """
+    normalize = lambda value: ' '.join(value.split())
+    label_set = {normalize(value) for value in labels}
+    support = []
+    for match in _PUBLIC_QUOTATIONS.finditer(text):
+        excerpt = next(value for value in match.groups() if value is not None)
+        normalized = normalize(excerpt)
+        prefix = text[max(0, match.start() - 32):match.start()]
+        explicit = bool(re.search(
+            r'(?:原文(?:依据)?|原话|引文|摘录|引用|依据)\s*[1-9一二三①②③]?\s*'
+            r'(?:是|为|写道|说|提到|指出|强调|记载)?\s*[:：，,]?\s*$', prefix)
+            or re.search(r'(?:资料中?|视频中?)(?:写道|说|指出|强调|记载)\s*[:：，,]?\s*$', prefix))
+        if normalized in label_set and not explicit:
+            continue
+        substantive = len(''.join(excerpt.split())) >= 6 and sum(char.isalnum() for char in excerpt) >= 4
+        naming = bool(re.search(r'(?:名为|名叫|叫作|称为|称作|人名|术语|名称|标题|命令)\s*(?:是|为)?\s*[:：]?\s*$', prefix))
+        sentence = substantive and not naming and normalized.endswith(('。', '！', '？'))
+        if not explicit and not sentence:
+            continue
+        matches = [source for source in source_ids if normalized and any(
+            normalized in normalize(context) for context in provided_texts.get(source, []))]
+        if not matches:
+            raise ValueError('public_quote_not_supported')
+        if explicit and attributed_spans is not None:
+            group = next(index for index, value in enumerate(match.groups(), 1) if value is not None)
+            attributed_spans.append(match.span(group))
+        support.append({'excerpt_sha256': hashlib.sha256(normalized.encode('utf-8')).hexdigest(),
+                        'source_ids': matches})
+    return support
+
+
 _SAFE_TOOL_AUDIT_CODES = QUOTE_CODES | frozenset({
     'library_not_allowed', 'invalid_question', 'invalid_evidence_scope', 'invalid_evidence',
+    'invalid_evidence_focus',
     'source_identity_conflict', 'reply_must_be_a_separate_tool_call', 'query_required_before_answer',
-    'invalid_source_ids', 'undeclared_source_reference', 'reply_too_long', 'invalid_public_reply',
+    'invalid_source_ids', 'undeclared_source_reference', 'public_quote_not_supported', 'reply_too_long', 'invalid_public_reply',
     'write_success_not_supported', 'query_required_before_no_evidence', 'invalid_clarification_reason',
     'tool_not_allowed', 'explicit_save_command_required', 'import_run_stopped', 'import_status_required',
     'import_status_unverified', 'invalid_import_status', 'import_response_scope_mismatch', 'invalid_tool_arguments',
@@ -43,7 +86,7 @@ TOOLS = [
              ["knowledge_base_id", "question"]),
     function("propose_reply", "依据已经返回的原文，提出在当前原评论下回复的正文和依据编号。必须单独调用。",
              {"text": {"type": "string", "minLength": 1, "maxLength": 280},
-              "source_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 3}},
+              "source_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": MAX_REPLY_SOURCES}},
              ["text", "source_ids"]),
     function("request_clarification", "需要明确需求、库未绑定、没有原文或当前动作未支持时，选择明确原因。",
              {"reason_code": {"type": "string", "enum": ["ambiguous_request", "library_not_allowed", "no_evidence", "unsupported_action"]}},
@@ -238,6 +281,8 @@ class AgentEngine:
             "不必每次用‘视频里说’开头，不套固定的总分总、要点模板；只有适合本题时才分点。"
             "不编造亲身经历、不冒充真人，也不声称能够规避平台核验或风控。"
             "source_ids必须来自刚返回的原文编号，仅用于内部核对；公开正文不加来源标签或资料编号。"
+            "只列出实际用于这次回答的来源，不把所有候选都当引用；最多8个。"
+            "逐字摘录必须保持原字句，并声明承载该摘录的实际来源；人名和短术语的自然引号不代表原文引用。"
             "若正文引用了资料N，每个编号仍必须列入source_ids，不能多写其他编号。"
             "一次工具消息中的多个调用不可并行假定已完成，回复提议应等看过结果后单独调用。\n"
             + ("本轮固定查询范围：" if binding.is_all_local else "绑定的唯一知识库：") + canonical_json(library)
@@ -278,6 +323,7 @@ class AgentEngine:
         requirement = parse_answer_requirements(envelope['comment_text'])
         reply_text_limit = min(self.max_reply_chars, 280) if requirement is not None else self.max_reply_chars
         selected_tools = deepcopy(tools_for_requirements(TOOLS + IMPORT_TOOLS if self.ingestion is not None else TOOLS, requirement))
+        focus_query = getattr(self.knowledge, 'query_with_focus', None)
         for tool in selected_tools:
             if tool['function']['name'] == 'propose_reply':
                 tool['function']['parameters']['properties']['text']['maxLength'] = reply_text_limit
@@ -287,6 +333,15 @@ class AgentEngine:
                     tool['function']['description']='查询本轮已经固定并获准的本人本机全部已入库资料原文；不能选择其它范围。'
                     tool['function']['parameters']['properties'].pop('knowledge_base_id')
                     tool['function']['parameters']['required']=['question']
+        if callable(focus_query):
+            for tool in selected_tools:
+                if tool['function']['name'] == 'query_knowledge_base':
+                    tool['function']['parameters']['properties']['focus'] = {'type': 'string',
+                        'enum': ['auto', 'authorized_scope', 'current_video']}
+                    tool['function']['description'] += (
+                        ' 可选focus只控制既定授权资料范围内的检索侧重，不选择账号、库或视频编号。'
+                        '比较当前视频与以前资料时用authorized_scope；只问当前视频内容时用current_video；'
+                        '未明确时可省略或用auto，由程序保留原规则。')
         if requirement is not None and not requirement.issue:
             messages[0]['content'] += '\n'+requirement_instruction(requirement)
         source_chars, total_calls, queried = 0, 0, False
@@ -366,6 +421,7 @@ class AgentEngine:
                 record("tool_call", {"round": round_number, "tool_name": name if isinstance(name, str) else "invalid"})
                 proposal = None
                 validated_quotes = None
+                literal_support = None
                 # Measure this invocation and its result validation directly;
                 # ledger writes/model rounds are outside this interval.
                 tool_started = time.monotonic()
@@ -374,8 +430,12 @@ class AgentEngine:
                         parse_tool_arguments(raw, set(), set())
                         result = {"status": "ok", "libraries": [library]}
                     elif name == "query_knowledge_base":
-                        keys={'question'} if binding.is_all_local else {'knowledge_base_id','question'}
-                        args = parse_tool_arguments(raw, keys, keys)
+                        required={'question'} if binding.is_all_local else {'knowledge_base_id','question'}
+                        keys=required | ({'focus'} if callable(focus_query) else set())
+                        args = parse_tool_arguments(raw, keys, required)
+                        if 'focus' in args and (type(args['focus']) is not str
+                                or args['focus'] not in {'auto', 'authorized_scope', 'current_video'}):
+                            raise ValueError('invalid_evidence_focus')
                         if not binding.is_all_local and (type(args["knowledge_base_id"]) is not int
                                 or args["knowledge_base_id"] != binding.knowledge_base_id):
                             raise ValueError("library_not_allowed")
@@ -387,7 +447,8 @@ class AgentEngine:
                             from app.services.conversation_query import build_retrieval_query
                             question = build_retrieval_query(question, self.conversation_context["prior_questions"])
                         try:
-                            result = self.knowledge.query(question)
+                            result = (focus_query(question, focus=args['focus']) if 'focus' in args
+                                      else self.knowledge.query(question))
                         except Exception:
                             raise ToolExecutionFailure("knowledge_query_failed") from None
                         if (not isinstance(result, dict) or 'knowledge_base_id' not in result
@@ -477,19 +538,23 @@ class AgentEngine:
                         if not queried:
                             raise ValueError("query_required_before_answer")
                         ids = args["source_ids"]
-                        if (not isinstance(ids, list) or not 1 <= len(ids) <= 3
+                        if (not isinstance(ids, list) or not 1 <= len(ids) <= MAX_REPLY_SOURCES
                                 or any(not isinstance(key, str) or key not in sources for key in ids)
                                 or len(set(ids)) != len(ids)):
                             raise ValueError("invalid_source_ids")
-                        text = self._public_text(args["text"], maximum=reply_text_limit)
+                        text = self._public_text(args["text"], maximum=reply_text_limit, check_write_claims=False)
                         mentioned = {"资料" + number for number in re.findall(r"资料\s*(\d+)", unicodedata.normalize("NFKC", text))}
                         if not mentioned.issubset(set(ids)):
                             raise ValueError("undeclared_source_reference")
                         text = self._public_text(re.sub(r"\[来源\s*[:：][^\]]*\]", "", text),
-                            maximum=reply_text_limit)
+                            maximum=reply_text_limit, check_write_claims=False)
                         if requirement is not None:
                             validated_quotes=validate_quotes(requirement,args.get('evidence_quotes'),text,ids,provided_texts,
                                 non_evidence_labels=(library['name'],*self.allowed_library_names))
+                        attributed_spans = []
+                        literal_support = _literal_quote_support(text, ids, provided_texts,
+                            labels=(library['name'], *self.allowed_library_names), attributed_spans=attributed_spans)
+                        self._check_write_claims(text, attributed_spans)
                         if len(text) > self.max_reply_chars:
                             raise ValueError("reply_too_long")
                         proposal = {"text": text, "source_ids": ids, "kind": "answer",
@@ -527,8 +592,9 @@ class AgentEngine:
                     # Fixed codes only: no raw provider/DB errors or credentials.
                     code = error.code if isinstance(error,AnswerRequirementError) else str(error) if str(error) in {
                         "library_not_allowed", "invalid_question", "invalid_evidence_scope", "invalid_evidence",
+                        "invalid_evidence_focus",
                         "source_identity_conflict", "reply_must_be_a_separate_tool_call", "query_required_before_answer",
-                        "invalid_source_ids", "undeclared_source_reference", "reply_too_long", "invalid_public_reply", "write_success_not_supported",
+                        "invalid_source_ids", "undeclared_source_reference", "public_quote_not_supported", "reply_too_long", "invalid_public_reply", "write_success_not_supported",
                         "query_required_before_no_evidence", "invalid_clarification_reason", "tool_not_allowed",
                         "explicit_save_command_required", "import_run_stopped", "import_status_required",
                         "import_status_unverified", "invalid_import_status", "import_response_scope_mismatch",
@@ -536,6 +602,8 @@ class AgentEngine:
                     result = {"status": "error", "code": code}
                     if code == "undeclared_source_reference":
                         result["hint"] = "正文中的资料编号必须全部在source_ids中；编号只作内部核对，公开正文不加来源标签或编号。请修正后单独propose_reply。"
+                    if code == 'public_quote_not_supported':
+                        result['hint'] = '逐字引文必须出自本轮实际提供且列入source_ids的原文；请修正摘录或实际来源，不能引用截断外、历史或未提供内容。保持原轮数与长度限制。'
                     if requirement is not None and (code in QUOTE_CODES or code in {'reply_too_long','invalid_public_reply','invalid_tool_arguments','invalid_source_ids'}):
                         result['hint']=quote_error_hint(requirement)
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": canonical_json(result)})
@@ -553,6 +621,11 @@ class AgentEngine:
                 if validated_quotes is not None and result['status']=='reply_proposed':
                     audit['answer_requirement']={'minimum':requirement.minimum,'maximum':requirement.maximum,
                         'quotes':[{**item,'excerpt_sha256':hashlib.sha256(item['excerpt'].encode('utf8')).hexdigest()} for item in validated_quotes]}
+                if name == 'propose_reply' and result['status'] == 'reply_proposed':
+                    audit['source_ids'] = list(proposal['source_ids'])
+                    audit['source_count'] = len(proposal['source_ids'])
+                    if literal_support:
+                        audit['quote_support'] = {'kind': 'literal_match_only', 'quotes': literal_support}
                 record("tool_result", audit)
                 if proposal is not None:
                     if not scope_active():
@@ -562,14 +635,25 @@ class AgentEngine:
                     return Decision(proposal, model_rounds=round_number, tool_calls=total_calls)
         return Decision(review_code="model_round_budget_exceeded", model_rounds=self.max_rounds, tool_calls=total_calls)
 
-    def _public_text(self, text, *, maximum=None):
+    @staticmethod
+    def _check_write_claims(text, attributed_spans=()):
+        # Mask ONLY verified, explicitly attributed excerpt contents for this
+        # check. The original body/audit text and all text outside those spans
+        # remain intact; one valid quote never exempts the rest of an answer.
+        masked = list(text)
+        for start, end in attributed_spans:
+            masked[start:end] = [char if char in '\n\t' else ' ' for char in text[start:end]]
+        if re.search(r"(?:已|已经|成功).{0,10}(?:入库|导入|上传|删除|重置|保存|收藏|索引)", ''.join(masked)):
+            raise ValueError('write_success_not_supported')
+
+    def _public_text(self, text, *, maximum=None, check_write_claims=True):
         maximum = self.max_reply_chars if maximum is None else min(maximum, self.max_reply_chars)
         if (not isinstance(text, str) or not text.strip() or len(text) > maximum
                 or "@" in text or re.search(r"https?://", text, re.I)
                 or any(ord(char) < 32 and char not in "\n\t" for char in text)):
             raise ValueError("invalid_public_reply")
-        if re.search(r"(?:已|已经|成功).{0,10}(?:入库|导入|上传|删除|重置|保存|收藏)", text):
-            raise ValueError("write_success_not_supported")
+        if check_write_claims:
+            self._check_write_claims(text)
         return text.strip()
 
     @staticmethod

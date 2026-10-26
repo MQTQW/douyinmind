@@ -28,11 +28,45 @@ _ID = re.compile(r"[1-9][0-9]{0,29}", re.ASCII)
 _ZERO = re.compile(r"(?:0|[1-9][0-9]{0,29})", re.ASCII)
 
 
+ENDPOINT_ROLES = {
+    PREFIX + "query/user/": "identity",
+    PREFIX + "notice/count/": "notice_count",
+    PREFIX + "notice/": "notice_list",
+    PREFIX + "notice/detail/": "notice_detail",
+}
+
+
+def project_native_transport_facts(value):
+    """Memory-only fixed facts, never an authority or raw-response projection.
+
+    Unknown keys are not read. Missing/ill-typed/oversized optional numbers are
+    omitted, not coerced to zero; without a known endpoint role nothing exports.
+    """
+    if type(value) is not dict:
+        return {}
+    role = value.get("endpoint_role")
+    if type(role) is not str or role not in ENDPOINT_ROLES.values():
+        return {}
+    result = {"endpoint_role": role}
+    status = value.get("http_status")
+    if type(status) is int and 100 <= status <= 599:
+        result["http_status"] = status
+    code = value.get("api_status_code")
+    if type(code) is int and -(2 ** 31) <= code < 2 ** 31:
+        result["api_status_code"] = code
+    return result
+
+
 class NativeTransportError(RuntimeError):
-    def __init__(self, code):
+    def __init__(self, code, *, transport_facts=None):
+        self._transport_facts = tuple(project_native_transport_facts(transport_facts).items())
         # Only module-authored literal codes are passed to this constructor.
         self.code = code if type(code) is str and re.fullmatch(r"[a-z_]{1,64}", code) else "transport_error"
         super().__init__(self.code)
+
+    @property
+    def transport_facts(self):
+        return dict(self._transport_facts)
 
 
 def fail(code):
@@ -186,6 +220,15 @@ class NativeTransport:
             fail("identity_not_verified")
 
     def _get_json(self, path, parameters):
+        facts = project_native_transport_facts({"endpoint_role": ENDPOINT_ROLES.get(path)}) if type(path) is str else {}
+        try:
+            return self._get_json_checked(path, parameters, facts)
+        except NativeTransportError as error:
+            # Only this call's fixed route/validated response numbers survive.
+            # An injected network exception cannot supply its own facts.
+            raise NativeTransportError(error.code, transport_facts=facts) from None
+
+    def _get_json_checked(self, path, parameters, facts):
         self._guard(verified=False)
         if path not in PATH_KEYS or type(parameters) is not dict or set(parameters) - PATH_KEYS[path]:
             fail("request_not_allowed")
@@ -210,6 +253,7 @@ class NativeTransport:
                 or type(response[0]) is not int or type(response[1]) is not bytes):
             fail("network_response_invalid")
         status, body = response
+        facts["http_status"] = status
         if 300 <= status < 400:
             fail("redirect_denied")
         if status in (401, 403):
@@ -223,6 +267,7 @@ class NativeTransport:
         code = value.get("status_code")
         if type(code) is not int:
             fail("invalid_response_status")
+        facts["api_status_code"] = code
         message = value.get("status_msg", "")
         message = message.casefold() if type(message) is str else ""
         if any(value.get(key) for key in ("captcha_required", "verify_required", "isRiskManagementVerifyError", "verify_center_decision_conf")) or any(

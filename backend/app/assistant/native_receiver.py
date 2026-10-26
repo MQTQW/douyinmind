@@ -7,13 +7,18 @@ import time
 from .native_events import (NativeEventError, canonical_profile, project_page,
     project_ui_review_hints, project_semantic_messages)
 from .native_source_store import NativeSourceStore, NativeStoreError
-from .native_transport import NativeTransportError, decimal_id
+from .native_transport import NativeTransportError, decimal_id, project_native_transport_facts
 
 
 class NativeReceiverError(RuntimeError):
-    def __init__(self, code):
+    def __init__(self, code, *, transport_facts=None):
+        self._transport_facts = tuple(project_native_transport_facts(transport_facts).items())
         self.code = code if type(code) is str and re.fullmatch(r"[a-z_]{1,80}", code) else "native_receiver_error"
         super().__init__(self.code)
+
+    @property
+    def transport_facts(self):
+        return dict(self._transport_facts)
 
 
 class NativeReceiver:
@@ -125,7 +130,7 @@ class NativeReceiver:
                 self.store.pause(error.code)
             except NativeStoreError:
                 pass
-            raise NativeReceiverError(error.code) from None
+            raise NativeReceiverError(error.code, transport_facts=getattr(error, "transport_facts", None)) from None
         except Exception:
             self._last_code = "native_receiver_error"
             try:
@@ -155,7 +160,7 @@ class NativeReceiver:
                 self.store.pause(error.code)
             except Exception:
                 pass
-            raise NativeReceiverError(error.code) from None
+            raise NativeReceiverError(error.code, transport_facts=getattr(error, "transport_facts", None)) from None
         except Exception:
             self._last_code = "native_receiver_error"
             try:

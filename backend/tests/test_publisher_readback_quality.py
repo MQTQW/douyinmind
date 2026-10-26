@@ -39,9 +39,12 @@ def test_unknown_or_private_quality_not_projected_or_treated_as_publication_fail
 
 def test_failed_target_lookup_saves_only_bounded_integer_counts(make_context):
     adapter=FakeAdapter(prepare_error=RuntimeError('SYNTHETIC_PRIVATE_ERROR'))
-    adapter.last_original_lookup={'candidate_limit':3,'candidate_count':2,'checked_count':1,
+    current_lookup={'candidate_limit':3,'candidate_count':2,'checked_count':1,
         'match_count':True,'final_verified':'SYNTHETIC_PRIVATE','page_open_count':100001,
         'reason_code':'SYNTHETIC_PRIVATE','raw_body':'SYNTHETIC_PRIVATE'}
+    # The real opener starts a fresh record during this preparation; an old
+    # adapter record from a previous task is deliberately not failure evidence.
+    adapter.prepare_hook=lambda:setattr(adapter,'last_original_lookup',current_lookup)
     context=make_context(adapter=adapter)
     result=context.publisher.publish(context.task_id)
     assert result['state']=='preflight_blocked'
