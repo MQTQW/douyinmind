@@ -159,6 +159,13 @@ export function assistantHeartbeat(overview: AssistantOverview | null, now = Dat
   return { state: now - stamp > 180000 ? 'stale' : 'fresh', at: at! };
 }
 
+// UI-only redundancy guard. Other capability and recovery gates remain independent.
+export function isAssistantStartRedundant(overview: AssistantOverview | null): boolean {
+  return Boolean(overview && overview.control.process_alive === true
+    && overview.control.desired_state === 'running'
+    && ['running', 'listening'].includes(overview.control.state));
+}
+
 // Current typed receiver reason only; a prior native-session snapshot is not evidence.
 export function isNativeSessionCooldown(overview: AssistantOverview | null, now = Date.now(), checkHeartbeat = true): boolean {
   if (!overview || !['running', 'listening'].includes(overview.control.state)

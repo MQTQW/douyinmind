@@ -311,3 +311,64 @@ test('configuration failure controls badge and help while preserving the recover
     assert.equal(fakeAPI.calls.some(c => ['control', 'action'].includes(c[0])), false);
   });
 });
+
+
+test('already running or listening disables redundant Start including a normal cooldown', async () => {
+  for (const change of [
+    { state: 'running', receiver_state: 'ready' },
+    { state: 'listening', receiver_state: 'ready' },
+    { state: 'running', receiver_state: 'page_unavailable', reason_code: 'native_session_cooldown',
+      native_session_status: { state: 'cooldown', generation: 1, refresh_count: 1,
+        source: 'same_context', seal_state: 'sealed', reason_code: null,
+        transient_failures: 2, last_transient_code: 'network_timeout', retry_after_seconds: 90 } },
+  ]) {
+    await withPanel({ capabilities: { start: true, pause: true, stop: true }, control: {
+      ...change, desired_state: 'running', process_alive: true, heartbeat_at: new Date().toISOString(),
+    } }, async ({ tree }) => {
+      const start = buttons(tree).find(n => text(n) === '开启助手');
+      assert.equal(start.props.disabled, true, JSON.stringify(change));
+      assert.match(renderToStaticMarkup(start), /disabled=""/);
+      assert.equal(buttons(tree).find(n => text(n) === '暂停处理').props.disabled, false);
+      assert.equal(buttons(tree).find(n => text(n) === '停止').props.disabled, false);
+      assert.equal(fakeAPI.calls.some(c => c[0] === 'control'), false);
+    });
+  }
+});
+
+test('paused stopped and recovery Start entries retain the existing fake action', async () => {
+  for (const change of [
+    { state: 'paused', desired_state: 'paused', process_alive: true },
+    { state: 'running', desired_state: 'paused', process_alive: true },
+    { state: 'stopped', desired_state: 'stopped', process_alive: false },
+    { state: 'interrupted', desired_state: 'running', process_alive: false },
+    { state: 'recovering', desired_state: 'running', process_alive: false },
+    { state: 'running', desired_state: 'running', process_alive: false },
+    { state: 'running', desired_state: 'running' },
+  ]) {
+    await withPanel({ capabilities: { start: true, pause: true, stop: true }, control: {
+      ...change, heartbeat_at: new Date().toISOString(),
+    } }, async ({ tree, settle }) => {
+      const start = buttons(tree).find(n => text(n) === '开启助手');
+      assert.equal(start.props.disabled, false, JSON.stringify(change));
+      assert.doesNotMatch(renderToStaticMarkup(start), /disabled=""/);
+      start.props.onClick(); await settle();
+      assert.deepEqual(fakeAPI.calls.filter(c => c[0] === 'control'), [['control', 'start']]);
+    });
+  }
+});
+
+test('existing capability configuration and manual gates still disable Start', async () => {
+  const control = { state: 'paused', desired_state: 'paused', process_alive: true, heartbeat_at: new Date().toISOString() };
+  for (const change of [
+    { capabilities: { start: false, pause: true, stop: true }, control },
+    { capabilities: { start: true, pause: true, stop: true }, control, configuration: { state: 'unavailable' } },
+    { capabilities: { start: true, pause: true, stop: true }, control: { ...control, manual_verification: {
+      available: true, active: true, url: 'http://127.0.0.1:8767/',
+    } } },
+  ]) {
+    await withPanel(change, async ({ tree }) => {
+      assert.equal(buttons(tree).find(n => text(n) === '开启助手').props.disabled, true);
+      assert.equal(fakeAPI.calls.some(c => c[0] === 'control'), false);
+    });
+  }
+});
