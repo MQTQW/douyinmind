@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from 'react';
+import { lazy, Suspense, useState, useRef, useCallback, useEffect } from 'react';
 import SourcesPanel from '../components/SourcesPanel';
 import ChatPanel from '../components/ChatPanel';
 import * as api from '../api';
@@ -6,11 +6,13 @@ import { subscribePageReturn } from '../pageRefresh';
 import { BookOpen, ChevronLeft, Download, Files, LogOut, Menu, MessagesSquare, Plus } from 'lucide-react';
 import type { WorkspaceView } from '../workspaceView';
 
+const AssistantPanel = lazy(() => import('../components/AssistantPanel'));
+
 interface Props { onLogout: () => void; loggedIn: boolean; }
 
 export default function Workspace({ onLogout, loggedIn }: Props) {
   const [leftWidth, setLeftWidth] = useState(272);
-  const [view, setView] = useState<WorkspaceView>('chat');
+  const [view, setView] = useState<WorkspaceView>(() => typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('panel') === 'assistant' ? 'assistant' : 'chat');
   const [contentContainer, setContentContainer] = useState<HTMLDivElement | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [selectedCollectionId, setSelectedCollectionId] = useState<string>('all');
@@ -178,26 +180,28 @@ export default function Workspace({ onLogout, loggedIn }: Props) {
         <main className={`${showSources ? 'hidden' : 'flex'} md:!flex flex-col flex-1 h-full min-w-0 bg-[var(--color-panel)]`}>
           <div className="workspace-heading">
             <div className="min-w-0">
-              <p className="eyebrow">{view === 'collections' || view === 'progress' ? '资料管理 /' : !loggedIn ? '体验模式 /' : '我的知识库 /'}</p>
-              <h2 className="workspace-title">{view === 'collections' ? '我的收藏夹' : view === 'progress' ? '处理进度' : !loggedIn ? '先体验 AI 对话' : selectedKnowledgeBase?.name || (selectedCollectionId === 'all' ? '全部已入库资料' : '当前收藏夹的已入库资料')}</h2>
+              <p className="eyebrow">{view === 'assistant' ? '我的助手 /' : view === 'collections' || view === 'progress' ? '资料管理 /' : !loggedIn ? '体验模式 /' : '我的知识库 /'}</p>
+              <h2 className="workspace-title">{view === 'assistant' ? '抖音助手' : view === 'collections' ? '我的收藏夹' : view === 'progress' ? '处理进度' : !loggedIn ? '先体验 AI 对话' : selectedKnowledgeBase?.name || (selectedCollectionId === 'all' ? '全部已入库资料' : '当前收藏夹的已入库资料')}</h2>
               {selectedKnowledgeBase && (view === 'chat' || view === 'materials') && <p className="mt-1 text-xs text-[var(--color-ink-muted)]">{selectedKnowledgeBase.video_count} 个视频 · {selectedKnowledgeBase.ready_count} 个可提问</p>}
             </div>
-            <div className="flex flex-wrap gap-2">
+            {view !== 'assistant' && <div className="flex flex-wrap gap-2">
               <button onClick={startNewChat} disabled={chatBusy} className="ui-button"><Plus size={16} />新对话</button>
-              {loggedIn && <button onClick={() => setView('collections')} disabled={chatBusy} className="ui-button ui-button-primary"><Download size={16} />从收藏夹导入</button>}
-            </div>
+              {loggedIn && view !== 'collections' && <button onClick={() => setView('collections')} disabled={chatBusy} className="ui-button ui-button-primary"><Download size={16} />从收藏夹导入</button>}
+            </div>}
+            {view === 'assistant' && <button className="text-button" onClick={() => setView('chat')}><ChevronLeft size={15} />返回知识库</button>}
           </div>
           {(view === 'chat' || view === 'materials') ? <nav className="workspace-tabs" aria-label="知识库工作区">
             <button className={view === 'chat' ? 'active' : ''} onClick={() => setView('chat')} aria-current={view === 'chat' ? 'page' : undefined}><MessagesSquare size={16} />对话</button>
             {loggedIn && <button className={view === 'materials' ? 'active' : ''} onClick={() => setView('materials')} aria-current={view === 'materials' ? 'page' : undefined}><Files size={16} />视频资料</button>}
-          </nav> : <div className="border-b border-[var(--color-border)] px-6 pb-3"><button className="text-button" onClick={() => setView('chat')}><ChevronLeft size={15} />返回知识库</button></div>}
+          </nav> : view === 'assistant' ? null : <div className="border-b border-[var(--color-border)] px-6 pb-3"><button className="text-button" onClick={() => setView('chat')}><ChevronLeft size={15} />返回知识库</button></div>}
           <div className={view === 'chat' ? 'flex-1 min-h-0' : 'hidden'}>
           <ChatPanel key={conversationVersion} collectionId={selectedKnowledgeBase ? 'all' : selectedCollectionId} statsRefreshKey={statsRefreshKey} chatOnly={!loggedIn}
             knowledgeBaseId={selectedKnowledgeBase?.id ?? null} knowledgeBaseName={selectedKnowledgeBase?.name ?? ''}
             openedSessionId={openedSessionId} sessionTitle={currentSession?.title ?? '新对话'}
             onSessionSaved={sessionSaved} onHistoryChanged={refreshHistory} onBusyChange={setChatBusy} onNewChat={startNewChat} />
           </div>
-          <div ref={setContentContainer} className={view === 'chat' ? 'hidden' : 'flex-1 min-h-0 overflow-y-auto'} />
+          {view === 'assistant' && <div className="flex-1 min-h-0 overflow-y-auto"><Suspense fallback={<p className="empty-hint p-6" role="status">正在加载抖音助手…</p>}><AssistantPanel /></Suspense></div>}
+          <div ref={setContentContainer} className={view === 'chat' || view === 'assistant' ? 'hidden' : 'flex-1 min-h-0 overflow-y-auto'} />
         </main>
       </div>
     </div>

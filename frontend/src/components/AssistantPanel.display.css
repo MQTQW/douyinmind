@@ -1,0 +1,103 @@
+.assistant-panel .assistant-ui-compact-binding {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.assistant-panel .assistant-task-row > span {
+  min-width: 0;
+}
+
+.assistant-panel .assistant-task-row .assistant-stage {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+
+.assistant-panel .assistant-task-row .assistant-stage > i {
+  flex-shrink: 0;
+}
+
+.assistant-ui-compact-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  margin: 18px 0;
+  padding: 12px 0;
+  border-block: 1px solid var(--color-border);
+}
+
+.assistant-ui-compact-counts > div {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+}
+
+.assistant-ui-compact-counts dt {
+  color: var(--color-ink-muted);
+  font-size: 12px;
+}
+
+.assistant-ui-compact-counts dd {
+  color: var(--color-ink);
+  font-size: 18px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.assistant-ui-records {
+  margin: 0 23px 23px;
+  border: 1px solid var(--color-border);
+  border-radius: 9px;
+}
+
+.assistant-ui-records > summary {
+  padding: 14px 15px;
+  cursor: pointer;
+  color: var(--color-ink);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.assistant-ui-records > summary span {
+  margin-left: 8px;
+  color: var(--color-ink-muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.assistant-ui-records > .assistant-detail-section {
+  margin: 0 15px;
+  padding: 18px 0;
+}
+
+.assistant-ui-records > .assistant-detail-section:last-child {
+  border-bottom: 0;
+}
+
+.assistant-ui-record-substeps {
+  margin-top: 15px;
+}
+
+.assistant-ui-record-substeps h5 {
+  margin-bottom: 14px;
+  color: var(--color-ink-muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+@media (max-width: 767px) {
+  .assistant-panel .assistant-ui-compact-binding {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .assistant-ui-compact-counts {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    column-gap: 12px;
+  }
+
+  .assistant-ui-records > summary span {
+    display: block;
+    margin: 5px 0 0 16px;
+  }
+}

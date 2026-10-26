@@ -4,13 +4,15 @@
 
 ## 先检查是否找到资料
 
+这些工具主要评网页RAG（检索增强生成）流程，不验证抖音原评论、账号权限、一次发送或A侧送达。实验助手还需单独的受控验收，不能套用这里的分数。
+
 `backend/scripts/evaluate_retrieval.py` 用已标注的问题、正确视频、原话和时间检查检索。评分区分“找到正确视频”“找到至少一条支持答案的原文”和“找到全部标注依据”；只找到标题不算找到答案依据。还会单独记录问题是否被分到只查标题等流程。
 
 提问时，只有明确索要视频或标题清单（例如「有哪些视频」「关于 Git 的视频有哪些」）才只列标题。「有哪些原因」「列出操作步骤」「初始化后出现什么目录」以及列视频后还要求解释细节的提问，进入原文检索；不会因单独出现「哪些、清单、目录」就跳过正文。
 
 题库和实测结果保存在本地 `backend/app/storage/retrieval_eval/`，该目录已被 Git 忽略，仓库不附带个人题库。请根据自己的已入库资料标注有答案题与无答案/范围隔离题；答案以可核实的原话为准，并回看原视频核对识别不清的内容。
 
-在 `backend` 目录执行，先免费检查题库中的引用和范围，再运行实测：
+在 `backend` 目录执行，先作不调用模型服务的本地题库与范围检查，再运行实测：
 
 ```powershell
 # 只检查题库，不调用模型服务
@@ -36,13 +38,13 @@
 
 ### 最终回答：是否答全、是否有据
 
-`evaluate_answers.py` 使用同一套题，按网页真实流程执行资料检索、原文上下文和流式回答。会调用真实模型服务；每题只记录一次生成，不反复挑选较好的答案。旧版本中的摘要调用按实际记录保留，当前版本不再调用中间摘要。检索资料与数据库均使用临时副本，测试聊天不会写入用户历史；正确答案和评分依据不会传给回答模型。
+`evaluate_answers.py` 使用同一套题，按网页真实流程执行资料检索、原文上下文和流式回答。会调用真实模型服务；每题只记录一次生成，不反复挑选较好的答案。旧版本中的摘要字段和调用按实际记录保留，当前流程不再调用中间摘要；字段仍存在不代表又付费生成摘要。检索资料与数据库均使用临时副本，测试聊天不会写入用户历史；正确答案和评分依据不会传给回答模型。
 
 ```powershell
-# 先免费核对考卷、资料、模型与检索基线是否一致
+# 先在本地核对考卷、资料、模型与检索基线，不调用模型
 .\.venv\Scripts\python.exe scripts/evaluate_answers.py --dataset app/storage/retrieval_eval/retrieval-exam-v1.json --reference app/storage/retrieval_eval/after-routing-v1.json --output app/storage/retrieval_eval/answers-validation-v1.json
 
-# 真实生成；已有输出不会被覆盖，原始检索、摘要输入输出与最终模型输入分别记录
+# 真实生成；已有输出不会被覆盖，保留原始检索与实际模型输入输出
 .\.venv\Scripts\python.exe scripts/evaluate_answers.py --dataset app/storage/retrieval_eval/retrieval-exam-v1.json --reference app/storage/retrieval_eval/after-routing-v1.json --output app/storage/retrieval_eval/answers-v1.json --run
 
 # 逐题人工核对后，将评阅记录与一次生成的回答一起输出为报告

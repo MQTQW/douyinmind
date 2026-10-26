@@ -203,12 +203,12 @@ export default function ChatPanel({
 
   return (
     <div className="chat-room h-full flex flex-col bg-[var(--color-panel)]">
-      <div className="chat-session-heading">
+      {(openedSessionId !== null || sessionId !== null || messages.length > 0 || Boolean(sessionTitle && sessionTitle !== '新对话')) && <div className="chat-session-heading">
         <div className="flex-1 min-w-0">
           <h2 className="truncate text-sm font-medium text-[var(--color-ink)]" title={sessionTitle || '新对话'}>{sessionTitle || '新对话'}</h2>
           <p className="mt-1 truncate text-xs text-[var(--color-ink-muted)]" title={knowledgeBaseName}>回答资料：{chatOnly ? '体验模式，不使用收藏视频' : knowledgeBaseId != null ? knowledgeBaseName : collectionId === 'all' ? '全部已入库资料' : '当前收藏夹的已入库资料'}</p>
         </div>
-      </div>
+      </div>}
       {/* Messages */}
       <div className="chat-canvas">
         <div ref={scrollRef} className="chat-thread">
@@ -227,8 +227,8 @@ export default function ChatPanel({
           <div className="h-full flex flex-col items-center justify-center gap-6 text-center">
             <div aria-hidden="true" className="welcome-mark"><BookOpen size={30} /></div>
             <div>
-              <h2 className="font-display text-xl text-[var(--color-ink)]">{knowledgeBaseId != null ? knowledgeBaseName : chatOnly ? '先体验 AI 对话' : '你的收藏夹知识库'}</h2>
-              <p className="text-sm text-[var(--color-ink-muted)] mt-1">{knowledgeBaseId != null ? '根据这个知识库中已完成的视频提问，或从收藏夹导入更多资料。' : chatOnly ? '直接提问，体验回答逐步出现。收藏内容问答需要先登录并入库。' : '创建知识库 → 勾选视频导入 → 开始对话'}</p>
+              <h2 className="font-display text-xl text-[var(--color-ink)]">{chatOnly ? '先体验 AI 对话' : '想了解什么？'}</h2>
+              <p className="text-sm text-[var(--color-ink-muted)] mt-1">{chatOnly ? '直接提问，体验回答逐步出现。收藏内容问答需要先登录并入库。' : '围绕下方资料范围提问，已完成处理的资料可用于回答。'}</p>
             </div>
             <div className="flex flex-wrap gap-2 justify-center max-w-md">
               {promptChips.map((text, i) => (
@@ -285,7 +285,7 @@ export default function ChatPanel({
         <textarea rows={2}
           value={input}
           onChange={e => { setInput(e.target.value); setInputError(''); }}
-          placeholder={historyLoading ? '正在加载历史对话…' : !historyReady ? '请先重新加载历史对话' : chatOnly ? '输入你的问题…' : '输入你的问题，搜索收藏夹中的知识...'}
+          placeholder={historyLoading ? '正在加载历史对话…' : !historyReady ? '请先重新加载历史对话' : chatOnly ? '输入你的问题…' : '输入问题，查找当前资料中的内容…'}
           className="composer-input"
           onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void handleSubmit(event); } }}
           aria-label="输入问题"

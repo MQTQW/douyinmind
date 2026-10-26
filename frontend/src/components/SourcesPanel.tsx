@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import { AudioLines, Check, ChevronRight, Download, Ellipsis, FileAudio, FileDown, FolderInput, FolderMinus, History, ListChecks, MessageCircle, Pencil, RefreshCw, RotateCcw, Trash2 } from 'lucide-react';
+import { AudioLines, Check, ChevronRight, Download, Ellipsis, FileAudio, FileDown, FolderMinus, History, Inbox, ListChecks, MessageCircle, Pencil, RefreshCw, RotateCcw, Trash2 } from 'lucide-react';
 import type { WorkspaceView } from '../workspaceView';
 import ActionMenu from './ActionMenu';
 import * as api from '../api';
@@ -9,6 +9,7 @@ import VideoContentModal from './VideoContentModal';
 import SessionActionModal from './SessionActionModal';
 import KnowledgeBasesPanel from './KnowledgeBasesPanel';
 import type { CollectionImportSource } from '../collectionImport';
+import { visibleHistory } from '../workspacePresentation';
 
 interface Props {
   view: WorkspaceView;
@@ -53,6 +54,7 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
   const [sessions, setSessions] = useState<api.SessionItem[]>([]);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [historyError, setHistoryError] = useState('');
+  const [historyExpanded, setHistoryExpanded] = useState(false);
   const historyRequestRef = useRef(0);
   const [sessionAction, setSessionAction] = useState<{session: api.SessionItem; action: 'rename' | 'delete'} | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -381,7 +383,7 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
 
   const statusLabel = (status: string) => ({done: '可提问', failed: '失败', pending: '待入库', downloading: '下载中', transcribing: '转写中', embedding: '保存中'} as Record<string, string>)[status] || '处理中';
   const videoActions = (video: api.VideoItem, inLibrary = false) => <ActionMenu label={`更多操作：${video.title}`}>
-      <button onClick={() => setViewingItemId(video.platform_item_id)}><FileAudio size={15} />查看识别结果</button>
+
       {video.status === 'done' && <>
         <button onClick={() => handleExport(video.platform_item_id, 'original')}><FileDown size={15} />导出原文与时间</button>
         <button onClick={() => handleExport(video.platform_item_id, 'ai')}><ListChecks size={15} />AI 整理导出</button>
@@ -394,14 +396,15 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
     <div className="sources-sidebar h-full flex flex-col">
       <div className="flex-1 min-h-0 overflow-y-auto p-3 md:p-4">
         <KnowledgeBasesPanel selectedId={selectedKnowledgeBase?.id ?? null} refreshKey={statsRefreshKey + basesRefreshKey}
-          disabled={chatBusy || chatOnly} onListLoaded={setKnowledgeBases} onSelect={onSelectKnowledgeBase}
+          disabled={chatBusy || chatOnly} disabledReason={chatBusy ? '请等待当前回答完成' : '体验模式尚未连接抖音；登录后可选择和管理知识库。'} onListLoaded={setKnowledgeBases} onSelect={onSelectKnowledgeBase}
           onRefresh={onBuildDone} onCreated={base => { baseCreated(base); onSelectKnowledgeBase(base); }} />
         <section className="history-section" aria-label="历史对话">
           <div className="flex items-center justify-between mb-3"><h2 className="section-title"><History size={16} />历史对话</h2><span className="text-xs text-[var(--color-ink-muted)]">自动保存</span></div>
           {historyError && <p role="alert" className="text-xs text-red-600">{historyError} <button onClick={fetchSessions} className="underline">重新加载</button></p>}
           {historyLoading && sessions.length === 0 && <p className="text-xs text-[var(--color-ink-muted)]">正在加载历史对话…</p>}
           {!historyLoading && !historyError && sessions.length === 0 && <p className="text-xs text-[var(--color-ink-muted)] leading-relaxed">还没有对话。提问后会自动保存，方便下次继续。</p>}
-          {sessions.map(s => <div key={s.id} className={`history-row ${activeSessionId === s.id ? 'active' : ''}`}>
+          <div id="workspace-history-list">
+          {visibleHistory(sessions, activeSessionId, historyExpanded).map(s => <div key={s.id} className={`history-row ${activeSessionId === s.id ? 'active' : ''}`}>
             <button onClick={() => onSelectSession(s, knowledgeBases.find(base => base.id === s.knowledge_base_id) ?? null)} disabled={chatBusy || (s.knowledge_base_id != null && !knowledgeBases.some(base => base.id === s.knowledge_base_id))} aria-current={activeSessionId === s.id ? 'true' : undefined} title={s.title} className="history-open">
               <MessageCircle size={14} className="shrink-0" /><span className="truncate">{s.title}</span>
             </button>
@@ -410,14 +413,16 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
               <button className="danger-action" onClick={() => setSessionAction({session: s, action: 'delete'})} disabled={chatBusy && activeSessionId === s.id}><Trash2 size={15} />删除对话</button>
             </ActionMenu>
           </div>)}
+          </div>
+          {sessions.length > 6 && <button type="button" className="text-button history-toggle" aria-expanded={historyExpanded} aria-controls="workspace-history-list" onClick={() => setHistoryExpanded(value => !value)}>{historyExpanded ? '收起历史' : `全部历史 (${sessions.length})`}</button>}
           {sessions.length === 100 && <p className="mt-2 text-xs text-[var(--color-ink-muted)]">显示最近 100 段对话</p>}
         </section>
       </div>
-      {!chatOnly && <div className="sidebar-footer"><button className="task-shortcut" onClick={() => onChangeView('progress')}><AudioLines size={19} /><span><strong>{building || processingCount ? '视频正在处理中' : '处理进度'}</strong><small>{doneCount} 可提问{failedCount ? ` · ${failedCount} 个失败待处理` : ' · 查看导入状态'}</small></span><ChevronRight size={16} /></button></div>}
+      <div className="sidebar-footer assistant-sidebar-shortcuts"><button className={`task-shortcut ${view === 'assistant' ? 'assistant-shortcut-active' : ''}`} onClick={() => onChangeView('assistant')} aria-current={view === 'assistant' ? 'page' : undefined}><Inbox size={17} /><span><strong>抖音助手</strong></span><ChevronRight size={15} /></button>{!chatOnly && <button className="task-shortcut" onClick={() => onChangeView('progress')} aria-current={view === 'progress' ? 'page' : undefined}><AudioLines size={17} /><span><strong>{building || processingCount ? '视频正在处理中' : '处理进度'}</strong><small>{doneCount} 可提问{failedCount ? ` · ${failedCount} 失败` : ''}</small></span><ChevronRight size={15} /></button>}</div>
 
-      {contentContainer && view !== 'chat' && createPortal(<div className="source-workspace">
+      {contentContainer && view !== 'chat' && view !== 'assistant' && createPortal(<div className="source-workspace">
         {view === 'materials' && <>
-          <div className="page-section-heading"><div><h3>视频资料</h3><p>完整文字稿、逐段时间和处理结果</p></div><button className="ui-button" onClick={() => onChangeView('collections')} disabled={chatBusy}><FolderInput size={16} />添加视频</button></div>
+          <div className="materials-toolbar" aria-label="视频资料列表"><p>文字稿 · 时间定位 · 处理结果</p></div>
           {baseVideosLoading ? <p role="status" className="empty-hint">正在加载视频资料…</p> : baseVideosError ? <p role="alert" className="empty-hint text-red-600">{baseVideosError} <button onClick={() => setBasesRefreshKey(key => key + 1)} className="underline">重新加载</button></p> : baseVideos.length === 0 ? <div className="empty-resource"><FileAudio size={30} /><h3>还没有可查看的视频</h3><p>从收藏夹选择视频，导入到知识库后就能查看文字稿。</p><button className="ui-button ui-button-primary" onClick={() => onChangeView('collections')}>从收藏夹导入</button></div> : <div className="resource-list">{baseVideos.map(video => <div key={video.platform_item_id} className="resource-row">
             <span className="resource-icon"><FileAudio size={20} /></span><button className="resource-title" onClick={() => setViewingItemId(video.platform_item_id)}><strong>{video.title || '未命名视频'}</strong><small>{video.author ? `@${video.author} · ` : ''}{video.duration ? `${Math.floor(video.duration / 60)}:${String(video.duration % 60).padStart(2, '0')} · ` : ''}查看完整识别结果</small></button>
             <span className={`status-badge ${video.status === 'failed' ? 'status-failed' : ''}`}>{video.status === 'done' && <Check size={13} />}{statusLabel(video.status)}</span>{videoActions(video, true)}
@@ -442,7 +447,7 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
           <button className="text-button mt-4" onClick={() => openBuildConfirm(undefined, sourceForCollection('all', []))} disabled={allFavoriteCount === 0 || building || chatBusy}>导入全部收藏 ({allFavoriteCount})</button>
         </>}
         {view === 'progress' && <>
-          <div className="page-section-heading"><div><h3>当前处理状态</h3><p>下载音频 → 声音转文字 → 整理入库</p></div><button className="ui-button" onClick={onBuildDone}><RefreshCw size={15} />刷新状态</button></div>
+          <div className="page-section-heading processing-section-heading"><p>下载视频 → 识别转文字 → 建立索引</p><button className="ui-button" onClick={onBuildDone}><RefreshCw size={15} />刷新状态</button></div>
           <div className="processing-summary"><span>{doneCount} 可提问</span><span>{processingCount} 处理中</span><span>{pendingCount} 待入库</span><span>{failedCount} 失败</span><small>{totalCount} 个视频总计</small></div>
           {building && <div className="processing-current"><div className="flex gap-3 items-start"><AudioLines size={22} /><div className="min-w-0"><strong>正在处理视频</strong><p className="mt-2 text-sm break-words">{buildMessage || '正在读取进度…'}</p></div></div><div className="processing-track"><div style={{width: `${buildTotal ? buildProgress / buildTotal * 100 : 0}%`}} /></div><p className="mt-2 text-xs text-[var(--color-ink-muted)]">已完成 {buildProgress} / {buildTotal} 个视频</p></div>}
           {taskVideosLoading && <p role="status" className="empty-hint">正在读取视频状态…</p>}

@@ -64,6 +64,34 @@ test('comments, optional spaces and multi-line data are parsed', async () => {
   ]);
 });
 
+test('complete meta and done frames release a stream even when HTTP does not close', async () => {
+  for (const events of [
+    [['meta', { session_id: 501 }], ['done', { ok: true }]],
+    [['done', { ok: true }], ['meta', { session_id: 501 }]],
+  ]) {
+    let controller;
+    let cancelled = 0;
+    let timer;
+    const body = new ReadableStream({
+      start(value) { controller = value; for (const [event, data] of events) value.enqueue(encoder.encode(wire(event, data))); },
+      cancel() { cancelled++; },
+    });
+    try {
+      await withResponse(body, async () => {
+        const result = await Promise.race([
+          collect(chatAskStream('synthetic EOF test')),
+          new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('completed protocol still waits for HTTP EOF')), 500); }),
+        ]);
+        assert.equal(result.length, 2);
+      });
+      assert.equal(cancelled, 1, 'the completed response reader is explicitly released');
+    } finally {
+      clearTimeout(timer);
+      try { controller.close(); } catch { /* already cancelled */ }
+    }
+  }
+});
+
 test('invalid JSON reports an error rather than silently dropping a message', async () => {
   await assert.rejects(collect(readSSE(stream(encoder.encode('event: delta\ndata: broken\n\n')))), SyntaxError);
 });

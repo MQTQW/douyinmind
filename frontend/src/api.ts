@@ -6,6 +6,218 @@ import { readSSE } from './sse';
 
 const BASE = '/api';
 
+// ---- Douyin assistant (separate from the existing chat and ingestion APIs) ----
+export interface AssistantBindingSummary {
+  binding_id?: string; sender_profile_url?: string; receiver_profile_url?: string;
+  sender_display_name?: string; receiver_display_name?: string;
+  sender_public_number?: string; receiver_public_number?: string;
+  knowledge_base_id?: number | null; knowledge_base_name?: string; query_scope?: 'library' | 'all_local'; scope_label?: string;
+  public_reply_allowed?: boolean; allow_import?: boolean; instance_id?: string;
+}
+export interface AssistantOverview {
+  available: boolean;
+  control: { state: string; desired_state?: string; run_id?: string | null; pid?: number | null; heartbeat_at?: string | null; reason_code?: string | null; receiver_state?: string; message?: string; process_alive?: boolean; worker_state?: 'idle' | 'processing' | 'error'; worker_reason?: string | null; capture_cycles?: number; last_capture_at?: string | null; last_capture_admitted_count?: number | null; last_capture_baseline_created?: boolean | null; manual_verification?: { available: boolean; url?: string | null; state: string; active: boolean; observed_at?: string } };
+  counts: Record<string, number>;
+  capabilities: { start: boolean; pause: boolean; stop: boolean; multi_user?: boolean; public_visibility?: string };
+  binding?: AssistantBindingSummary | null;
+  configuration?: { state: 'ready' | 'not_configured' | 'unavailable'; reason_code?: string | null; message?: string | null };
+  intake_issues?: { unresolved_count: number; recent: { id: string; comment_excerpt?: string; message?: string; state: string; created_at?: string; }[] };
+  diagnostics?: AssistantDiagnostics;
+}
+export interface AssistantDiagnostics {
+  disk_source_version: string | null;
+  backend_build: { source_version: string | null; matches_disk: boolean | null; captured_at?: string | null };
+  helper_build: { source_version: string | null; matches_disk: boolean | null; captured_at?: string | null };
+  heartbeat_age_seconds: number | null; capture_age_seconds: number | null;
+  unverified_notice_deferrals?: number;
+  notices: { code: string; message: string }[];
+  intake_scope: { poll_seconds: number; visible_candidates_per_batch: number; all_notifications_confirmed: false };
+  delivery: { b_view_visible: number; requires_review: number; recipient_visibility: string };
+}
+export interface AssistantTimelineStep {
+  id?: string | number; kind: string; label?: string; created_at?: string | number; at?: string;
+  elapsed_ms?: number; duration_ms?: number; status?: string;
+  metadata?: { tool_name?: string; elapsed_ms?: number; source_count?: number; status?: string; usage?: AssistantUsage; code?: string; kind?: string };
+}
+export interface AssistantUsage { total_tokens?: number | null; prompt_tokens?: number | null; completion_tokens?: number | null; input_tokens?: number | null; output_tokens?: number | null; model_calls?: number; model_responses?: number; elapsed_ms?: number; }
+export type AssistantTaskAction = 'reconcile' | 'resume' | 'retry_query';
+export interface AssistantActionStatus { id: string; action: AssistantTaskAction; state: 'queued' | 'processing' | 'done' | 'failed'; reason_code?: string | null; message?: string; created_at?: string | number | null; updated_at?: string | number | null; }
+export interface AssistantTimings {
+  execution_ms?: number; model_ms?: number; retrieval_ms?: number;
+  video_processing?: { run_id: string; request_id: string; video_id: string;
+    stages_seconds: { download?: number; recognition?: number; indexing?: number } };
+}
+export interface AssistantTask {
+  id: string; kind: string; state: string; status_label?: string; binding_id?: string; user_id?: string; device_id?: string; knowledge_base_id?: number | null; query_scope?: 'library' | 'all_local'; scope_label?: string; execution_note?: string;
+  video_id?: string; video_title?: string; comment_text?: string; created_at?: string | number; updated_at?: string | number;
+  agent_task_id?: string; reason_code?: string | null; import_state?: string | null; reply_state?: string | null;
+  actions?: { can_reconcile: boolean; can_resume: boolean; can_retry_query?: boolean };
+  stages?: Record<string, string | { state?: string; label?: string }>;
+  usage?: AssistantUsage | null; timeline?: AssistantTimelineStep[];
+  sources?: { source_id?: string; chunk_id?: string; title?: string; url?: string; platform_item_id?: string; time_range?: string }[];
+  reply?: { text?: string; state?: string; kind?: string } | null;
+  details?: { reply_text?: string; library_name?: string; sources?: AssistantTask['sources']; steps?: AssistantTimelineStep[]; timings?: AssistantTimings;
+    library_choice?: { choice_id?: string; state?: string; option_count?: number; selected_knowledge_base_id?: number | null; selected_library_name?: string | null; child_task_id?: string | null } };
+  latest_action?: AssistantActionStatus | null;
+}
+export interface AssistantTaskPage { items: AssistantTask[]; total: number; page: number; page_size: number; }
+
+const ASSISTANT_ERRORS: Record<string, string> = {
+  not_configured: '请先完成助手账号与知识库设置。', binding_missing: '尚未设置助手绑定，请先完成设置。',
+  binding_inactive: '当前账号绑定已停用，请在设置中核对。', task_not_resumable: '这项任务不能直接继续，请先核对处理记录。',
+  unsafe_resume: '这项任务有未确认操作，请先核对，不能直接重试。', verification_required: '助手窗口需要本人完成核验，当前操作已暂停。',
+  invalid_state: '状态已经变化，请刷新后核对。', action_not_allowed: '当前状态不允许这个操作，请先核对。',
+  remote_catalog_not_verified: '这台设备的资料目录尚未经过核对，请在对应电脑上配置。',
+  alias_conflict: '这个别名已指向其他知识库，请换一个名称。',
+  record_not_found: '这项账号、设备或授权已不存在，请刷新后核对。',
+  profile_already_registered: '这个账号组合已经登记，请管理原记录。',
+  device_instance_already_registered: '这个账号已经登记了该设备，请管理原设备。',
+  library_not_in_local_catalog: '这个知识库不在本机可用清单中，请重新核对。',
+  catalog_unavailable: '本机知识库清单暂时无法读取，原有授权没有改动。',
+  invalid_legacy_binding: '未找到可用的原本机绑定，请先核对账号设置。',
+  legacy_migration_requires_empty_devices: '已有设备登记，请先核对现有设置，未替换原授权。',
+  assistant_not_configured: '请先完成助手账号与知识库设置，再开启收件。',
+  resume_not_safe: '当前证据不足，不能直接恢复，请先核对任务记录。',
+  query_retry_not_safe: '这项问答不满足单次重试条件，原记录已保留。',
+  query_retry_already_used: '这项问答的单次重试已登记，请核查原任务，不要重复操作。',
+  reconciler_unavailable: '当前助手运行时尚不能核查，请先确认助手服务已就绪。',
+  runtime_stopping: '助手正在停止，请等待本次运行结束后再操作。',
+  launch_pending_requires_review: '上次启动结果尚未确认，请先核对现有助手窗口。',
+  registry_missing_after_initialization: '原授权登记库缺失，已停止执行。请恢复原授权状态，不会自动重建或回退旧绑定。',
+  registry_required_marker_missing: '授权保护标记缺失，已停止执行。请恢复原授权状态。',
+  registry_required_marker_write_failed: '授权保护标记未可靠保存，本次设置尚未完成。',
+  invalid_registry_required_marker: '授权保护标记无效，已停止执行。请核对原授权状态。',
+  unsafe_registry_required_marker: '授权保护标记路径异常，已停止执行。请核对原授权状态。',
+  registry_missing_or_empty: '原授权登记库缺失或为空，已停止执行，不会自动修复或重建。',
+  foreign_registry_database: '授权登记库格式不符，已停止执行。请核对原授权状态。',
+  registry_required_but_missing: '原授权登记库不可用，已停止执行。请恢复原授权状态，不会回退旧绑定。',
+  assistant_configuration_unavailable: '助手设置暂时无法读取，已保留原记录。请核对原有授权和助手设置。',
+  assistant_receiver_not_configured: '助手收件配置尚不可用，请核对原有助手设置。',
+  assistant_setup_required: '请先完成助手账号与知识库设置，再开启助手。',
+  verified_local_binding_required: '尚无可用的本机授权，请在账号与设备中确认账号、设备和知识库范围。',
+  task_not_found: '这个任务已不存在，请刷新任务记录。',
+  task_busy: '任务仍在处理中，请稍后核对。',
+  usage_policy_changed: '额度已被其他操作修改，请重新读取后再保存。',
+  usage_budget_missing: '原用量台账缺失，已保留任务。请恢复原记录，不能重新建空台账。',
+  usage_budget_marker_missing: '用量台账保护标记缺失，请核对原记录。',
+  invalid_usage_budget_marker: '用量台账保护标记异常，请核对原记录。',
+  unsafe_usage_budget_marker: '用量台账保护标记不可用，请核对原记录。',
+  foreign_usage_budget: '用量台账格式不符，未修改原记录。',
+  usage_budget_unavailable: '用量台账暂不可读，未把未知费用按零计算。请核对助手状态。',
+  model_budget_exceeded: '本次请求超过配置的文字用量准入额度，尚未发起模型请求。',
+  model_budget_unknown: '存在未核清的模型用量或台账状态，本次未继续调用模型。',
+  local_owner_verified_device_required: '请先在本人电脑上确认账号和本机设备；另一台电脑不会继承全部资料权限。',
+  catalog_owner_confirmation_required: '登记当前全部库的保存权限前，需要明确允许查看本人本机目录。',
+  local_owner_scope_required: '请先选择全部资料查询或本机目录范围，再选择公开许可。',
+  invalid_local_owner_access_schema: '本机全部资料授权记录格式异常，已停止操作，原有记录保留。',
+};
+
+export function assistantErrorMessage(code: unknown, fallback: string): string {
+  return typeof code === 'string' && Object.prototype.hasOwnProperty.call(ASSISTANT_ERRORS, code) ? ASSISTANT_ERRORS[code] : fallback;
+}
+
+export class AssistantRequestError extends Error {
+  constructor(message: string, public status = 0) { super(message); this.name = 'AssistantRequestError'; }
+}
+
+async function assistantRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(`${BASE}/assistant${path}`, {
+      ...options, headers: { 'Content-Type': 'application/json', ...options.headers },
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') throw error;
+    throw new Error('助手服务暂时无法连接，请检查本机服务后重试。');
+  }
+  const data = await response.json().catch(() => null);
+  if (!response.ok || data?.success === false) {
+    const code = typeof data?.code === 'string' ? data.code : data?.detail?.code;
+    throw new AssistantRequestError(assistantErrorMessage(code, response.status === 401 ? '本机管理确认已过期，请重新确认。' : response.status === 404 ? '助手管理服务尚未就绪，请稍后重新连接。' : '操作未完成，请刷新状态后核对。'), response.status);
+  }
+  if (!data || typeof data !== 'object') throw new Error('助手状态返回不完整，请重新加载。');
+  return data as T;
+}
+
+export function getAssistantOverview(signal?: AbortSignal): Promise<AssistantOverview> {
+  return assistantRequest('/overview', { signal });
+}
+export interface AssistantBudgetTotals {
+  request_count: number; actual_tokens: number; held_estimated_tokens: number;
+  unknown_unbounded_requests: number; unsettled_requests: number; overrun_requests: number;
+  committed_tokens: number; needs_reconciliation: boolean;
+}
+export interface AssistantBudgetSummary {
+  initialized: boolean; day_key?: string; currency_cost: null;
+  policy?: { per_task_tokens: number | null; daily_tokens: number | null; revision: number };
+  daily?: AssistantBudgetTotals; all_time?: AssistantBudgetTotals;
+}
+export function getAssistantUsage(signal?: AbortSignal): Promise<AssistantBudgetSummary> {
+  return assistantRequest('/usage', { signal });
+}
+export function setAssistantUsageLimits(token: string, body: { per_task_tokens: number | null; daily_tokens: number | null; expected_revision: number }): Promise<AssistantBudgetSummary> {
+  return assistantRequest('/usage/limits', { method: 'PUT', headers: { Authorization: `Bearer ${token}` }, body: JSON.stringify(body) });
+}
+export function listAssistantTasks(filters: { state?: string; q?: string; page?: number; page_size?: number }, signal?: AbortSignal): Promise<AssistantTaskPage> {
+  const query = new URLSearchParams();
+  Object.entries(filters).forEach(([key, value]) => { if (value != null && value !== '') query.set(key, String(value)); });
+  return assistantRequest(`/tasks?${query}`, { signal });
+}
+export function getAssistantTask(id: string, signal?: AbortSignal): Promise<AssistantTask> {
+  return assistantRequest(`/tasks/${encodeURIComponent(id)}`, { signal });
+}
+export function controlAssistant(action: 'start' | 'pause' | 'stop'): Promise<{ success: boolean; overview: AssistantOverview }> {
+  return assistantRequest(`/${action}`, { method: 'POST', body: '{}' });
+}
+export function actOnAssistantTask(id: string, action: AssistantTaskAction): Promise<{ success: boolean; accepted?: boolean; task?: AssistantTask; message?: string }> {
+  const operation = action === 'retry_query' ? 'retry-query' : action;
+  return assistantRequest(`/tasks/${encodeURIComponent(id)}/${operation}`, { method: 'POST', body: '{}' });
+}
+
+export interface AssistantLibraryGrant {
+  grant_id?: string; knowledge_base_id: number; name: string; aliases: string[]; is_default: boolean;
+  can_query: boolean; can_import: boolean; public_reply_allowed: boolean; revoked?: boolean; binding_id?: string; library_exists?: boolean;
+  active?: boolean;
+}
+export interface AssistantDevice {
+  device_id: string; label: string; instance_id: string; enabled: boolean; revoked: boolean;
+  verification_status?: string; is_local?: boolean; online?: boolean; last_seen_at?: string | null;
+  libraries: AssistantLibraryGrant[];
+  local_owner_access?: AssistantLocalOwnerAccess;
+}
+export interface AssistantLocalOwnerAccess {
+  configured: boolean; active: boolean; query_all_local: boolean; catalog_read_allowed: boolean;
+  public_reply_allowed: boolean; version?: number; auth_revision?: number;
+}
+export interface AssistantLocalOwnerRequest {
+  confirm: true; query_all_local: boolean; catalog_read_allowed: boolean; public_reply_allowed: boolean; grant_current_libraries: boolean;
+}
+export interface AssistantRegistryUser {
+  user_id: string; label: string; sender_profile_url: string; receiver_profile_url: string;
+  verification_status: string; verification_method?: string; active: boolean; default_device_id?: string | null;
+  devices: AssistantDevice[];
+}
+export interface AssistantRegistry {
+  configured: boolean; users: AssistantRegistryUser[]; local_catalog: { id: number; name: string }[];
+  local_instance_id?: string; cross_device_status?: string; verification_scope?: string;
+  catalog_error?: string | null;
+}
+export interface AssistantAdminSession { admin_token: string; expires_at_utc: string; admin_id?: string; }
+
+export function getAssistantRegistry(signal?: AbortSignal): Promise<AssistantRegistry> {
+  return assistantRequest('/registry', { signal });
+}
+export function confirmAssistantAdmin(): Promise<AssistantAdminSession> {
+  return assistantRequest('/registry/admin-session', { method: 'POST', body: JSON.stringify({ confirm_local_admin: true }) });
+}
+export function updateAssistantRegistry(path: string, token: string, body: Record<string, unknown>, method: 'POST' | 'PUT' | 'DELETE' = 'POST'): Promise<unknown> {
+  if (!token) return Promise.reject(new Error('请先确认本机管理身份。'));
+  return assistantRequest(`/registry${path}`, { method, headers: { Authorization: `Bearer ${token}` }, body: JSON.stringify(body) });
+}
+export function setAssistantLocalOwnerAccess(userId: string, deviceId: string, token: string, body: AssistantLocalOwnerRequest): Promise<unknown> {
+  return updateAssistantRegistry(`/users/${encodeURIComponent(userId)}/devices/${encodeURIComponent(deviceId)}/local-owner-access`, token, { ...body }, 'PUT');
+}
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${url}`, {
     headers: { 'Content-Type': 'application/json' },
@@ -364,6 +576,9 @@ export async function* chatAskStream(
       completed = true;
     }
     yield { ...payload, _event: event } as ChatStreamEvent;
+    // Both terminal facts are required, including the legacy done-before-meta
+    // order. Once complete, release the reader instead of waiting for HTTP EOF.
+    if (completed && hasMeta) break;
   }
   if (!completed || !hasMeta) throw new Error('连接中断，回答可能不完整，请重试。');
 }

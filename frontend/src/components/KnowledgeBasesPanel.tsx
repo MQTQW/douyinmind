@@ -7,13 +7,14 @@ interface Props {
   selectedId: number | null;
   refreshKey: number;
   disabled: boolean;
+  disabledReason?: string;
   onSelect: (base: api.KnowledgeBaseItem | null) => void;
   onCreated: (base: api.KnowledgeBaseItem) => void;
   onListLoaded?: (items: api.KnowledgeBaseItem[]) => void;
   onRefresh: () => void;
 }
 
-export default function KnowledgeBasesPanel({ selectedId, refreshKey, disabled, onSelect, onCreated, onListLoaded, onRefresh }: Props) {
+export default function KnowledgeBasesPanel({ selectedId, refreshKey, disabled, disabledReason = '请等待当前回答完成', onSelect, onCreated, onListLoaded, onRefresh }: Props) {
   const [bases, setBases] = useState<api.KnowledgeBaseItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -66,11 +67,11 @@ export default function KnowledgeBasesPanel({ selectedId, refreshKey, disabled, 
           <button type="button" onClick={onRefresh} disabled={loading} aria-label="刷新知识库数量"
             className="icon-button" title="刷新知识库数量"><RefreshCw size={14} /></button>
           <button type="button" onClick={() => setEditingBase(null)} disabled={disabled}
-            className="icon-button" aria-label="新建知识库" title="新建知识库"><Plus size={17} /></button>
+            className="icon-button" aria-label="新建知识库" title={disabled ? disabledReason : '新建知识库'}><Plus size={17} /></button>
         </div>
       </div>
       <button type="button" onClick={() => onSelect(null)} disabled={disabled}
-        aria-pressed={selectedId === null}
+        aria-pressed={selectedId === null} title={disabled ? disabledReason : '全部已入库资料'}
         className={`all-materials-link ${selectedId === null ? 'active' : ''}`}>
         <Library size={17} />全部已入库资料
       </button>
@@ -80,7 +81,7 @@ export default function KnowledgeBasesPanel({ selectedId, refreshKey, disabled, 
       {bases.map(base => (
         <div key={base.id} className={`library-entry ${selectedId === base.id ? 'active' : ''}`}>
           <button type="button" onClick={() => onSelect(base)} disabled={disabled} aria-pressed={selectedId === base.id}
-            title={disabled ? '请等待当前回答完成' : base.name}
+            title={disabled ? disabledReason : base.name}
             className="library-open">
             <span className="library-icon">{selectedId === base.id ? <FolderOpen size={19} /> : <Folder size={19} />}</span>
             <span className="min-w-0 flex-1">
