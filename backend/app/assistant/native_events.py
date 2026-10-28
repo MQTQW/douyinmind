@@ -327,9 +327,15 @@ def project_page(page, channel, *, receiver_uid, receiver_sec_uid, profile_allow
             cid, hint = _cid_from_schema(wrapper.get("schema_url"), video), None
             source_kind = "native_notice_candidate"
         else:
-            video = _id(comment.get("aweme_id"), field_role='reply_video_id')
-            if _id(_object(wrapper.get("aweme")).get("aweme_id"), field_role='reply_wrapper_video_id') != video:
-                _fail("notice_video_mismatch")
+            inner_video = comment.get("aweme_id")
+            if type(inner_video) is str and inner_video == "":
+                # This one native shape omits the inner video as an exact
+                # empty string. The same notice wrapper must still prove it.
+                video = _id(_object(wrapper.get("aweme")).get("aweme_id"), field_role='reply_wrapper_video_id')
+            else:
+                video = _id(inner_video, field_role='reply_video_id')
+                if _id(_object(wrapper.get("aweme")).get("aweme_id"), field_role='reply_wrapper_video_id') != video:
+                    _fail("notice_video_mismatch")
             if "aweme_id" in raw and _id(raw["aweme_id"], field_role='reply_outer_video_id') != video:
                 _fail("notice_video_mismatch")
             cid, content = _id(comment.get("cid"), field_role='reply_comment_id'), _text(comment.get("text"))
