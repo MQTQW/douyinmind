@@ -178,7 +178,7 @@ class NativeLane:
                     # Provenance belongs to THIS failure, never an older store
                     # pause or a visible string that might belong to a comment.
                     if code in {'invalid_native_visibility','invalid_notice_page','invalid_notice_schema',
-                                'invalid_notice_type','invalid_notice_time','unknown_comment_type','group_schema_unknown'}:
+                                'invalid_notice_type','invalid_notice_time','invalid_notice_identifier','unknown_comment_type','group_schema_unknown'}:
                         failure.native_intake_data_code=code
                     raise failure from None
                 if session_status['state'] == 'cooldown':

@@ -117,7 +117,9 @@ def intervention_health(error):
         reason = status['reason_code']
         if getattr(error,'native_intake_data_code',None) in {
                 'invalid_native_visibility','invalid_notice_page','invalid_notice_schema','invalid_notice_type',
-                'invalid_notice_time','unknown_comment_type','group_schema_unknown'}:
+                'invalid_notice_time','unknown_comment_type','group_schema_unknown'} or (
+                getattr(error,'native_intake_data_code',None)=='invalid_notice_identifier'
+                and reason=='invalid_notice_identifier'):
             return 'page_unavailable','native_notice_format_unavailable'
         if reason == 'api_error':
             return 'page_unavailable','native_api_error'
@@ -165,11 +167,24 @@ def _manual_identity_failure_status(lane, failure):
     except Exception:return None
 
 
+def _manual_notice_failure_status(lane):
+    from .native_lifecycle import project_native_session_status
+    try:
+        status=project_native_session_status(lane._public_native_session_status())
+        if status['state']!='paused' or status['reason_code']!='invalid_notice_identifier':return None
+        status.pop('transport_facts',None)
+        return status
+    except Exception:return None
+
+
 def explicit_start_failure_health(error, lane):
     from .manual_verification import native_identity_api_failure
     failure=native_identity_api_failure(error)
     if failure is not None:
         return 'page_unavailable','native_api_error',_manual_identity_failure_status(lane,failure)
+    from .manual_verification import native_notice_format_failure
+    if native_notice_format_failure(error) is not None:
+        return 'page_unavailable','native_notice_format_unavailable',_manual_notice_failure_status(lane)
     return 'verification_required','human_identity_unconfirmed',None
 
 

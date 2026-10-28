@@ -45,11 +45,25 @@ def native_identity_api_failure(error):
     return {'reason_code':'native_api_error',**({'transport_facts':facts} if facts else {})}
 
 
+def native_notice_format_failure(error):
+    """One current typed data-validation failure; never text or an old status."""
+    from .native_lifecycle import SessionLifecycleError
+    from .native_receiver import NativeReceiverError
+    from .native_transport import NativeTransportError
+    if type(error) in (SessionLifecycleError,NativeReceiverError,NativeTransportError) and error.code=='invalid_notice_identifier':
+        return {'reason_code':'native_notice_format_unavailable'}
+    return None
+
+
+def native_manual_failure(error):
+    return native_identity_api_failure(error) or native_notice_format_failure(error)
+
+
 def project_manual_failure_fields(value):
     """Copy known safe diagnostic fields, not raw server/exception objects."""
     from .native_transport import project_native_transport_facts
     reason=value.get('reason_code') if type(value) is dict else None
-    allowed={'native_api_error','action_failed','page_unavailable','verification_failed','owner_unavailable'}
+    allowed={'native_api_error','native_notice_format_unavailable','action_failed','page_unavailable','verification_failed','owner_unavailable'}
     reason=reason if type(reason) is str and reason in allowed else None
     result={'reason_code':reason}
     if reason=='native_api_error' and 'transport_facts' in value:
@@ -303,7 +317,7 @@ class ManualVerificationServer:
             # Do not log/serialize exception messages: they could contain text.
             reason = exc.code if type(exc) is ManualVerificationError and exc.code in {'page_unavailable', 'action_failed'} else 'action_failed'
             with self._lock:
-                failure=native_identity_api_failure(exc) if action=='finish' else None
+                failure=native_manual_failure(exc) if action=='finish' else None
                 self._end('verification_failed', failure['reason_code'] if failure else reason,
                     failure_facts=failure.get('transport_facts') if failure else None)
         finally:

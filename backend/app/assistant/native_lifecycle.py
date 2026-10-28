@@ -37,7 +37,7 @@ _CODES = frozenset({
     "identity_schema_unknown", "invalid_parameters", "api_error", "http_error",
     "response_too_large", "duplicate_json_key", "json_integer_limit", "invalid_json_constant",
     "session_cooldown", "session_transient_retry_exhausted",
-    "invalid_native_session_status",
+    "invalid_native_session_status", "invalid_notice_identifier",
 })
 _TRANSIENT_CODES = frozenset({"network_timeout", "network_error", "rate_limited", "http_error", "empty_response", "empty_nonterminal", "session_cookie_expiring"})
 _TRANSIENT_DELAYS = (45.0, 90.0)

@@ -21,7 +21,9 @@ const status=document.getElementById('status'),image=document.getElementById('sc
 let session=null,frameURL=null,frameGeneration=-1,inputEnabled=false,dragging=false,points=[],gestureStart=0,updating=false;
 const messages={idle:'尚未开始',queued:'已登记，等待助手主线程处理',processing:'正在处理本次操作',active:'核验通道已开启',completed:'核验检查通过；助手仍暂停，请回项目页面开启',cancelled:'核验通道已关闭',expired:'本次核验已到期，请重新开始',verification_not_ready:'助手当前不满足核验条件，操作已停止',verification_failed:'核验尚未通过，或本次操作未完成'};
 function failureMessage(value){
-if(value.state!=='verification_failed'||value.reason_code!=='native_api_error')return null;
+if(value.state!=='verification_failed')return null;
+if(value.reason_code==='native_notice_format_unavailable')return '通知数据格式未通过本机校验；助手保持暂停。主页核验不能绕过这项数据检查，也不能据此判定需要验证码。请保留任务，不要重复发送评论，等待核对程序的数据格式处理。';
+if(value.reason_code!=='native_api_error')return null;
 let numbers='';const f=value.transport_facts;
 if(f&&f.endpoint_role==='identity'&&Number.isInteger(f.http_status)&&f.http_status===200&&Number.isSafeInteger(f.api_status_code)&&f.api_status_code!==0&&Math.abs(f.api_status_code)<=1000000000)numbers=`（HTTP ${f.http_status}，业务码 ${f.api_status_code}）`;
 return `身份接口尚未确认${numbers}；助手保持暂停。主页可见不等于接口身份检查通过，这也不证明需要验证码。请保留任务，不要重复发送评论。`;
