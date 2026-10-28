@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import re
 import time
+import logging
 
 from .native_events import (NativeEventError, canonical_profile, project_page,
-    project_ui_review_hints, project_semantic_messages)
+    project_ui_review_hints, project_semantic_messages, notice_identifier_diagnostic)
 from .native_source_store import NativeSourceStore, NativeStoreError
 from .native_transport import NativeTransportError, decimal_id, project_native_transport_facts
+
+_LOG = logging.getLogger(__name__)
 
 
 class NativeReceiverError(RuntimeError):
@@ -130,6 +133,17 @@ class NativeReceiver:
                 self.store.pause(error.code)
             except NativeStoreError:
                 pass
+            diagnostic = notice_identifier_diagnostic(error)
+            if diagnostic is not None:
+                try:
+                    _LOG.warning('Native notice identifier rejected: field_role=%s value_kind=%s problem=%s',
+                                 diagnostic['field_role'], diagnostic['value_kind'], diagnostic['problem'])
+                except Exception:
+                    pass  # Diagnostics never replace the original rejection.
+                try:
+                    self.store.record_notice_identifier_diagnostic(diagnostic)
+                except Exception:
+                    pass  # Local diagnostic storage cannot grant or recover intake.
             raise NativeReceiverError(error.code, transport_facts=getattr(error, "transport_facts", None)) from None
         except Exception:
             self._last_code = "native_receiver_error"

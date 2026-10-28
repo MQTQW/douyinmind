@@ -22,11 +22,96 @@ def _fail(code):
     raise NativeEventError(code) from None
 
 
-def _id(value, *, zero=False):
+_IDENTIFIER_FACT_BRAND = object()
+_IDENTIFIER_FIELD_ROLES = frozenset({
+    'unspecified', 'receiver_uid', 'notice_id', 'recipient_uid', 'author_uid',
+    'notice_create_time', 'schema_cid', 'at_outer_video_id', 'at_inner_video_id',
+    'reply_video_id', 'reply_wrapper_video_id', 'reply_outer_video_id',
+    'reply_comment_id', 'reply_parent_hint', 'probe_video_id', 'probe_comment_id',
+})
+_IDENTIFIER_VALUE_KINDS = frozenset({'null_or_missing', 'bool', 'int', 'float', 'str', 'list', 'dict', 'other'})
+_IDENTIFIER_PROBLEMS = frozenset({
+    'wrong_type', 'negative', 'zero_not_allowed', 'out_of_range', 'empty',
+    'non_ascii', 'padded', 'signed', 'leading_zero', 'non_decimal', 'unknown',
+})
+
+
+def _identifier_kind(value):
+    if value is None:
+        return 'null_or_missing'
+    for kind, label in ((bool, 'bool'), (int, 'int'), (float, 'float'),
+                        (str, 'str'), (list, 'list'), (dict, 'dict')):
+        if type(value) is kind:
+            return label
+    return 'other'
+
+
+def _identifier_problem(value, *, zero):
+    if type(value) is int:
+        if value < 0:
+            return 'negative'
+        if value == 0 and not zero:
+            return 'zero_not_allowed'
+        return 'out_of_range' if value >= 10 ** 30 else 'unknown'
+    if type(value) is not str:
+        return 'wrong_type'
+    if not value:
+        return 'empty'
+    if not value.isascii():
+        return 'non_ascii'
+    if value != value.strip():
+        return 'padded'
+    if value[0] in '+-':
+        return 'signed'
+    if value.isdigit():
+        if value == '0' and not zero:
+            return 'zero_not_allowed'
+        if len(value) > 1 and value[0] == '0':
+            return 'leading_zero'
+        return 'out_of_range' if len(value) > 30 else 'unknown'
+    return 'non_decimal'
+
+
+def validate_notice_identifier_diagnostic(value):
+    """Three fixed enums only; unknown extra values are never inspected."""
+    if type(value) is not dict or set(value) != {'field_role', 'value_kind', 'problem'}:
+        return None
+    fields = {'field_role': _IDENTIFIER_FIELD_ROLES,
+              'value_kind': _IDENTIFIER_VALUE_KINDS, 'problem': _IDENTIFIER_PROBLEMS}
+    result = {}
+    for key, allowed in fields.items():
+        item = value[key]
+        if type(item) is not str or item not in allowed:
+            return None
+        result[key] = item
+    return result
+
+
+def notice_identifier_diagnostic(error):
+    """Only an actual _id failure has a trusted issuer tuple, never raw data."""
+    if type(error) is not NativeEventError:
+        return None
+    stored = object.__getattribute__(error, '__dict__')
+    if type(stored) is not dict:
+        return None
+    fact = stored.get('_identifier_fact')
+    if type(fact) is not tuple or len(fact) != 4 or fact[0] is not _IDENTIFIER_FACT_BRAND:
+        return None
+    return validate_notice_identifier_diagnostic({
+        'field_role': fact[1], 'value_kind': fact[2], 'problem': fact[3]})
+
+
+def _id(value, *, zero=False, field_role='unspecified'):
     try:
         return decimal_id(value, zero=zero)
     except NativeTransportError:
-        _fail("invalid_notice_identifier")
+        # This tuple contains enums, not the rejected value, and grants no
+        # permission. The same business error continues through the old gate.
+        role = field_role if type(field_role) is str and field_role in _IDENTIFIER_FIELD_ROLES else 'unspecified'
+        error = NativeEventError('invalid_notice_identifier')
+        error._identifier_fact = (_IDENTIFIER_FACT_BRAND, role, _identifier_kind(value),
+                                  _identifier_problem(value, zero=zero))
+        raise error from None
 
 
 def canonical_profile(sec_uid):
@@ -65,7 +150,7 @@ def _cid_from_schema(value, video):
         hits = [(key, val) for key, val in pairs if key.casefold() == "cid"]
         if len(hits) != 1 or hits[0][0] != "cid" or raw_keys.count("cid") != 1:
             _fail("invalid_notice_schema")
-        return _id(hits[0][1])
+        return _id(hits[0][1], field_role='schema_cid')
     except NativeEventError:
         raise
     except (ValueError, UnicodeError):
@@ -75,7 +160,7 @@ def _cid_from_schema(value, video):
 def _timestamp(value):
     if value is None:
         return None
-    number = _id(value, zero=True)
+    number = _id(value, zero=True, field_role='notice_create_time')
     if int(number) >= 10 ** 12:
         _fail("invalid_notice_time")
     return number
@@ -88,10 +173,10 @@ def _visibility_probe(value):
     if set(value) - {'video_id', 'current_text', 'previous_text', 'current_comment_id', 'previous_comment_id'}:
         return None
     try:
-        result = {'video_id': _id(value['video_id']), 'current_text': _text(value['current_text'])}
+        result = {'video_id': _id(value['video_id'], field_role='probe_video_id'), 'current_text': _text(value['current_text'])}
         result['previous_text'] = None if value['previous_text'] is None else _text(value['previous_text'])
         for key in ('current_comment_id', 'previous_comment_id'):
-            result[key] = None if value.get(key) is None else _id(value[key])
+            result[key] = None if value.get(key) is None else _id(value[key], field_role='probe_comment_id')
         return result
     except (NativeEventError, KeyError, TypeError, ValueError):
         return None
@@ -117,8 +202,8 @@ def _observe_unknown_at_visibility(raw, wrapper, nid, probe, observer):
         return
     video = cid = None
     try:
-        video = _id(raw.get('aweme_id'))
-        if _id(_object(wrapper.get('aweme')).get('aweme_id')) != video:
+        video = _id(raw.get('aweme_id'), field_role='at_outer_video_id')
+        if _id(_object(wrapper.get('aweme')).get('aweme_id'), field_role='at_inner_video_id') != video:
             video = None
     except NativeEventError:
         video = None
@@ -159,7 +244,7 @@ def project_page(page, channel, *, receiver_uid, receiver_sec_uid, profile_allow
     Native author UID/sec are pinned together by the durable source store.
     """
     probe = _visibility_probe(diagnostic_probe)
-    receiver_uid = _id(receiver_uid)
+    receiver_uid = _id(receiver_uid, field_role='receiver_uid')
     receiver_profile = canonical_profile(receiver_sec_uid)
     if type(channel) is not int or channel not in (9, 7) or not callable(profile_allowed):
         _fail("invalid_native_channel")
@@ -172,7 +257,7 @@ def project_page(page, channel, *, receiver_uid, receiver_sec_uid, profile_allow
     notices, candidates, seen, skipped = [], [], set(), 0
     for raw in rows:
         raw = _object(raw)
-        nid, recipient = _id(raw.get("nid_str")), _id(raw.get("user_id"))
+        nid, recipient = _id(raw.get("nid_str"), field_role='notice_id'), _id(raw.get("user_id"), field_role='recipient_uid')
         if recipient != receiver_uid:
             _fail("notice_recipient_mismatch")
         if nid in seen:
@@ -205,7 +290,7 @@ def project_page(page, channel, *, receiver_uid, receiver_sec_uid, profile_allow
                 continue
             comment = _object(wrapper.get("comment"))
             author = _object(comment.get("user"))
-        uid, sec = _id(author.get("uid")), author.get("sec_uid")
+        uid, sec = _id(author.get("uid"), field_role='author_uid'), author.get("sec_uid")
         sender_profile = canonical_profile(sec)
         try:
             allowed = profile_allowed(sender_profile)
@@ -235,21 +320,21 @@ def project_page(page, channel, *, receiver_uid, receiver_sec_uid, profile_allow
             skipped += 1
             continue
         if channel == 9:
-            video = _id(raw.get("aweme_id"))
-            if _id(_object(wrapper.get("aweme")).get("aweme_id")) != video:
+            video = _id(raw.get("aweme_id"), field_role='at_outer_video_id')
+            if _id(_object(wrapper.get("aweme")).get("aweme_id"), field_role='at_inner_video_id') != video:
                 _fail("notice_video_mismatch")
             content = _text(wrapper.get("content"))
             cid, hint = _cid_from_schema(wrapper.get("schema_url"), video), None
             source_kind = "native_notice_candidate"
         else:
-            video = _id(comment.get("aweme_id"))
-            if _id(_object(wrapper.get("aweme")).get("aweme_id")) != video:
+            video = _id(comment.get("aweme_id"), field_role='reply_video_id')
+            if _id(_object(wrapper.get("aweme")).get("aweme_id"), field_role='reply_wrapper_video_id') != video:
                 _fail("notice_video_mismatch")
-            if "aweme_id" in raw and _id(raw["aweme_id"]) != video:
+            if "aweme_id" in raw and _id(raw["aweme_id"], field_role='reply_outer_video_id') != video:
                 _fail("notice_video_mismatch")
-            cid, content = _id(comment.get("cid")), _text(comment.get("text"))
+            cid, content = _id(comment.get("cid"), field_role='reply_comment_id'), _text(comment.get("text"))
             hint = wrapper.get("parent_id")
-            hint = None if hint is None else _id(hint, zero=True)
+            hint = None if hint is None else _id(hint, zero=True, field_role='reply_parent_hint')
             source_kind = "native_reply_notice_candidate"
         candidates.append({
             "namespace": "douyin_web_v1", "source_kind": source_kind,
@@ -272,7 +357,7 @@ def project_semantic_messages(page, channel, *, receiver_uid, receiver_sec_uid, 
     This projection is never returned by project_page and grants no UI claim.
     The existing candidate/review paths still prove whether execution is possible.
     """
-    receiver_uid=_id(receiver_uid);receiver_profile=canonical_profile(receiver_sec_uid)
+    receiver_uid=_id(receiver_uid, field_role='receiver_uid');receiver_profile=canonical_profile(receiver_sec_uid)
     if type(channel) is not int or channel not in (9,7) or not callable(profile_allowed):
         _fail('invalid_native_channel')
     if channel!=9:return []
@@ -282,8 +367,8 @@ def project_semantic_messages(page, channel, *, receiver_uid, receiver_sec_uid, 
     if type(rows) is not list or len(rows)>100:_fail('invalid_notice_page')
     messages=[];seen=set()
     for raw in rows:
-        raw=_object(raw);nid=_id(raw.get('nid_str'))
-        if _id(raw.get('user_id'))!=receiver_uid:_fail('notice_recipient_mismatch')
+        raw=_object(raw);nid=_id(raw.get('nid_str'), field_role='notice_id')
+        if _id(raw.get('user_id'), field_role='recipient_uid')!=receiver_uid:_fail('notice_recipient_mismatch')
         if nid in seen:_fail('duplicate_native_notice_id')
         seen.add(nid);kind=raw.get('type')
         if type(kind) is not int or not 0<=kind<=100000:_fail('invalid_notice_type')
@@ -291,14 +376,14 @@ def project_semantic_messages(page, channel, *, receiver_uid, receiver_sec_uid, 
         wrapper=_object(raw.get('at'));subtype=wrapper.get('sub_type')
         if type(subtype) is not int:_fail('invalid_notice_type')
         if subtype!=2:continue
-        author=_object(wrapper.get('user_info'));uid=_id(author.get('uid'));sec=author.get('sec_uid')
+        author=_object(wrapper.get('user_info'));uid=_id(author.get('uid'), field_role='author_uid');sec=author.get('sec_uid')
         sender=canonical_profile(sec)
         try:allowed=profile_allowed(sender)
         except Exception:_fail('native_profile_check_failed')
         if allowed is not True:continue
         try:
-            video=_id(raw.get('aweme_id'))
-            if _id(_object(wrapper.get('aweme')).get('aweme_id'))!=video:continue
+            video=_id(raw.get('aweme_id'), field_role='at_outer_video_id')
+            if _id(_object(wrapper.get('aweme')).get('aweme_id'), field_role='at_inner_video_id')!=video:continue
             content=_text(wrapper.get('content'));cid=_cid_from_schema(wrapper.get('schema_url'),video)
             created=_timestamp(raw.get('create_time'))
         except NativeEventError:continue
@@ -318,7 +403,7 @@ def project_ui_review_hints(page, channel, *, receiver_uid, receiver_sec_uid, pr
     remains unknown; malformed individual hint content stays quarantined. Page
     identity/type corruption still fails closed. No probe comparison is used.
     """
-    receiver_uid = _id(receiver_uid)
+    receiver_uid = _id(receiver_uid, field_role='receiver_uid')
     receiver_profile = canonical_profile(receiver_sec_uid)
     if type(channel) is not int or channel not in (9, 7) or not callable(profile_allowed):
         _fail('invalid_native_channel')
@@ -333,7 +418,7 @@ def project_ui_review_hints(page, channel, *, receiver_uid, receiver_sec_uid, pr
     hints, seen = [], set()
     for raw in rows:
         raw = _object(raw)
-        nid, recipient = _id(raw.get('nid_str')), _id(raw.get('user_id'))
+        nid, recipient = _id(raw.get('nid_str'), field_role='notice_id'), _id(raw.get('user_id'), field_role='recipient_uid')
         if recipient != receiver_uid:
             _fail('notice_recipient_mismatch')
         if nid in seen:
@@ -351,7 +436,7 @@ def project_ui_review_hints(page, channel, *, receiver_uid, receiver_sec_uid, pr
         if subtype != 2:
             continue
         author = _object(wrapper.get('user_info'))
-        uid, sec = _id(author.get('uid')), author.get('sec_uid')
+        uid, sec = _id(author.get('uid'), field_role='author_uid'), author.get('sec_uid')
         sender_profile = canonical_profile(sec)
         try:
             allowed = profile_allowed(sender_profile)
@@ -363,8 +448,8 @@ def project_ui_review_hints(page, channel, *, receiver_uid, receiver_sec_uid, pr
         if type(visible) is not int or visible in (0, 1) or type(hidden) is not int or hidden != 0:
             continue
         try:
-            video = _id(raw.get('aweme_id'))
-            if _id(_object(wrapper.get('aweme')).get('aweme_id')) != video:
+            video = _id(raw.get('aweme_id'), field_role='at_outer_video_id')
+            if _id(_object(wrapper.get('aweme')).get('aweme_id'), field_role='at_inner_video_id') != video:
                 continue
             content = _text(wrapper.get('content'))
             cid = _cid_from_schema(wrapper.get('schema_url'), video)

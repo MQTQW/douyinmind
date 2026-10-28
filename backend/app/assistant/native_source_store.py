@@ -17,7 +17,7 @@ import time
 import urllib.parse
 import uuid
 
-from .native_events import canonical_profile
+from .native_events import canonical_profile, validate_notice_identifier_diagnostic
 from .native_transport import decimal_id
 from app.storage_guard import (StorageGuardError, assert_no_orphan_sqlite_files,
                                guarded_sqlite_file, verified_readonly_connection)
@@ -250,6 +250,19 @@ class NativeSourceStore:
         with self._connection(write=True) as db:
             db.execute("UPDATE meta SET value=? WHERE key='pause_code'", (_code(code),))
             db.execute("UPDATE meta SET value='0' WHERE key='verified_at'")
+
+    def record_notice_identifier_diagnostic(self, value):
+        """Diagnostic only: three enums for the currently paused format error."""
+        clean = validate_notice_identifier_diagnostic(value)
+        if clean is None:
+            raise NativeStoreError('invalid_notice_identifier_diagnostic')
+        with self._connection(write=True) as db:
+            current = db.execute("SELECT value FROM meta WHERE key='pause_code'").fetchone()
+            if current is None or current[0] != 'invalid_notice_identifier':
+                raise NativeStoreError('notice_identifier_diagnostic_not_current')
+            db.execute("INSERT INTO meta(key,value) VALUES('notice_identifier_diagnostic_v1',?) "
+                       "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (_dump(clean),))
+        return True
 
     def prepare_channel(self, channel, group):
         if type(channel) is not int or channel not in (7, 9):
