@@ -153,11 +153,32 @@ def receiver_page_health(error):
     return 'page_unavailable','page_not_ready'
 
 
+def _manual_identity_failure_status(lane, failure):
+    """Current safe lifecycle snapshot; no old transport numbers are reused."""
+    from .native_lifecycle import project_native_session_status
+    try:
+        status=project_native_session_status(lane._public_native_session_status())
+        if status['state']!='paused' or status['reason_code']!='api_error':return None
+        status.pop('transport_facts',None)
+        if 'transport_facts' in failure:status['transport_facts']=dict(failure['transport_facts'])
+        return status
+    except Exception:return None
+
+
+def explicit_start_failure_health(error, lane):
+    from .manual_verification import native_identity_api_failure
+    failure=native_identity_api_failure(error)
+    if failure is not None:
+        return 'page_unavailable','native_api_error',_manual_identity_failure_status(lane,failure)
+    return 'verification_required','human_identity_unconfirmed',None
+
+
 def record_manual_verification(control, run_id, server):
+    from .manual_verification import project_manual_failure_fields
     status=server.safe_status() if server is not None else {'state':'unavailable'}
     value={'available':server is not None,'url':'http://127.0.0.1:8767/' if server is not None else None,
            'state':status.get('state','unavailable'),
-           'active':manual_needs_owner(server)}
+           'active':manual_needs_owner(server),**project_manual_failure_fields(status)}
     def update(current):
         if current.get('run_id')!=run_id:raise ValueError('runtime_owner_changed')
         previous=current.get('manual_verification') or {}
@@ -419,9 +440,11 @@ def run_registered(queue, control, *, poll_seconds=45, publish_gap_seconds=30):
                                 control.heartbeat(run_id,native_session_status=status)
                             except ReceiverInterventionRequired:
                                 control.pause()
-                            except Exception:
+                            except Exception as error:
                                 control.pause()
-                                control.set_receiver_health(run_id,'verification_required',reason_code='human_identity_unconfirmed')
+                                health_state,health_code,status=explicit_start_failure_health(error,lane)
+                                if status is not None:control.heartbeat(run_id,native_session_status=status)
+                                control.set_receiver_health(run_id,health_state,reason_code=health_code)
                             else:
                                 intervention=False
                                 browser_intervention.clear()

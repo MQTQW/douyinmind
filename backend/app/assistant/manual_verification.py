@@ -30,6 +30,37 @@ class ManualVerificationError(ValueError):
         super().__init__(code)
 
 
+def native_identity_api_failure(error):
+    """Fixed current typed identity-API failure only; never exception text."""
+    from .native_lifecycle import SessionLifecycleError
+    from .native_receiver import NativeReceiverError
+    from .native_transport import NativeTransportError, project_native_transport_facts
+    if type(error) not in (SessionLifecycleError,NativeReceiverError,NativeTransportError) or error.code!='api_error':
+        return None
+    facts=project_native_transport_facts(error.transport_facts)
+    if facts and (set(facts)!={'endpoint_role','http_status','api_status_code'}
+            or facts['endpoint_role']!='identity' or type(facts['http_status']) is not int or facts['http_status']!=200
+            or type(facts['api_status_code']) is not int or facts['api_status_code']==0):
+        return None
+    return {'reason_code':'native_api_error',**({'transport_facts':facts} if facts else {})}
+
+
+def project_manual_failure_fields(value):
+    """Copy known safe diagnostic fields, not raw server/exception objects."""
+    from .native_transport import project_native_transport_facts
+    reason=value.get('reason_code') if type(value) is dict else None
+    allowed={'native_api_error','action_failed','page_unavailable','verification_failed','owner_unavailable'}
+    reason=reason if type(reason) is str and reason in allowed else None
+    result={'reason_code':reason}
+    if reason=='native_api_error' and 'transport_facts' in value:
+        facts=project_native_transport_facts(value['transport_facts'])
+        if (set(facts)=={'endpoint_role','http_status','api_status_code'} and facts['endpoint_role']=='identity'
+                and type(facts['http_status']) is int and facts['http_status']==200
+                and type(facts['api_status_code']) is int and facts['api_status_code']!=0):
+            result['transport_facts']=facts
+    return result
+
+
 def _json(data):
     return json.dumps(data, separators=(',', ':'), ensure_ascii=False, allow_nan=False).encode('utf-8')
 
@@ -77,6 +108,7 @@ class ManualVerificationServer:
         self._expires = 0.0
         self._state = 'idle'
         self._reason = None
+        self._failure_facts = {}
         self._frame = None
         self._frame_at = 0.0
         self._width = self._height = 0
@@ -98,12 +130,13 @@ class ManualVerificationServer:
         self._frame_at = 0.0
         self._input_enabled = self._auth_region_known = False
 
-    def _end(self, state, reason=None):
+    def _end(self, state, reason=None, *, failure_facts=None):
         self._pending.clear()  # Includes any unconsumed text; never persisted.
         self._clear_frame()
         self._session = self._session_nonce = None
         self._expires = 0.0
         self._state, self._reason = state, reason
+        self._failure_facts = project_manual_failure_fields({'reason_code':reason,'transport_facts':failure_facts or {}}).get('transport_facts',{})
 
     def _expire(self):
         now = self._clock()
@@ -152,12 +185,15 @@ class ManualVerificationServer:
     def safe_status(self):
         with self._lock:
             self._expire()
-            return {'state': self._state, 'reason_code': self._reason,
+            result = {'state': self._state, 'reason_code': self._reason,
                     'active': self._session is not None, 'pending': bool(self._pending),
                     'frame_available': self._frame is not None,
                     'frame_generation': self._frame_generation,
                     'input_enabled': self._input_enabled,
                     'auth_region_known': self._auth_region_known}
+            if self._state=='verification_failed' and self._reason=='native_api_error' and self._failure_facts:
+                result['transport_facts']=dict(self._failure_facts)
+            return result
 
     def operation_current(self):
         """Current operation lease, checked by owner before/after browser waits.
@@ -267,7 +303,9 @@ class ManualVerificationServer:
             # Do not log/serialize exception messages: they could contain text.
             reason = exc.code if type(exc) is ManualVerificationError and exc.code in {'page_unavailable', 'action_failed'} else 'action_failed'
             with self._lock:
-                self._end('verification_failed', reason)
+                failure=native_identity_api_failure(exc) if action=='finish' else None
+                self._end('verification_failed', failure['reason_code'] if failure else reason,
+                    failure_facts=failure.get('transport_facts') if failure else None)
         finally:
             # Python strings cannot promise physical memory zeroization. The
             # reference is dropped and no application log/file/response sees it.

@@ -482,7 +482,17 @@ class NativeSessionLifecycle:
         allowed = {None, "verification_required", "session_invalid", "session_identity_mismatch",
                    "authorization_expired", "session_expired", "session_existing_draft",
                    "session_cookie_expired", "session_cookie_expiring", "session_transient_retry_exhausted"}
-        if self._blocked not in allowed:
+        # Only this explicit human finish/Start hook may recheck a previous
+        # identity API business rejection. This is not identity success: the
+        # existing same-context capture, fixed UID GET, sealing and receiver
+        # checkpoint still have to pass. Missing/other-role facts stay blocked.
+        facts = self._last_transport_facts
+        identity_api_recheck = (self._blocked == "api_error"
+            and type(facts) is dict and set(facts) == {"endpoint_role", "http_status", "api_status_code"}
+            and facts["endpoint_role"] == "identity"
+            and type(facts["http_status"]) is int and facts["http_status"] == 200
+            and type(facts["api_status_code"]) is int and facts["api_status_code"] != 0)
+        if self._blocked not in allowed and not identity_api_recheck:
             _fail(self._blocked)
         # Recheck normally; no refresh if the draft/challenge still exists.
         self._capture.guard()
