@@ -1,4 +1,4 @@
-![DouyinMind：收藏，成为你的知识](docs/assets/cover.svg)
+![DouyinMind：收藏，成为你的知识；收藏知识库与抖音评论助手](docs/assets/cover-poster.png)
 
 # DouyinMind
 
