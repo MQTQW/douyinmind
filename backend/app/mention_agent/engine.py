@@ -250,6 +250,9 @@ class AgentEngine:
     def run(self, binding: Binding, envelope: dict, *, record: Callable = lambda *args: None,
             current_binding: Callable | None = None) -> Decision:
         envelope = validate_envelope(envelope, binding)
+        if (envelope.get('evidence', {}).get('source_kind') == 'intent_clarification_reply'
+                and self.trusted_semantic_decision is None):
+            return Decision(review_code='clarification_receipt_required')
         if envelope.get('evidence', {}).get('source_kind') == 'conversation_followup':
             if self.ingestion is not None:
                 return Decision(review_code='followup_query_only')

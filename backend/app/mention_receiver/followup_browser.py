@@ -275,10 +275,15 @@ def read_followup_reply(receiver,anchor,candidate,*,keep_open=True):
 
 
 def _target_args(target):
-    proof=target.get('followup_evidence')
+    proof=target.get('clarification_evidence') or target.get('followup_evidence')
     env={k:target[k] for k in ('command_id','reference_id','reference_quality','native_comment_id',
         'sender_profile_url','receiver_profile_url','video_id','comment_text','source_mode')}
-    env['evidence']=proof;validate_followup_envelope(env)
+    env['evidence']=proof
+    if target.get('clarification_evidence') is not None:
+        from app.mention_agent.clarification_evidence import validate_clarification_envelope
+        validate_clarification_envelope(env)
+    else:
+        validate_followup_envelope(env)
     root={'sender_profile_url':target['sender_profile_url'],'receiver_profile_url':target['receiver_profile_url'],
         'video_id':target['video_id'],'comment_text':proof['root_comment_text'],'reference_id':proof['root_reference_id'],
         'native_comment_id':proof['root_native_comment_id'],'source_mode':'live_ui','evidence':{'real_mention':True}}
@@ -317,8 +322,14 @@ def _prepare_followup_reply(receiver,target,text):
     from app.mention_agent.publisher import ReplyPreflightError
     anchor,candidate,args=_target_args(target)
     detail=read_followup_reply(receiver,anchor,candidate,keep_open=True)
-    fresh=make_followup_envelope(detail,{'binding_id':target['binding_id'],'instance_id':target['instance_id'],
-        'sender_profile_url':target['sender_profile_url'],'receiver_profile_url':target['receiver_profile_url'],'active':True})
+    def rebuild(actual):
+        binding={'binding_id':target['binding_id'],'instance_id':target['instance_id'],
+            'sender_profile_url':target['sender_profile_url'],'receiver_profile_url':target['receiver_profile_url'],'active':True}
+        if target.get('clarification_evidence') is not None:
+            from app.mention_agent.clarification_evidence import rebuild_clarification_envelope
+            return rebuild_clarification_envelope(actual,binding,target['clarification_evidence'])
+        return make_followup_envelope(actual,binding)
+    fresh=rebuild(detail)
     if fresh['reference_id']!=target['reference_id'] or fresh['native_comment_id']!=target['native_comment_id']:
         raise ReplyPreflightError('followup_frozen_target_changed')
     value=followup_reply_state(receiver,target,text)
@@ -334,6 +345,5 @@ def _prepare_followup_reply(receiver,target,text):
     # including changed parent/native quality. A frozen old proof is not its
     # own fresh verification, even if text/reference stayed the same.
     actual=_detail(anchor,args,value['detail'])
-    fresh=make_followup_envelope(actual,{'binding_id':target['binding_id'],'instance_id':target['instance_id'],
-        'sender_profile_url':target['sender_profile_url'],'receiver_profile_url':target['receiver_profile_url'],'active':True})
+    fresh=rebuild(actual)
     return {k:fresh[k] for k in ('sender_profile_url','receiver_profile_url','video_id','comment_text','reference_id','native_comment_id')}|fresh['evidence']

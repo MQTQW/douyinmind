@@ -466,6 +466,9 @@ class AssistantQueue:
         immutable_envelope = {name: value for name, value in envelope.items() if name not in {"command_id", "evidence"}}
         immutable_envelope["comment_text"] = re.sub(r"\s+", "", immutable_envelope["comment_text"])
         proof = envelope['evidence']
+        if proof.get('source_kind') == 'intent_clarification_reply':
+            immutable_envelope['clarification_parent'] = {name:value for name,value in proof.items()
+                if name!='observed_at_utc'}
         if proof.get('source_kind') == 'conversation_followup':
             # Re-observation can refresh time, never exchange the published
             # anchor, parent quality, account identity or exact prior receipt.

@@ -108,6 +108,9 @@ def validate_envelope(value: dict, binding: Binding) -> dict:
     if public_profile(value["receiver_profile_url"]) != binding.receiver_profile_url:
         raise ValueError("评论没有发给当前助手")
     evidence = value["evidence"]
+    if isinstance(evidence, dict) and evidence.get('source_kind') == 'intent_clarification_reply':
+        from .clarification_evidence import validate_clarification_envelope
+        return validate_clarification_envelope(value, binding)
     if isinstance(evidence, dict) and evidence.get('source_kind') == 'conversation_followup':
         from .followup_evidence import validate_followup_envelope
         return validate_followup_envelope(value, binding)

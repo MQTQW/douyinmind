@@ -96,6 +96,10 @@ class AgentService:
 
     def process(self, envelope: dict, *, video_title=None, query_retry_action_id=None) -> dict:
         envelope = validate_envelope(envelope, self.binding)
+        if (envelope.get('evidence', {}).get('source_kind') == 'intent_clarification_reply'
+                and self.trusted_semantic_decision is None):
+            return {'task_id':None,'state':'needs_review','reason_code':'clarification_receipt_required',
+                    'created':False,'ran_model':False}
         if envelope.get('evidence', {}).get('source_kind') == 'conversation_followup' and self.allow_import:
             return {'task_id':None,'state':'needs_review','reason_code':'followup_query_only',
                     'created':False,'ran_model':False}

@@ -605,7 +605,7 @@ class NormalPageReceiver:
 
     def _reply_state(self, target, text):
         from app.mention_agent.publisher import ReplyPreflightError
-        if target.get('followup_evidence') is not None:
+        if (target.get('followup_evidence') is not None or target.get('clarification_evidence') is not None):
             from .followup_browser import followup_reply_state
             return followup_reply_state(self, target, text)
         if target.get('choice_evidence') is not None:
@@ -946,7 +946,7 @@ class NormalPageReceiver:
     def prepare_reply(self, target: dict, text: str) -> dict:
         """Fresh public identity, exact parent and inline draft; never submits."""
         from app.mention_agent.publisher import ReplyPreflightError
-        if target.get('followup_evidence') is not None:
+        if (target.get('followup_evidence') is not None or target.get('clarification_evidence') is not None):
             return self.prepare_followup_reply(target, text)
         if target.get('choice_evidence') is not None:
             from .choice_browser import prepare_choice_reply
@@ -1018,7 +1018,7 @@ class NormalPageReceiver:
 
     def submit_reply(self, target: dict, text: str, *, before_submit) -> dict:
         """Exactly one click invocation after durable reservation and last gate."""
-        if target.get('followup_evidence') is not None:
+        if (target.get('followup_evidence') is not None or target.get('clarification_evidence') is not None):
             from .choice_browser import _readback_viewport
             with _readback_viewport(self):
                 return self._submit_reply(target, text, before_submit=before_submit)
@@ -1064,7 +1064,7 @@ class NormalPageReceiver:
         return {"outcome": "delivery_unknown", "exact_body_in_original_thread": False}
 
     def save_reply_evidence(self, target, text, path):
-        if target.get('followup_evidence') is not None:
+        if (target.get('followup_evidence') is not None or target.get('clarification_evidence') is not None):
             from .choice_browser import _readback_viewport
             with _readback_viewport(self):
                 return self._save_reply_evidence(target, text, path)
@@ -1074,7 +1074,7 @@ class NormalPageReceiver:
         self._check_challenge()
         value = self._reply_state(target, text)
         if value["matching_reply_count"] == 1:
-            index = value.get('evidence_root_index', value['root_index']) if target.get('followup_evidence') is not None else value['root_index']
+            index = value.get('evidence_root_index', value['root_index']) if (target.get('followup_evidence') is not None or target.get('clarification_evidence') is not None) else value['root_index']
             self.page.locator('[data-e2e="comment-item"]').nth(index).screenshot(
                 path=str(path), timeout=5000)
 

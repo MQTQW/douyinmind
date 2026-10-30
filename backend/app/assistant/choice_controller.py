@@ -51,6 +51,15 @@ class ChoiceController:
         self.semantic_choice_receipt_loader=None
         self.semantic_root_resolution_provider=None
         self.last_semantic_choice_status=None
+        self.intent_origin_for_task=None
+
+    def _origin_envelope(self,task):
+        if task.get('envelope',{}).get('evidence',{}).get('source_kind')!='intent_clarification_reply':
+            return task['envelope']
+        origin=self.intent_origin_for_task(task) if callable(self.intent_origin_for_task) else None
+        if not isinstance(origin,dict) or not isinstance(origin.get('envelope'),dict):
+            raise ValueError('clarification_choice_origin_unverified')
+        return origin['envelope']
 
     def _root_resolution(self,task):
         provider=self.semantic_root_resolution_provider
@@ -120,10 +129,14 @@ class ChoiceController:
 
     def _fresh_root(self,session):
         task=self.queue.get_task(session['root_task_id'])
+        try:
+            origin=self._origin_envelope(task) if task else None
+        except (ValueError,TypeError,KeyError,AttributeError):
+            return None
         if (not task or task.get('state') in {'cancelled','failed'} or not self._authorized_task(task)
                 or task.get('binding')!=session['root_binding']
                 or task.get('authorization')!=session['authorization_snapshot']
-                or _identity(task['envelope'])!=_identity(session['root_envelope'])):
+                or _identity(origin)!=_identity(session['root_envelope'])):
             return None
         try:
             resolution=self._root_resolution(task)
@@ -155,7 +168,7 @@ class ChoiceController:
             if not options:return None
             prefix = self.agent.freeze_reply_prefix('assistant:' + task['id'], reply_prefix)
             ask=self._menu(current, prefix)
-            return self.store.create(root_task_id=task['id'],root_binding=task['binding'],root_envelope=task['envelope'],
+            return self.store.create(root_task_id=task['id'],root_binding=task['binding'],root_envelope=self._origin_envelope(task),
                 ask_ref=self._ask_ref(task,current,ask),ask_text=ask,options=options,authorization=task['authorization'])
         except (ValueError,TypeError,KeyError,AttributeError):
             self.last_issue_code='choice_prepare_not_authorized';return None
@@ -253,7 +266,7 @@ class ChoiceController:
             if (not root or root['state'] not in {'b_view_visible','waiting_library'}
                     or not self._authorized_task(root) or root['binding'] != session['root_binding']
                     or root['authorization'] != session['authorization_snapshot']
-                    or _identity(root['envelope']) != _identity(session['root_envelope'])):
+                    or _identity(self._origin_envelope(root)) != _identity(session['root_envelope'])):
                 return False
             identity = {'instance_id':session['root_binding']['instance_id'],
                 'sender':session['root_binding']['sender_profile_url'],'receiver':session['root_binding']['receiver_profile_url'],

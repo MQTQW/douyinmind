@@ -178,6 +178,7 @@ class LegacyBridge:
         if source_authorizer is not None and not callable(source_authorizer):
             raise ValueError('invalid_source_authorizer')
         self.source_authorizer = source_authorizer
+        self.clarifications = None  # Explicit future-only capability; no legacy fallback.
         self.registry, self.queue, self.control = registry, queue, control
         self.database = Path(database or configured_database())
         self.agent_path = Path(agent_path).absolute()
@@ -282,6 +283,8 @@ class LegacyBridge:
         elif not binding.active:
             _followup_anchor_note(self, 'followup_anchor_binding_inactive')
         proof = task.get('envelope', {}).get('evidence', {})
+        if authorized and proof.get('source_kind') == 'intent_clarification_reply':
+            authorized = self.clarifications is not None and self.clarifications.authority_current(task) is True
         if authorized and proof.get('source_kind') == 'conversation_followup':
             try:
                 from app.mention_agent.followup_evidence import validate_followup_envelope
@@ -335,7 +338,7 @@ class LegacyBridge:
         preferred=task['binding_id'] if proof.get('quality')=='verified_ancestor' else None
         try:
             receipt = self._semantic_receipt(task)
-            if task['envelope'].get('evidence', {}).get('source_kind') == 'conversation_followup' and receipt is None:
+            if task['envelope'].get('evidence', {}).get('source_kind') in {'conversation_followup','intent_clarification_reply'} and receipt is None:
                 return None
             resolution = (self.resolver.resolve_verified_intent(task['envelope'], receipt, preferred_binding_id=preferred)
                 if receipt is not None else self.resolver.resolve(task['envelope'], preferred_binding_id=preferred))
@@ -377,7 +380,7 @@ class LegacyBridge:
         """A cost observation can only deny execution, never authorize it."""
         accounting, receipt = self._semantic_accounting(task), self._semantic_receipt(task)
         if accounting is None:
-            return receipt is None and task['envelope'].get('evidence', {}).get('source_kind') != 'conversation_followup'
+            return receipt is None and task['envelope'].get('evidence', {}).get('source_kind') not in {'conversation_followup','intent_clarification_reply'}
         return bool(accounting['state'] == 'complete' and receipt is not None
             and receipt.plan_id == accounting['plan_id']
             and receipt.budget_scope_id == accounting['budget_scope_id']
@@ -413,6 +416,11 @@ class LegacyBridge:
                 return _followup_anchor_reject(self, 'followup_anchor_source_mode')
             ancestor = envelope
             proof = envelope.get('evidence', {})
+            if proof.get('source_kind') == 'intent_clarification_reply':
+                origin = self.clarifications.origin_for_task(task) if self.clarifications is not None else None
+                if origin is None:
+                    return _followup_anchor_reject(self, 'followup_anchor_root_evidence')
+                ancestor = origin['envelope']
             if proof.get('source_kind') in {'library_choice_reply', 'conversation_followup'}:
                 reference = proof.get('root_reference_id')
                 with _followup_owned_ro(self.queue) as db:
@@ -470,6 +478,8 @@ class LegacyBridge:
                     expected['choice_evidence'] = proof
                 elif proof.get('source_kind') == 'conversation_followup':
                     expected['followup_evidence'] = proof
+                elif proof.get('source_kind') == 'intent_clarification_reply':
+                    expected['clarification_evidence'] = proof
                 if target != expected:
                     return _followup_anchor_reject(self, 'followup_anchor_reply_target')
             _followup_anchor_note(self, 'followup_anchor_matched')
@@ -516,7 +526,7 @@ class LegacyBridge:
                 return _followup_anchor_reject(self, 'followup_anchor_lineage_scope')
             kind, predecessor = anchor.get('anchor_source_kind'), anchor.get('predecessor_task_id')
             if kind != 'conversation_followup':
-                if kind in (None, 'library_choice_reply') and predecessor is None:
+                if kind in (None, 'library_choice_reply', 'intent_clarification_reply') and predecessor is None:
                     return anchor
                 return _followup_anchor_reject(self, 'followup_anchor_lineage_kind')
             if type(predecessor) is not str or not re.fullmatch(r'[a-f0-9]{32}', predecessor):
@@ -1211,6 +1221,8 @@ class LegacyBridge:
             ).publish(result['agent_task_id'])
         if self.choices is not None:
             self.choices.after_publish(task, outcome)
+        if getattr(self,'clarifications',None) is not None:
+            self.clarifications.after_publish(task)
         held=self.agent.get_task(result['agent_task_id'])
         preflight_verification=(outcome['state']=='verification_required' and held['state']=='needs_review'
                                 and held.get('reason_code')=='preflight_verification_required')

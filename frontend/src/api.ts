@@ -22,6 +22,7 @@ export interface AssistantOverview {
   binding?: AssistantBindingSummary | null;
   configuration?: { state: 'ready' | 'not_configured' | 'unavailable'; reason_code?: string | null; message?: string | null };
   intake_issues?: { unresolved_count: number; recent: { id: string; comment_excerpt?: string; message?: string; state: string; created_at?: string; }[] };
+  native_intake?: { available: false; observed_at?: string; message?: string } | { available: true; observed_at: string; unresolved_count: number; pending_count: number; recent: { id: string; state: string; reason_code?: string; message?: string; comment_excerpt?: string; created_at?: string; }[] } | null;
   diagnostics?: AssistantDiagnostics;
 }
 export interface AssistantDiagnostics {

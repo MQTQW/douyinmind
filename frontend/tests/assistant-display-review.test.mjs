@@ -15,12 +15,14 @@ async function moduleURL(path, imports = {}, transform = source => source) {
 const reactImports = { react: import.meta.resolve('react'), 'react/jsx-runtime': import.meta.resolve('react/jsx-runtime'), 'lucide-react': import.meta.resolve('lucide-react') };
 const viewURL = await moduleURL('../src/assistantView.ts');
 const view = await import(viewURL);
+const NativeIntakeNotice = (await import(await moduleURL('../src/components/NativeIntakeNotice.tsx', { ...reactImports, '../assistantView': viewURL }))).default;
 const sharedImports = {
   ...reactImports, '../assistantView': viewURL,
   '../api': asURL('export {};'), './AssistantPanel.display.css': asURL('export {};'),
   '../assistantDemo': asURL('export const demoOverview={};export const demoTasks=[];export function demoTaskDetail(){}'),
   './AssistantSettings': asURL('export default function Settings(){return null}'),
   './AssistantOperations': asURL('export default function Operations(){return null}'),
+  './NativeIntakeNotice': await moduleURL('../src/components/NativeIntakeNotice.tsx', { ...reactImports, '../assistantView': viewURL }),
 };
 const { TaskDetails } = await import(await moduleURL('../src/components/AssistantPanel.tsx', sharedImports,
   source => source.replace('function TaskDetails(', 'export function TaskDetails(')));
@@ -35,6 +37,52 @@ const detailProps = task => ({ task, error: '', pending: '', demo: true, notice:
   onClose() {}, onRefresh() {}, async onAction() {}, onOpenTask() {} });
 const renderDetails = (task, props = {}) => renderToStaticMarkup(createElement(TaskDetails, { ...detailProps(task), ...props }));
 const beforeRecords = html => html.split('<details class="assistant-ui-records"')[0];
+const sourceSummary = {
+  available: true, observed_at: '2026-01-02T12:01:00Z', unresolved_count: 1, pending_count: 0,
+  recent: [{ id: 'synthetic-source', state: 'held', created_at: '2026-01-02T11:55:00Z',
+    message: '无法确认这条回复对应的原线程。', comment_excerpt: '请只保存，不需要总结。' }],
+};
+const renderNativeIntake = summary => renderToStaticMarkup(createElement(NativeIntakeNotice, { summary }));
+
+test('source holds stay visible independently of empty task/configuration issue lists', () => {
+  const html = renderNativeIntake(sourceSummary);
+  for (const text of ['1 条收件记录需核对', '通知已登记', '尚未确认进入任务队列', '无法确认这条回复对应的原线程', '请只保存，不需要总结', '首次记录', '最近核对']) assert.ok(html.includes(text), text);
+  assert.doesNotMatch(html, /未调用模型|不计费|无需费用|已完成任务|<button/);
+  assert.doesNotMatch(html, /<details[^>]*\bopen(?:=|[ >])/);
+});
+
+test('unavailable source observations never render a reassuring zero', () => {
+  const html = renderNativeIntake({ available: false });
+  assert.match(html, /role="status"/);
+  assert.match(html, /收件明细暂时无法读取，已有记录保留/);
+  assert.doesNotMatch(html, /0 条|无异常|已完成/);
+});
+
+test('normal pending admission is a status rather than a failed task', () => {
+  const html = renderNativeIntake({ ...sourceSummary, unresolved_count: 0, pending_count: 2, recent: [] });
+  assert.match(html, /2 条指令正在核对受理条件/);
+  assert.match(html, /role="status"/);
+  assert.doesNotMatch(html, /需核对|失败|<details|<button/);
+});
+
+test('healthy or older servers leave the incumbent screen unchanged', () => {
+  assert.equal(renderNativeIntake(null), '');
+  assert.equal(renderNativeIntake(undefined), '');
+  assert.equal(renderNativeIntake({ ...sourceSummary, unresolved_count: 0, recent: [] }), '');
+});
+
+test('source text is escaped and cannot turn a diagnostic into an action', () => {
+  const html = renderNativeIntake({ ...sourceSummary, recent: [{ ...sourceSummary.recent[0], comment_excerpt: '<script>sendAgain()</script>' }] });
+  assert.match(html, /&lt;script&gt;/);
+  assert.doesNotMatch(html, /<script>|<a |<button/);
+});
+
+test('bounded detail list does not pretend to show every held observation', () => {
+  const html = renderNativeIntake({ ...sourceSummary, unresolved_count: 12, pending_count: 3 });
+  assert.match(html, /12 条收件记录需核对/);
+  assert.match(html, /另有 11 条记录需核对/);
+  assert.match(html, /另有 3 条指令正在核对受理条件/);
+});
 
 for (const [name, task] of Object.entries({
   answer: base,

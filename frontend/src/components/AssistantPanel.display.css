@@ -85,6 +85,17 @@
   font-weight: 500;
 }
 
+.assistant-native-intake-status {
+  margin-top: 17px;
+  color: var(--color-ink-muted);
+  font-size: 12px;
+  line-height: 1.8;
+}
+
+.assistant-native-intake span {
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 767px) {
   .assistant-panel .assistant-ui-compact-binding {
     grid-template-columns: repeat(2, minmax(0, 1fr));

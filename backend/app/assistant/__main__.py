@@ -258,7 +258,7 @@ def pump_manual_verification(server, owner, control, run_id, admission_lock, hol
     return True
 
 
-def run_registered(queue, control, *, poll_seconds=45, publish_gap_seconds=30):
+def run_registered(queue, control, *, poll_seconds=45, publish_gap_seconds=30, enable_intent_clarification=False):
     from playwright.sync_api import sync_playwright, Error as BrowserError
     from app.core.config import settings
     from app.mention_agent.service import configured_database
@@ -300,6 +300,11 @@ def run_registered(queue, control, *, poll_seconds=45, publish_gap_seconds=30):
             protected_paths=(database, AGENT_PATH, queue.path, conversation.path,
                              queue.path.parent/'registry.sqlite3', queue.path.parent/'usage-budget.sqlite3'))
         control.register(run_id)
+        def clear_clarification_capability(current):
+            if current.get('run_id')==run_id:
+                current['intent_clarification_v1']={'enabled':False,'activated_at':None}
+            return current
+        queue.update_control(clear_clarification_capability)
         with sync_playwright() as p:
             headless=product_browser_headless()
             context=p.chromium.launch_persistent_context(str(profile),headless=headless,
@@ -382,6 +387,28 @@ def run_registered(queue, control, *, poll_seconds=45, publish_gap_seconds=30):
                     bridge.choices.semantic_choice_planner=plan_choice
                     bridge.choices.semantic_choice_receipt_loader=semantic_store.get_recorded_decision
                     bridge.choices.semantic_root_resolution_provider=interpreter.recorded_resolution
+                from .clarification_sessions import ClarificationSessionStore,DATABASE_NAME,MARKER_NAME
+                clarification_path=queue.path.parent/DATABASE_NAME
+                clarification_store=None
+                if enable_intent_clarification:
+                    clarification_store=ClarificationSessionStore.prepare(clarification_path,enabled=True)
+                elif clarification_path.exists() or (queue.path.parent/MARKER_NAME).exists():
+                    # Explicit activation survives a normal Start; this path
+                    # neither initializes a missing store nor changes its epoch.
+                    clarification_store=ClarificationSessionStore(clarification_path)
+                if clarification_store is not None:
+                    if interpreter is None or getattr(lane,'source_store',None) is None:
+                        raise ValueError('clarification_capability_unavailable')
+                    from .clarification_continuation import ClarificationContinuation
+                    continuation=ClarificationContinuation(clarification_store,bridge,lane,interpreter)
+                    bridge.clarifications=continuation
+                    bridge.choices.intent_origin_for_task=continuation.origin_for_task
+                    lane.clarification_coordinator=continuation
+                    def mark_clarification(current):
+                        if current.get('run_id')==run_id:
+                            current['intent_clarification_v1']={'enabled':True,'activated_at':clarification_store.activated_at}
+                        return current
+                    queue.update_control(mark_clarification)
                 runtime=AssistantRuntime(queue,control,execute=bridge.execute,publish=bridge.publish,
                     reconcile=bridge.reconcile,resume_adapter=bridge.operator_resume,
                     retry_adapter=bridge.operator_retry_query,intake=lane.collect,run_id=run_id,
@@ -535,6 +562,8 @@ def run_registered(queue, control, *, poll_seconds=45, publish_gap_seconds=30):
                             control.record_capture(run_id,admitted_count=len(admitted),
                                 baseline_created=getattr(lane,'last_baseline_created',False),
                                 unavailable_details=getattr(lane,'last_detail_failure_count',0))
+                            from .native_intake_visibility import record_native_intake
+                            record_native_intake(control,run_id,lane)
                             control.set_receiver_health(run_id,'ready' if native_ready else 'starting',
                                 reason_code=None if native_ready else 'native_history_baseline_in_progress')
                             next_capture=time.monotonic()+poll_seconds
@@ -550,6 +579,8 @@ def run_registered(queue, control, *, poll_seconds=45, publish_gap_seconds=30):
                                 control.set_receiver_health(run_id,'page_unavailable',reason_code='native_ui_wakeup_unconfirmed')
                             finally:
                                 record_native_read_diagnostic(control,run_id,lane,previous_read)
+                                from .native_intake_visibility import record_native_intake
+                                record_native_intake(control,run_id,lane)
                         runtime.process_action_once()
                         # This lane only reads already attempted public replies.
                         # Unknown send reservations never become publish jobs.
@@ -627,7 +658,15 @@ def main(argv=None):
     recovery.add_argument('--review-unexecuted-followup',help='完整审计无执行记录及真实原线程后，为中断追问登记独立一次新读取；不重发任何结果')
     recovery.add_argument('--finalize-query-draft',help='核验已登记的操作员问答首稿，只生成未发草稿，不重跑模型或发送；填写32位任务号')
     parser.add_argument('--candidate-sha256',help='与操作员首稿请求一起固定已核对候选的64位SHA256，不能单独使用')
+    parser.add_argument('--enable-intent-clarification',action='store_true',help='明确启用v1未来意图澄清续接；不回填旧任务或来源')
     args=parser.parse_args(argv)
+    if args.enable_intent_clarification and args.run_registered:
+        parser.error('先用独立启用配置命令，再通过正常助手入口加载；不与后台owner参数合并。')
+    if args.enable_intent_clarification and any((args.review_native_source,args.resume_native_source,
+            args.review_native_visibility_hint,args.inspect_native_visibility_hint,args.recover_native_visibility_hint,
+            args.inspect_assistant_reply,args.review_thread_followup,args.inspect_thread_followup,
+            args.review_unexecuted_followup,args.finalize_query_draft,args.candidate_sha256)):
+        parser.error('启用配置不能与审查、恢复、首稿或其它操作合并。')
     draft_provided = args.finalize_query_draft is not None
     candidate_provided = args.candidate_sha256 is not None
     if draft_provided != candidate_provided:
@@ -647,6 +686,13 @@ def main(argv=None):
     launching_run=initial.get('run_id') if args.run_registered and initial.get('state')=='starting' else None
     try:
         start_guard()
+        if args.enable_intent_clarification:
+            from .clarification_sessions import ClarificationSessionStore,DATABASE_NAME
+            store=ClarificationSessionStore.prepare(STATE/DATABASE_NAME,enabled=True)
+            print(json.dumps({'configured':True,'capability':'intent_clarification_v1',
+                'activated_at':store.activated_at,'started':False,
+                'message':'已明确启用未来意图澄清续接。请通过正常助手入口加载匹配版本；当前owner和旧任务未变更。'},ensure_ascii=False))
+            return 0
         if args.review_native_source or args.resume_native_source or args.review_native_visibility_hint or args.inspect_native_visibility_hint or args.recover_native_visibility_hint or args.inspect_assistant_reply or args.review_thread_followup or args.inspect_thread_followup or args.review_unexecuted_followup or args.finalize_query_draft:
             from .native_recovery_mailbox import NativeRecoveryMailbox
             request=NativeRecoveryMailbox(STATE,initial.get('run_id'),control).submit(

@@ -129,6 +129,7 @@ class NativeLane:
         self.last_native_read_diagnostic = {}
         self.visibility_hint_store = None  # Explicit local factory opt-in only.
         self.semantic_intake_ready = None
+        self.clarification_coordinator = None
         self.semantic_candidate_action = None
         self.semantic_ui_source_ready = None
         self.followup_coordinator = None
@@ -1667,6 +1668,12 @@ class NativeLane:
         for session in scoped:
             env = session['root_envelope']
             original_row = self.source_store.lookup_source_for_task(session['root_task_id'])
+            if getattr(self,'clarification_coordinator',None) is not None:
+                menu_task=self.queue.get_task(session['root_task_id'])
+                if menu_task and menu_task.get('envelope',{}).get('evidence',{}).get('source_kind')=='intent_clarification_reply':
+                    origin=self.clarification_coordinator.origin_for_task(menu_task)
+                    if origin is None:continue
+                    original_row=self.source_store.lookup_source_for_task(origin['id'])
             if original_row is not None:
                 if (original_row.get('state') != 'admitted' or original_row.get('historical') is not False
                         or self.source_store.admission_current(original_row['source_id']) is not True):
@@ -1710,6 +1717,18 @@ class NativeLane:
 
     def _reply(self, claim, session=None):
         candidate = claim['candidate']
+        if getattr(self,'clarification_coordinator',None) is not None and session is None:
+            prepared = self.clarification_coordinator.prepare(claim,
+                checkpoint=lambda:self._check(claim,reverify_identity=True),
+                read=lambda anchor,observed:self._read_with_interruption_receipt(claim,'original_ui_lookup',
+                    lambda:self.adapter.read_followup_reply(anchor,observed,keep_open=True)))
+            if prepared is not None:
+                rows,thread,correlation,failure=prepared
+                if not rows:
+                    self._hold(claim,failure or 'clarification_no_resolution')
+                    return []
+                self._plan(claim,rows[0],thread,correlation)
+                return rows
         session = session or self._reply_session(candidate)
         if session is None:
             if self.followup_coordinator is not None:
@@ -1870,6 +1889,8 @@ class NativeLane:
             claim = pending['claim']
             self.source_store.finish_ui_admission(claim['source_id'], claim['claim_token'], task['id'], reference)
             self._pending.pop(reference, None)
+        if getattr(self,'clarification_coordinator',None) is not None:
+            self.clarification_coordinator.admitted(tasks)
 
     def recover(self):
         """Only observe existing immutable Queue rows; never re-enqueue a plan."""
@@ -1909,6 +1930,8 @@ class NativeLane:
             elif env.get('evidence', {}).get('source_kind') == 'library_choice_reply':
                 self._hold(claim, 'native_plan_conflict'); continue
             self.source_store.finish_ui_admission(claim['source_id'], claim['claim_token'], task['id'], env['reference_id'])
+            if getattr(self,'clarification_coordinator',None) is not None:
+                self.clarification_coordinator.recover_links([task])
             recovered += 1
         return recovered
 
@@ -1964,6 +1987,10 @@ class NativeLane:
             env = task.get('envelope')
             if not isinstance(env, dict) or not isinstance(env.get('reference_id'), str): return False
             proof = env.get('evidence', {})
+            if (proof.get('source_kind') == 'intent_clarification_reply'
+                    and (getattr(self,'clarification_coordinator',None) is None
+                         or not self.clarification_coordinator.authority_current(task))):
+                return False
             if (proof.get('source_kind') == 'conversation_followup'
                     and (self.followup_coordinator is None
                          or not self.followup_coordinator.authority_current(task))):

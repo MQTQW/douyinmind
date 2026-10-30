@@ -115,11 +115,20 @@ class AssistantAPI:
                 reason = reason if reason in CONFIGURATION_MESSAGES else "assistant_configuration_unavailable"
                 configuration = {"state": "unavailable", "reason_code": reason, "message": CONFIGURATION_MESSAGES[reason]}
         current_control, counts = self.control.snapshot(), self.queue.counts()
+        native_intake = None
+        if current_control.get('native_intake') is not None:
+            from .native_intake_visibility import project_native_intake
+            try:
+                native_intake = project_native_intake(current_control['native_intake'])
+            except Exception:
+                native_intake = {'available': False, 'message': '收件明细暂时无法读取，已有记录保留。'}
+            current_control = {**current_control, 'native_intake': native_intake}
         return {"available": True, "control": current_control, "counts": counts, "binding": binding,
                 "diagnostics": diagnostics(current_control, counts,
                     pending_rechecks=self.queue.notice_deferral_summary()['pending_rechecks']),
                 "configuration": configuration,
                 "intake_issues": self.queue.intake_issue_summary(),
+                "native_intake": native_intake,
                 "capabilities": {"start": configuration["state"] != "unavailable", "pause": True, "stop": True, "multi_user": False,
                     "public_visibility": "b_view_only", "reconcile": True, "automatic_unknown_retry": False}}
 
