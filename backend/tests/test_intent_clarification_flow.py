@@ -14,6 +14,7 @@ from app.assistant.clarification_sessions import ClarificationSessionStore,DATAB
 from app.assistant.clarification_continuation import ClarificationContinuation
 from app.assistant.legacy_bridge import LegacyBridge
 from app.assistant.runtime import AssistantRuntime
+from app.assistant.native_lane import NativeLane
 from app.assistant.semantic_plan_store import SemanticPlanStore
 from app.assistant.semantic_routing import SemanticIntentInterpreter
 from app.assistant.usage_budget import UsageBudget
@@ -53,13 +54,31 @@ class SourceLedger:
         finally:db.close()
     def add(self,sid,candidate,*,task=None,state='claimed',historical=False,attempts=1):
         with self._connection() as db:
-            db.execute('INSERT INTO sources VALUES(?,?,?,?,?,?,?,?,NULL)',(sid,state,
+            db.execute('INSERT INTO sources VALUES(?,?,?,?,?,?,?,?,?)',(sid,state,
                 task['id'] if task else None,task['envelope']['reference_id'] if task else None,
-                int(historical),time.time(),attempts,json.dumps(candidate)))
+                int(historical),time.time(),attempts,json.dumps(candidate),json.dumps(self._plan(task)) if task else None))
+    @staticmethod
+    def _plan(task):
+        item={key:deepcopy(task[key]) for key in ('kind','binding','authorization','user_id','device_id','envelope')}
+        return {'reference_id':task['envelope']['reference_id'],'envelope':deepcopy(task['envelope']),'queue_item':item}
     def admit(self,sid,task):
         with self._connection() as db:
-            db.execute("UPDATE sources SET state='admitted',task_id=?,reference_id=? WHERE source_id=?",
-                (task['id'],task['envelope']['reference_id'],sid))
+            db.execute("UPDATE sources SET state='admitted',task_id=?,reference_id=?,plan=? WHERE source_id=?",
+                (task['id'],task['envelope']['reference_id'],json.dumps(self._plan(task)),sid))
+    @staticmethod
+    def _view(row):
+        if row is None:return None
+        value=dict(row);value['historical']=bool(value['historical'])
+        value['candidate']=json.loads(value['candidate']);value['plan']=json.loads(value['plan']) if value['plan'] else None
+        return value
+    def find_sources_by_ui_reference(self,reference):
+        with self._connection() as db:return [self._view(row) for row in db.execute('SELECT * FROM sources WHERE reference_id=?',(reference,))]
+    def lookup_source_for_task(self,task_id):
+        with self._connection() as db:rows=list(db.execute('SELECT * FROM sources WHERE task_id=?',(task_id,)))
+        return self._view(rows[0]) if len(rows)==1 else None
+    def admitted_source_current(self,sid):
+        with self._connection() as db:row=self._view(db.execute('SELECT * FROM sources WHERE source_id=?',(sid,)).fetchone())
+        return bool(row and row['state']=='admitted' and row['historical'] is False and row['plan'])
 
 
 class Planner:
@@ -124,8 +143,24 @@ def flow(case,tmp_path):
     c.controller.semantic_root_resolution_provider=interpreter.recorded_resolution
     c.controller.semantic_choice_receipt_loader=meaning.get_recorded_decision
     c.controller.semantic_choice_planner=lambda **kw:meaning.run_once(**kw,model=planner,budget=budget)
-    lane=SimpleNamespace(source_store=sources,browser_lane=SimpleNamespace(pending={}))
+    lane=NativeLane.__new__(NativeLane)
+    lane.browser_lane=SimpleNamespace(pending={},choice_controller=c.controller)
+    lane.source_store=sources;lane.queue=c.queue;lane.registry=c.registry;lane.choice_controller=c.controller
+    lane.followup_coordinator=None;lane.visibility_hint_store=None
+    lane.clarification_coordinator=None
     coordinator=ClarificationContinuation(store,bridge,lane,interpreter)
+    lane.clarification_coordinator=coordinator
+    # These are the REAL application authority methods. Only capture/UI and
+    # provider effects are simulated, not the dispatcher permission spine.
+    interpreter.native_inbox=SimpleNamespace(lookup=lambda _:None)
+    interpreter.native_source_store=sources
+    source_checks=[];semantic_checks=[]
+    def authority(task):
+        source_checks.append(task['id'])
+        if lane.authority_current(task) is not True:return False
+        semantic_checks.append(task['id'])
+        return interpreter.native_authority_current(task) is True
+    bridge.source_authorizer=authority
     bridge.clarifications=coordinator;c.controller.intent_origin_for_task=coordinator.origin_for_task
     runtime=AssistantRuntime(c.queue,control,execute=bridge.execute,publish=bridge.publish,reconcile=bridge.reconcile)
     coordinator.admitted([task])
@@ -134,7 +169,8 @@ def flow(case,tmp_path):
     session=store.for_root(task['id']);assert session['state']=='awaiting_reply'
     return SimpleNamespace(c=c,store=store,meaning=meaning,budget=budget,planner=planner,interpreter=interpreter,
         sources=sources,root=c.queue.get_task(task['id']),session=session,backend=backend,platform=platform,
-        bridge=bridge,coordinator=coordinator,runtime=runtime,save_target=save_target,save_calls=save_calls)
+        bridge=bridge,coordinator=coordinator,runtime=runtime,save_target=save_target,save_calls=save_calls,
+        lane=lane,source_checks=source_checks,semantic_checks=semantic_checks)
 
 
 def prepare(c,*,text='请保存到编程库。',decision=None,detail_hook=None):
@@ -204,6 +240,15 @@ def test_missing_library_creates_new_formal_menu_then_unique_save_child(flow):
         source_checkpoint=lambda _:True,selection_candidate=selection)
     assert len(rows)==1 and rows[0]['kind']=='save'
     child=c.c.queue.enqueue(**rows[0]);c.c.controller.admitted([child]);c.save_target[0]=8
+    c.sources.add('native:'+'c'*64,{'source_kind':'native_reply_notice_candidate',
+        'native_comment_id':adapter.native,'content':text},task=child,state='admitted')
+    assert c.lane.authority_current(child) is True
+    assert c.interpreter.native_authority_current(child) is True
+    bad=deepcopy(child);bad['envelope']['evidence']['root_reference_id']='different-synthetic-root'
+    assert c.lane.authority_current(bad) is False
+    attached=c.lane.clarification_coordinator;c.lane.clarification_coordinator=None
+    assert c.lane.authority_current(child) is False
+    c.lane.clarification_coordinator=attached
     assert c.runtime.execute_once()['state']=='ready_to_publish'
     assert c.runtime.publish_once()['state']=='b_view_visible'
     assert c.backend.posts==1 and len(c.save_calls)==1
@@ -213,6 +258,8 @@ def test_missing_library_creates_new_formal_menu_then_unique_save_child(flow):
     assert c.c.controller.collect_pending(adapter,'synthetic-v1-owner',choice_id=choice['choice_id'],
         source_checkpoint=lambda _:True,selection_candidate=selection)==[]
     assert c.backend.posts==1
+    assert {c.root['id'],menu['id'],child['id']}<=set(c.source_checks)
+    assert {c.root['id'],menu['id'],child['id']}<=set(c.semantic_checks)
 
 
 @pytest.mark.parametrize('decision',[
@@ -249,3 +296,33 @@ def test_bad_scope_or_unknown_results_never_import_or_erase_consumption(flow,pro
     if problem in {'body_changed_after_model','unknown_model'}:
         assert c.store.for_root(c.root['id'])['state']=='responding'
         assert len(c.planner.calls)==2
+
+
+def test_crash_after_source_admitted_repairs_only_the_existing_queue_session_link(flow):
+    c=flow;sid,_,result,_=prepare(c)
+    row=result[0][0];task=c.c.queue.enqueue(**row)
+    c.c.history.bind_task(task['id'],row['binding'],row['envelope'],result[1]['root_reference_id'],result[1])
+    c.sources.admit(sid,task)  # Crash before coordinator/Session handoff.
+    assert c.store.for_root(c.root['id'])['state']=='planned'
+    source_before=c.sources.path.read_bytes();queue_before=c.c.queue.path.read_bytes()
+    agent_before=c.c.agent.path.read_bytes();calls=len(c.planner.calls)
+    assert c.coordinator.reconcile_existing()['links_repaired']==1
+    assert c.store.for_root(c.root['id'])['child_task_id']==task['id']
+    assert c.coordinator.reconcile_existing()['links_repaired']==0
+    assert len(c.planner.calls)==calls and c.backend.posts==0 and c.platform.submits==1
+    assert c.sources.path.read_bytes()==source_before and c.c.queue.path.read_bytes()==queue_before
+    assert c.c.agent.path.read_bytes()==agent_before
+    assert c.lane.authority_current(task) is True
+
+
+def test_crash_after_agent_exact_B_view_projects_publication_without_new_send(flow):
+    c=flow
+    with c.store._db(write=True) as db:
+        db.execute("UPDATE clarification_sessions SET state='awaiting_publication',published_reply=NULL,revision=1 WHERE session_id=?",(c.session['session_id'],))
+    snapshots={path:path.read_bytes() for path in (c.sources.path,c.c.queue.path,c.c.agent.path,c.meaning.path,c.budget.path)}
+    calls=len(c.planner.calls)
+    assert c.coordinator.reconcile_existing()['publications_observed']==1
+    assert c.store.for_root(c.root['id'])['state']=='awaiting_reply'
+    assert c.coordinator.reconcile_existing()['publications_observed']==0
+    assert c.platform.submits==1 and c.backend.posts==0 and len(c.planner.calls)==calls
+    assert all(path.read_bytes()==raw for path,raw in snapshots.items())

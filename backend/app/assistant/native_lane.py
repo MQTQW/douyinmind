@@ -1895,6 +1895,8 @@ class NativeLane:
     def recover(self):
         """Only observe existing immutable Queue rows; never re-enqueue a plan."""
         self._owner()
+        if getattr(self,'clarification_coordinator',None) is not None:
+            self.clarification_coordinator.reconcile_existing()
         recovered = 0
         plans = self.source_store.recoverable_ui_plans()
         if not isinstance(plans, list) or len(plans) > 100:
@@ -2003,6 +2005,26 @@ class NativeLane:
                         or choice.get('child_task_id') not in (None, task['id'])):
                     return False
                 root = self.queue.get_task(choice.get('root_task_id'))
+                if root and root.get('envelope',{}).get('evidence',{}).get('source_kind')=='intent_clarification_reply':
+                    coordinator=getattr(self,'clarification_coordinator',None)
+                    if coordinator is None or coordinator.authority_current(root) is not True:
+                        return False
+                    # The menu task is a new ordinary reply. Its current scope
+                    # and native admission stay mandatory, while only the
+                    # verified origin is used as the physical @ locator.
+                    menu=root
+                    current=self.registry.authorize_snapshot(menu.get('authorization'))
+                    if (current!=Binding.from_dict(menu['binding']) or not current.public_reply_allowed
+                            or any(menu.get(key)!=task.get(key) for key in ('user_id','device_id'))
+                            or not self._authority_current(menu,allow_choice_root=False)):
+                        return False
+                    origin=coordinator.origin_for_task(menu)
+                    root=self.queue.get_task(origin['id']) if isinstance(origin,dict) else None
+                    if (root is None or root['id']==menu['id']
+                            or any(root.get(key)!=origin.get(key) for key in
+                                ('binding','envelope','authorization','user_id','device_id'))
+                            or _identity(choice.get('root_envelope',{}))!=_identity(root['envelope'])):
+                        return False
                 if (not root or root['id'] == task['id']
                         or root.get('envelope', {}).get('evidence', {}).get('source_kind') is not None
                         or root['envelope'].get('reference_id') != proof.get('root_reference_id')

@@ -25,6 +25,17 @@ SOURCE_KIND = 'intent_clarification_reply'
 _TASK = re.compile(r'[a-f0-9]{32}\Z')
 _SHA = re.compile(r'[a-f0-9]{64}\Z')
 _SOURCE = re.compile(r'native:[a-f0-9]{64}\Z')
+_SCHEMA = {
+    'clarification_meta': 'CREATE TABLE clarification_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)',
+    'clarification_sessions': '''CREATE TABLE clarification_sessions(
+      session_id TEXT PRIMARY KEY,root_task_id TEXT UNIQUE NOT NULL,root TEXT NOT NULL,
+      immutable_hash TEXT NOT NULL,state TEXT NOT NULL,revision INTEGER NOT NULL,
+      published_reply TEXT,response_source_id TEXT UNIQUE,response_envelope TEXT,
+      response_hash TEXT,semantic_plan_id TEXT,decision TEXT,queue_item TEXT,
+      child_task_id TEXT UNIQUE,reason_code TEXT,created_at REAL NOT NULL,updated_at REAL NOT NULL)''',
+    'clarification_events': '''CREATE TABLE clarification_events(id INTEGER PRIMARY KEY,session_id TEXT NOT NULL,
+      kind TEXT NOT NULL,metadata TEXT NOT NULL,created_at REAL NOT NULL)''',
+}
 
 
 class ClarificationError(ValueError):
@@ -87,11 +98,13 @@ class ClarificationSessionStore:
                           kind TEXT NOT NULL,metadata TEXT NOT NULL,created_at REAL NOT NULL);
                     ''')
                     db.executemany('INSERT INTO clarification_meta VALUES(?,?)',
-                        [('component', COMPONENT), ('version', '1'), ('activated_at', str(now))])
+                        [('component', COMPONENT), ('version', '1'), ('activated_at', str(now)), ('enabled', '1')])
                 with marker.open('x', encoding='utf-8') as stream:
                     stream.write(canonical_json({'component': COMPONENT, 'version': 1}))
                     stream.flush(); os.fsync(stream.fileno())
-        return cls(path, clock=clock)
+        store = cls(path, clock=clock)
+        store.set_enabled(True)
+        return store
 
     def _location(self):
         if (self.path.name != DATABASE_NAME or self.path.resolve() != self.path
@@ -116,10 +129,47 @@ class ClarificationSessionStore:
     @staticmethod
     def _owned(db):
         try:
-            row = db.execute("SELECT value FROM clarification_meta WHERE key='component'").fetchone()
-            return row is not None and row[0] == COMPONENT
-        except sqlite3.Error:
+            meta = dict(db.execute('SELECT key,value FROM clarification_meta'))
+            if (set(meta) != {'component','version','activated_at','enabled'}
+                    or meta['component'] != COMPONENT or meta['version'] != '1'
+                    or meta['enabled'] not in {'0','1'}
+                    or not math.isfinite(float(meta['activated_at'])) or float(meta['activated_at']) <= 0):
+                return False
+            rows = list(db.execute("SELECT name,type,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"))
+            if any(row[1] != 'table' for row in rows):return False
+            actual = {row[0]: row[2] for row in rows}
+            normalize = lambda sql: ' '.join(sql.lower().split())
+            return set(actual) == set(_SCHEMA) and all(normalize(actual[key]) == normalize(sql) for key,sql in _SCHEMA.items())
+        except (sqlite3.Error,ValueError,TypeError):
             return False
+
+    @staticmethod
+    def _require_enabled(db):
+        row = db.execute("SELECT value FROM clarification_meta WHERE key='enabled'").fetchone()
+        if row is None or row[0] not in {'0','1'}:
+            raise ClarificationError('clarification_enabled_invalid')
+        if row[0] != '1':raise ClarificationError('clarification_feature_disabled')
+
+    @property
+    def enabled(self):
+        with self._db() as db:
+            row = db.execute("SELECT value FROM clarification_meta WHERE key='enabled'").fetchone()
+            if row is None or row[0] not in {'0','1'}:
+                raise ClarificationError('clarification_enabled_invalid')
+            return row[0] == '1'
+
+    def set_enabled(self, enabled):
+        """Stop future continuations; preserve all epochs, receipts and claims."""
+        if type(enabled) is not bool:raise ClarificationError('clarification_enabled_invalid')
+        with self._db(write=True) as db:
+            row = db.execute("SELECT value FROM clarification_meta WHERE key='enabled'").fetchone()
+            if row is None or row[0] not in {'0','1'}:
+                raise ClarificationError('clarification_enabled_invalid')
+            if (row[0] == '1') != enabled:
+                db.execute("UPDATE clarification_meta SET value=? WHERE key='enabled'", ('1' if enabled else '0',))
+                self._event(db, 'capability', 'enabled' if enabled else 'disabled',
+                    {'enabled': enabled, 'activated_at': self.activated_at})
+        return enabled
 
     @contextmanager
     def _db(self, *, write=False):
@@ -189,6 +239,7 @@ class ClarificationSessionStore:
         session_id = digest({'root_task_id': task['id'], 'root': root})
         now = self.clock()
         with self._db(write=True) as db:
+            self._require_enabled(db)
             old = db.execute('SELECT * FROM clarification_sessions WHERE root_task_id=?', (task['id'],)).fetchone()
             if old is not None:
                 if old['immutable_hash'] != digest(root): raise ClarificationError('clarification_root_changed')
@@ -246,6 +297,7 @@ class ClarificationSessionStore:
         if not _SOURCE.fullmatch(source_id): raise ClarificationError('clarification_response_invalid')
         envelope_hash = digest(immutable_envelope(envelope))
         with self._db(write=True) as db:
+            self._require_enabled(db)
             row = db.execute('SELECT * FROM clarification_sessions WHERE session_id=?', (session_id,)).fetchone()
             if row is None: raise ClarificationError('clarification_session_missing')
             if row['response_source_id'] is not None:
@@ -260,6 +312,7 @@ class ClarificationSessionStore:
 
     def plan(self, session_id, source_id, envelope, decision, queue_item):
         with self._db(write=True) as db:
+            self._require_enabled(db)
             row = db.execute('SELECT * FROM clarification_sessions WHERE session_id=?', (session_id,)).fetchone()
             if (row is None or row['response_source_id'] != source_id
                     or row['response_hash'] != digest(immutable_envelope(envelope))):
@@ -276,6 +329,7 @@ class ClarificationSessionStore:
 
     def admitted(self, session_id, source_id, task):
         with self._db(write=True) as db:
+            self._require_enabled(db)
             row = db.execute('SELECT * FROM clarification_sessions WHERE session_id=?', (session_id,)).fetchone()
             if (row is None or row['response_source_id'] != source_id or row['queue_item'] is None
                     or immutable_envelope(json.loads(row['queue_item'])['envelope']) != immutable_envelope(task['envelope'])):
