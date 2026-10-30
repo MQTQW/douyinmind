@@ -24,7 +24,8 @@ import uuid
 from app.storage_guard import (guarded_sqlite_file, verified_readonly_connection,
     assert_no_orphan_sqlite_files, StorageGuardError)
 from app.mention_agent.contracts import Binding, public_profile
-from .semantic_intent_model import FOLLOWUP_CONTEXT, intent_tools, intent_messages, parse_intent_turn, SemanticIntentError
+from .semantic_intent_model import (FOLLOWUP_CONTEXT,intent_tools,intent_messages,parse_intent_turn,
+    SemanticIntentError,ClarificationIntentModel)
 from .usage_budget import UsageBudgetExceeded
 
 
@@ -389,6 +390,10 @@ class SemanticPlanStore:
         try:
             gate()
             messages=intent_messages(mode,text,catalog,followup_context=prompt_context);tools=intent_tools(followup_context=prompt_context)
+            if type(model) is ClarificationIntentModel:
+                if mode!='root' or model.ui_digest!=frozen_ui_digest or followup_context is not None:
+                    raise SemanticPlanError('semantic_clarification_context_invalid')
+                messages,tools=model.prepare_input(messages,tools)
             estimate=len(_dump({'messages':messages,'tools':tools}).encode())+1500+2048
             try:
                 reservation=budget.reserve(scope,request,estimate)

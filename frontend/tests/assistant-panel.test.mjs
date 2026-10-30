@@ -25,6 +25,7 @@ const { TaskDetails } = await import(await moduleURL('../src/components/Assistan
   '../assistantDemo': asURL('export const demoOverview = {}; export const demoTasks = []; export function demoTaskDetail() {}'),
   './AssistantSettings': asURL('export default function Settings() { return null; }'),
   './AssistantOperations': asURL('export default function Operations() { return null; }'),
+  './NativeIntakeNotice': asURL('export default function NativeIntakeNotice() { return null; }'),
   './AssistantPanel.display.css': asURL('export {};'),
 }, source => source.replace('function TaskDetails(', 'export function TaskDetails(')));
 const renderDetails = task => renderToStaticMarkup(createElement(TaskDetails, {

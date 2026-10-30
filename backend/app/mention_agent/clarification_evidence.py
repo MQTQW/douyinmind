@@ -65,7 +65,10 @@ def make_clarification_envelope(detail, binding, session):
     proof = physical['evidence']
     if (proof['root_task_id'] != root['id']
             or proof['root_agent_task_id'] != published['agent_task_id']
+            or any(physical.get(key)!=root['envelope'][key] for key in ('sender_profile_url','receiver_profile_url','video_id'))
             or proof['root_reference_id'] != root['envelope']['reference_id']
+            or proof['root_comment_text'] != root['envelope']['comment_text']
+            or proof['root_native_comment_id'] not in (None,root['source_native_comment_id'])
             or proof['prior_reply_sha256'] != published['text_sha256']
             or proof['prior_reply_text'] != published['text']):
         raise ValueError('clarification_parent_conflict')

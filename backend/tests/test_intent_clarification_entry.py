@@ -15,7 +15,7 @@ def configured(tmp_path,monkeypatch):
         def __init__(self,path,**kwargs):self.path=path;calls.append('queue')
         def get_control(self):return {'state':'stopped','run_id':None,'pid':None}
     class Control:
-        def __init__(self,queue):pass
+        def __init__(self,queue,state_dir=None):pass
         def snapshot(self):return {'state':'stopped','run_id':None,'pid':None}
         def start(self):calls.append('start')
         def finish(self,*args):raise AssertionError('configuration must not control an owner')
