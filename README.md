@@ -1,3 +1,5 @@
+![DouyinMind：收藏，成为你的知识](docs/assets/cover.svg)
+
 # DouyinMind
 
 **把抖音收藏整理成可搜索、可回看、可提问的个人知识库。**
