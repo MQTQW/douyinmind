@@ -221,3 +221,25 @@ test('compact navigation and disclosure retain a 44px minimum target without cha
     assert.match(rule,/min-height: 44px/);
   }
 });
+
+test('deleting a different knowledge base preserves the current chat; deleting its own scope leaves it explicitly',()=>{
+  const h=harness(Workspace,{loggedIn:true,onLogout(){}},{selectedKnowledgeBase:{id:4,name:'合成库'},currentSession:{id:9,title:'合成会话'},openedSessionId:9,conversationVersion:2});
+  const source=()=>all(h.render(),node=>typeof node.props?.onKnowledgeBaseDeleted==='function')[0];
+  source().props.onKnowledgeBaseDeleted(8);
+  assert.equal(h.state.selectedKnowledgeBase.id,4);assert.equal(h.state.currentSession.id,9);assert.equal(h.state.conversationVersion,2);
+  source().props.onKnowledgeBaseDeleted(4);
+  assert.equal(h.state.selectedKnowledgeBase,null);assert.equal(h.state.selectedCollectionId,'all');
+  assert.equal(h.state.currentSession,null);assert.equal(h.state.openedSessionId,null);assert.equal(h.state.conversationVersion,3);
+});
+test('a material mutation locks range switching and new questions without remounting the chat',()=>{
+  const h=harness(Workspace,{loggedIn:true,onLogout(){}},{materialMutationBusy:true,selectedKnowledgeBase:{id:4,name:'合成库'},currentSession:{id:9,title:'合成会话'},conversationVersion:2});
+  const tree=h.render();
+  const source=all(tree,node=>typeof node.props?.onKnowledgeBaseDeleted==='function')[0];
+  const chat=all(tree,node=>typeof node.props?.onSessionSaved==='function')[0];
+  assert.equal(source.props.chatBusy,true);assert.equal(chat.props.interactionDisabled,true);
+  assert.equal(findButton(tree,'新对话').props.disabled,true);assert.equal(findButton(tree,'从收藏夹导入').props.disabled,true);
+  source.props.onSelectKnowledgeBase({id:8,name:'其他合成库'});source.props.onSelectSession({id:10,title:'其他合成会话'});findButton(tree,'新对话').props.onClick();
+  assert.equal(h.state.selectedKnowledgeBase.id,4);assert.equal(h.state.currentSession.id,9);assert.equal(h.state.conversationVersion,2);
+  source.props.onKnowledgeBaseDeleted(4);
+  assert.equal(h.state.selectedKnowledgeBase,null);assert.equal(h.state.currentSession,null);
+});

@@ -99,6 +99,64 @@ def counts(context):
                      for model in (VideoCache, KnowledgeBaseVideo, FavoriteVideo))
 
 
+def test_deleted_library_rejects_new_import_without_cache_membership_or_work(context):
+    from app.services.knowledge_base_service import knowledge_base_service
+    with context.sessions() as db:
+        knowledge_base_service.delete(db, context.payload["knowledge_base_id"])
+        db.commit()
+    with pytest.raises(MentionIngestionError, match="library_not_found"):
+        context.service.submit(context.payload)
+    assert counts(context) == (0, 0, 0)
+    assert context.worker.jobs == context.calls == []
+
+
+def test_unknown_deleted_library_receipt_keeps_its_replay_barrier(context):
+    from app.services.knowledge_base_service import knowledge_base_service
+    context.worker.fail_publication = True
+    assert context.service.submit(context.payload)["state"] == "unknown"
+    with context.sessions() as db:
+        knowledge_base_service.delete(db, context.payload["knowledge_base_id"])
+        db.commit()
+    assert context.service.get(context.payload["request_id"])["state"] == "unknown"
+    assert context.service.submit(context.payload)["state"] == "unknown"
+    with pytest.raises(MentionIngestionError, match="video_import_inflight"):
+        context.service.submit({**context.payload, "request_id": "synthetic-second-request"})
+    assert len(context.worker.jobs) == 1 and context.calls == []
+    assert counts(context) == (1, 0, 0)
+
+
+def test_old_queued_receipt_does_not_run_pipeline_after_library_disappears(context):
+    from app.services.knowledge_base_service import knowledge_base_service
+    context.service.submit(context.payload)
+    with context.sessions() as db:
+        knowledge_base_service.delete(db, context.payload["knowledge_base_id"])
+        db.commit()
+    context.worker.run(context.payload["request_id"])
+    assert context.calls == []
+    assert context.service.get(context.payload["request_id"])["state"] == "failed"
+
+
+def test_legacy_library_schema_still_imports_only_its_explicit_scope(context):
+    with sqlite3.connect(context.database) as db:
+        db.execute("ALTER TABLE knowledge_bases DROP COLUMN deleted_at")
+    result = context.service.submit(context.payload)
+    assert result["state"] == "accepted" and result["membership_exists"]
+    assert len(context.worker.jobs) == 1
+
+
+def test_worker_maintenance_prevents_receipt_creation_or_database_writes(context):
+    from app.services.worker import Worker
+    worker = Worker()
+    context.service.worker = worker
+    before = context.database.read_bytes()
+    with worker.maintenance_guard():
+        with pytest.raises(MentionIngestionError, match="backend_worker_busy"):
+            context.service.submit(context.payload)
+    assert context.database.read_bytes() == before
+    assert not context.service.receipt_path.exists()
+    assert context.calls == []
+
+
 def test_constructor_and_missing_get_do_not_create_receipts(context):
     assert not context.service.receipt_path.exists()
     with pytest.raises(MentionIngestionError, match="request_not_found"):

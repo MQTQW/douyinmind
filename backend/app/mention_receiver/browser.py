@@ -1018,6 +1018,13 @@ class NormalPageReceiver:
 
     def submit_reply(self, target: dict, text: str, *, before_submit) -> dict:
         """Exactly one click invocation after durable reservation and last gate."""
+        if target.get('followup_evidence') is not None:
+            from .choice_browser import _readback_viewport
+            with _readback_viewport(self):
+                return self._submit_reply(target, text, before_submit=before_submit)
+        return self._submit_reply(target, text, before_submit=before_submit)
+
+    def _submit_reply(self, target: dict, text: str, *, before_submit) -> dict:
         value = self._reply_state(target, text)
         self._validate_reply_draft(value, text)
         if value.get("composer_scope") == "modal":
@@ -1057,6 +1064,13 @@ class NormalPageReceiver:
         return {"outcome": "delivery_unknown", "exact_body_in_original_thread": False}
 
     def save_reply_evidence(self, target, text, path):
+        if target.get('followup_evidence') is not None:
+            from .choice_browser import _readback_viewport
+            with _readback_viewport(self):
+                return self._save_reply_evidence(target, text, path)
+        return self._save_reply_evidence(target, text, path)
+
+    def _save_reply_evidence(self, target, text, path):
         self._check_challenge()
         value = self._reply_state(target, text)
         if value["matching_reply_count"] == 1:

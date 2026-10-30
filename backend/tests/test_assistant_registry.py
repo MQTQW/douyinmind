@@ -274,6 +274,36 @@ def test_library_candidates_are_read_only_and_do_not_create_missing_db(tmp_path)
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before
 
 
+def test_library_candidates_hide_tombstones_without_modifying_them(tmp_path):
+    path = tmp_path / "catalog-tombstones.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE knowledge_bases(id INTEGER,name TEXT,deleted_at DATETIME)")
+        db.execute("INSERT INTO knowledge_bases VALUES(6,'已删合成库','2026-01-01'),(8,'合成现有库',NULL)")
+    before = path.read_bytes()
+    assert read_local_catalog(path) == [{"id": 8, "name": "合成现有库"}]
+    assert path.read_bytes() == before
+
+
+def test_catalog_filter_failure_never_retries_an_unfiltered_legacy_query(tmp_path, monkeypatch):
+    path = tmp_path / "filter-failure.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE knowledge_bases(id INTEGER,name TEXT,deleted_at DATETIME)")
+        db.execute("INSERT INTO knowledge_bases VALUES(6,'合成墓碑','2026-01-01')")
+    original_connect = sqlite3.connect
+    queries = []
+    class FailingFilter(sqlite3.Connection):
+        def execute(self, statement, *args, **kwargs):
+            if statement.startswith("SELECT id,name"):
+                queries.append(statement)
+                raise sqlite3.OperationalError("synthetic filtered read failure")
+            return super().execute(statement, *args, **kwargs)
+    monkeypatch.setattr(registry_module.sqlite3, "connect",
+        lambda *args, **kwargs: original_connect(*args, **kwargs, factory=FailingFilter))
+    with pytest.raises(RegistryError, match="catalog_unavailable"):
+        read_local_catalog(path)
+    assert queries == ["SELECT id,name FROM knowledge_bases WHERE deleted_at IS NULL ORDER BY id"]
+
+
 def test_foreign_registry_file_is_preserved(tmp_path):
     path = tmp_path / "business.sqlite3"
     with sqlite3.connect(path) as db:

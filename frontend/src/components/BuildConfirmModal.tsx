@@ -200,8 +200,8 @@ export default function BuildConfirmModal({
       <section ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={descriptionId}
         className="bg-[var(--color-panel)] rounded-2xl w-full max-w-[480px] max-h-[90vh] flex flex-col shadow-2xl" onClick={event => event.stopPropagation()}>
         <header className="px-4 sm:px-6 pt-5 pb-3 shrink-0">
-          <h2 id={titleId} className="font-display text-xl">{isSelectedEntry ? '导入所选视频' : '选择要导入的视频'}</h2>
-          <p id={descriptionId} className="text-xs text-[var(--color-ink-muted)] mt-2 leading-relaxed">{automaticMode ? `已选择“${sourceCollection?.title}”收藏夹的全部视频。` : '选择目标知识库，再确认要导入的视频。'}</p>
+          <h2 id={titleId} className="sr-only">{isSelectedEntry ? '导入所选视频' : '选择要导入的视频'}</h2>
+          <p id={descriptionId} className={automaticMode ? 'text-xs text-[var(--color-ink-muted)] mt-2 leading-relaxed' : 'sr-only'}>{automaticMode ? `已选择“${sourceCollection?.title}”收藏夹的全部视频。` : '选择目标知识库，再确认要导入的视频。'}</p>
         </header>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-4 sm:px-6 pb-1">
@@ -237,10 +237,6 @@ export default function BuildConfirmModal({
             {collectionSource && !isWholeCollection && !loading && <p className="mt-2 text-xs text-[var(--color-ink-muted)]">当前不是完整收藏夹，请选择目标知识库。</p>}
           </div>}
 
-          <div className="mt-3 space-y-1 text-xs leading-relaxed text-[var(--color-ink-muted)]">
-            <p>已入库的视频直接加入，不重新识别；新视频按{includeVisual ? '声音与画面' : '音频'}流程处理。</p>
-            <p>{includeVisual ? '识别声音与画面 → 保存文字稿、画面分析和时间信息' : '提取音频 → 完整转写 → 保存文字稿和时间信息'}</p>
-          </div>
           <div className="flex items-center justify-between gap-3 py-3">
             <label className="flex items-center gap-2 text-xs text-[var(--color-ink-soft)] cursor-pointer">
               <input ref={allCheckboxRef} type="checkbox" checked={allChecked} onChange={toggleAll}

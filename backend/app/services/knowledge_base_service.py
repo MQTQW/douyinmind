@@ -24,7 +24,11 @@ class FavoriteCollectionNotFound(ValueError):
 
 class KnowledgeBaseService:
     def require_base(self, db: Session, knowledge_base_id: int) -> KnowledgeBase:
-        item = db.get(KnowledgeBase, knowledge_base_id)
+        if type(knowledge_base_id) is not int or knowledge_base_id <= 0:
+            raise KnowledgeBaseNotFound("这个知识库不存在，请刷新后重新选择。")
+        item = db.scalar(select(KnowledgeBase).where(
+            KnowledgeBase.id == knowledge_base_id, KnowledgeBase.deleted_at.is_(None),
+        ).execution_options(populate_existing=True))
         if item is None:
             raise KnowledgeBaseNotFound("这个知识库不存在，请刷新后重新选择。")
         return item
@@ -36,11 +40,13 @@ class KnowledgeBaseService:
             raise ValueError("请输入知识库名称。")
         if len(name) > 128:
             raise ValueError("知识库名称最多 128 个字。")
+        if "\x00" in name:
+            raise ValueError("知识库名称包含无效字符，请重新填写。")
         return name, name.casefold()
 
     def create(self, db: Session, name: str) -> dict:
         name, name_key = self._normalize_name(name)
-        if db.scalar(select(KnowledgeBase.id).where(KnowledgeBase.name_key == name_key)):
+        if db.scalar(select(KnowledgeBase.id).where(KnowledgeBase.name_key == name_key, KnowledgeBase.deleted_at.is_(None))):
             raise DuplicateKnowledgeBaseName("已存在同名知识库，请换个名称。")
         item = KnowledgeBase(name=name, name_key=name_key)
         db.add(item)
@@ -69,7 +75,7 @@ class KnowledgeBaseService:
         # Folder titles may exceed the library name limit. The same stored title
         # always yields the same default name, without altering the source folder.
         name, name_key = self._normalize_name(name.strip()[:128])
-        existing_id = db.scalar(select(KnowledgeBase.id).where(KnowledgeBase.name_key == name_key))
+        existing_id = db.scalar(select(KnowledgeBase.id).where(KnowledgeBase.name_key == name_key, KnowledgeBase.deleted_at.is_(None)))
         if existing_id is not None:
             return self.get(db, existing_id), True
         connection = db.connection()
@@ -87,7 +93,7 @@ class KnowledgeBaseService:
                 db.flush()
             return self._to_dict(item, 0, 0), False
         except IntegrityError:
-            existing_id = db.scalar(select(KnowledgeBase.id).where(KnowledgeBase.name_key == name_key))
+            existing_id = db.scalar(select(KnowledgeBase.id).where(KnowledgeBase.name_key == name_key, KnowledgeBase.deleted_at.is_(None)))
             if existing_id is None:
                 raise
             return self.get(db, existing_id), True
@@ -97,6 +103,7 @@ class KnowledgeBaseService:
         name, name_key = self._normalize_name(name)
         duplicate = db.scalar(select(KnowledgeBase.id).where(
             KnowledgeBase.name_key == name_key, KnowledgeBase.id != item.id,
+            KnowledgeBase.deleted_at.is_(None),
         ))
         if duplicate:
             raise DuplicateKnowledgeBaseName("已存在同名知识库，请换个名称。")
@@ -111,6 +118,7 @@ class KnowledgeBaseService:
                    func.sum(case((VideoCache.status == "done", 1), else_=0)))
             .outerjoin(KnowledgeBaseVideo, KnowledgeBaseVideo.knowledge_base_id == KnowledgeBase.id)
             .outerjoin(VideoCache, VideoCache.platform_item_id == KnowledgeBaseVideo.platform_item_id)
+            .where(KnowledgeBase.deleted_at.is_(None))
             .group_by(KnowledgeBase.id)
             .order_by(desc(KnowledgeBase.updated_at), desc(KnowledgeBase.id))
         ).all()
@@ -187,6 +195,25 @@ class KnowledgeBaseService:
             item.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
         db.flush()
         return result.rowcount
+
+    def delete(self, db: Session, knowledge_base_id: int) -> dict:
+        """Caller holds worker maintenance_guard through commit/rollback.
+
+        Keep the row, its ID and original name for history/authorization references.
+        Only membership is removed; shared video results and other state are untouched.
+        """
+        item = self.require_base(db, knowledge_base_id)
+        removed = db.execute(delete(KnowledgeBaseVideo).where(
+            KnowledgeBaseVideo.knowledge_base_id == knowledge_base_id,
+        ))
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        item.deleted_at = now
+        item.updated_at = now
+        # NUL is rejected in user names, so this reserved namespace cannot collide.
+        # Keeping tombstone rows also prevents SQLite reusing the former max ID.
+        item.name_key = f"\x00deleted:{item.id}"
+        db.flush()
+        return {"deleted_id": item.id, "removed_count": int(removed.rowcount)}
 
     @staticmethod
     def _to_dict(item: KnowledgeBase, total: int, ready: int) -> dict:

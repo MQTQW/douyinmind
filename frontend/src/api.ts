@@ -297,7 +297,7 @@ export interface KnowledgeBaseItem {
   updated_at: string;
 }
 
-export async function listKnowledgeBases(): Promise<{ success: boolean; items: KnowledgeBaseItem[]; total: number }> {
+export async function listKnowledgeBases(): Promise<{ success: boolean; items: KnowledgeBaseItem[]; total: number; capabilities?: { delete_knowledge_base?: boolean } }> {
   return request('/knowledge-bases');
 }
 
@@ -319,6 +319,11 @@ export async function knowledgeBaseFromCollection(collectionId: string): Promise
 
 export async function renameKnowledgeBase(id: number, name: string): Promise<{ success: boolean; item: KnowledgeBaseItem }> {
   return request(`/knowledge-bases/${id}`, { method: 'PATCH', body: JSON.stringify({ name: knowledgeBaseName(name) }) });
+}
+
+export async function deleteKnowledgeBase(id: number): Promise<{ success: boolean; deleted_id: number; removed_count: number }> {
+  if (!Number.isSafeInteger(id) || id <= 0) throw new Error('知识库 ID 必须是正整数。');
+  return request(`/knowledge-bases/${id}`, { method: 'DELETE', body: JSON.stringify({}) });
 }
 
 export async function listKnowledgeBaseVideos(id: number, page = 1, size = 100): Promise<{ success: boolean; items: VideoItem[]; total: number }> {

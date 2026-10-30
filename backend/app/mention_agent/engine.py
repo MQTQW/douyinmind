@@ -17,6 +17,7 @@ from typing import Callable
 from .contracts import Binding, canonical_json, parse_tool_arguments, validate_envelope
 from .answer_requirements import (AnswerRequirementError, QUOTE_CODES, parse_answer_requirements,
     tools_for_requirements, requirement_instruction, quote_error_hint, validate_quotes)
+from app.assistant.reply_style import normalize_reply_prefix, reply_body_budget
 
 
 MAX_REPLY_SOURCES = 8  # Existing retrieval and product task-source bound.
@@ -113,20 +114,55 @@ class ToolExecutionFailure(RuntimeError):
     pass
 
 
+class PublicReplyValidationError(ValueError):
+    """Public-text feedback without retaining the rejected draft or exception text."""
+
+    def __init__(self, *, violations, observed_chars, effective_max_chars, control_count):
+        super().__init__('invalid_public_reply')
+        self.violations = tuple(violations)
+        self.observed_chars = observed_chars
+        self.effective_max_chars = effective_max_chars
+        self.control_count = control_count
+
+    def diagnostic(self):
+        return {'field': 'text', 'violations': list(self.violations),
+                'observed_chars': self.observed_chars, 'effective_max_chars': self.effective_max_chars,
+                'control_count': self.control_count}
+
+    def correction_hint(self):
+        hints = [f'text正文上限为{self.effective_max_chars}字符，已预留程序称呼；空白和换行也计入长度。']
+        if self.observed_chars is not None:
+            hints.append(f'本次text实际为{self.observed_chars}字符。')
+        explanations = {
+            'invalid_type': 'text必须是字符串，不能是对象、数组或null。',
+            'empty_text': 'text不能是空字符串或只有空白。',
+            'too_long': '请重新组织并缩短正文，留出余量；不要截断原文摘录。',
+            'contains_at': 'text不能含@字符或账号提及。',
+            'contains_url': 'text不能含http://或https://外链；依据编号放在source_ids。',
+            'contains_control_chars': f'含{self.control_count}个禁止控制字符；仅允许换行LF和制表符TAB，移除CR等其他控制字符。',
+        }
+        hints.extend(explanations[violation] for violation in self.violations)
+        hints.append('保留有效source_ids和真实依据，只修正text后单独调用propose_reply；无需重复检索，称呼由程序添加。')
+        return ''.join(hints)
+
+
 class AgentEngine:
     def __init__(self, model, knowledge, *, max_rounds=4, max_calls=8,
                  max_reply_chars=320, evidence_chars=8000, ingestion=None,
                  conversation_context=None, allowed_library_names=(), allow_private_execution=False,
                  current_video=None, automatic_import_receipt=False, trusted_save_selection=None,
                  trusted_semantic_decision=None, trusted_semantic_grant_id=None,
-                 trusted_semantic_owner_scope=None, trusted_semantic_agent_task_id=None):
+                 trusted_semantic_owner_scope=None, trusted_semantic_agent_task_id=None,
+                 reply_prefix=''):
         self.model, self.knowledge = model, knowledge
         self.ingestion = ingestion
         if not (1 <= max_rounds <= 6 and 1 <= max_calls <= 12
                 and 80 <= max_reply_chars <= 600 and 100 <= evidence_chars <= 8000):
             raise ValueError("代理调用预算无效")
         self.max_rounds, self.max_calls = max_rounds, max_calls
-        self.max_reply_chars, self.evidence_chars = max_reply_chars, evidence_chars
+        self.reply_prefix = normalize_reply_prefix(reply_prefix)
+        self.public_reply_chars = max_reply_chars
+        self.max_reply_chars, self.evidence_chars = reply_body_budget(max_reply_chars, self.reply_prefix), evidence_chars
         if (not isinstance(allowed_library_names, (list, tuple)) or len(allowed_library_names) > 64
                 or any(not isinstance(name, str) or not 1 <= len(name.strip()) <= 132 for name in allowed_library_names)):
             raise ValueError("知识库别名无效")
@@ -321,12 +357,15 @@ class AgentEngine:
         sources: dict[str, dict] = {}
         provided_texts: dict[str, list[str]] = {}
         requirement = parse_answer_requirements(envelope['comment_text'])
-        reply_text_limit = min(self.max_reply_chars, 280) if requirement is not None else self.max_reply_chars
+        reply_text_limit = reply_body_budget(min(self.public_reply_chars, 280), self.reply_prefix) if requirement is not None else self.max_reply_chars
         selected_tools = deepcopy(tools_for_requirements(TOOLS + IMPORT_TOOLS if self.ingestion is not None else TOOLS, requirement))
         focus_query = getattr(self.knowledge, 'query_with_focus', None)
         for tool in selected_tools:
             if tool['function']['name'] == 'propose_reply':
                 tool['function']['parameters']['properties']['text']['maxLength'] = reply_text_limit
+                tool['function']['description'] += (
+                    f' text正文最多{reply_text_limit}字符（包含空白和换行）；程序称呼预留{len(self.reply_prefix)}字符，'
+                    f'最终公开文本上限{reply_text_limit + len(self.reply_prefix)}字符。只提交正文，称呼由程序添加；超限须改写，不会自动截断。')
         if binding.is_all_local:
             for tool in selected_tools:
                 if tool['function']['name']=='query_knowledge_base':
@@ -344,6 +383,10 @@ class AgentEngine:
                         '未明确时可省略或用auto，由程序保留原规则。')
         if requirement is not None and not requirement.issue:
             messages[0]['content'] += '\n'+requirement_instruction(requirement)
+        messages[0]['content'] += (
+            f'\n本轮propose_reply.text的有效正文上限为{reply_text_limit}字符（空白和换行也计数），'
+            f'已为程序称呼预留{len(self.reply_prefix)}字符；最终公开文本最多{reply_text_limit + len(self.reply_prefix)}字符。'
+            '只提供正文，不自行添加称呼；超限时重新改写，程序不会截断。')
         source_chars, total_calls, queried = 0, 0, False
         seen_call_ids = set()
 
@@ -422,6 +465,7 @@ class AgentEngine:
                 proposal = None
                 validated_quotes = None
                 literal_support = None
+                public_text_diagnostic = None
                 # Measure this invocation and its result validation directly;
                 # ledger writes/model rounds are outside this interval.
                 tool_started = time.monotonic()
@@ -600,12 +644,16 @@ class AgentEngine:
                         "import_status_unverified", "invalid_import_status", "import_response_scope_mismatch",
                     } else "invalid_tool_arguments"
                     result = {"status": "error", "code": code}
+                    if isinstance(error, PublicReplyValidationError):
+                        public_text_diagnostic = error.diagnostic()
+                        result.update(public_text_diagnostic)
+                        result['hint'] = error.correction_hint()
                     if code == "undeclared_source_reference":
                         result["hint"] = "正文中的资料编号必须全部在source_ids中；编号只作内部核对，公开正文不加来源标签或编号。请修正后单独propose_reply。"
                     if code == 'public_quote_not_supported':
                         result['hint'] = '逐字引文必须出自本轮实际提供且列入source_ids的原文；请修正摘录或实际来源，不能引用截断外、历史或未提供内容。保持原轮数与长度限制。'
                     if requirement is not None and (code in QUOTE_CODES or code in {'reply_too_long','invalid_public_reply','invalid_tool_arguments','invalid_source_ids'}):
-                        result['hint']=quote_error_hint(requirement)
+                        result['hint'] = (result.get('hint', '') + ' ' + quote_error_hint(requirement)).strip()
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": canonical_json(result)})
                 audit = {"round": round_number, "tool_name": name if isinstance(name, str) else "invalid",
                          "status": result["status"], "source_count": len(result.get("evidence", [])),
@@ -613,6 +661,8 @@ class AgentEngine:
                 if result['status'] == 'error':
                     code = result.get('code')
                     audit['code'] = code if type(code) is str and code in _SAFE_TOOL_AUDIT_CODES else 'tool_validation_failed'
+                    if public_text_diagnostic is not None:
+                        audit['public_text_validation'] = public_text_diagnostic
                 if name == "query_knowledge_base" and result["status"] == "ok":
                     audit["knowledge_base_id"] = binding.knowledge_base_id
                     audit["evidence_refs"] = [{"source_id": item["source_id"], "platform_item_id": item["platform_item_id"],
@@ -648,10 +698,26 @@ class AgentEngine:
 
     def _public_text(self, text, *, maximum=None, check_write_claims=True):
         maximum = self.max_reply_chars if maximum is None else min(maximum, self.max_reply_chars)
-        if (not isinstance(text, str) or not text.strip() or len(text) > maximum
-                or "@" in text or re.search(r"https?://", text, re.I)
-                or any(ord(char) < 32 and char not in "\n\t" for char in text)):
-            raise ValueError("invalid_public_reply")
+        violations = []
+        observed_chars, control_count = None, 0
+        if not isinstance(text, str):
+            violations.append('invalid_type')
+        else:
+            observed_chars = len(text)
+            control_count = sum(ord(char) < 32 and char not in '\n\t' for char in text)
+            if not text.strip():
+                violations.append('empty_text')
+            if observed_chars > maximum:
+                violations.append('too_long')
+            if '@' in text:
+                violations.append('contains_at')
+            if re.search(r'https?://', text, re.I):
+                violations.append('contains_url')
+            if control_count:
+                violations.append('contains_control_chars')
+        if violations:
+            raise PublicReplyValidationError(violations=violations, observed_chars=observed_chars,
+                effective_max_chars=maximum, control_count=control_count)
         if check_write_claims:
             self._check_write_claims(text)
         return text.strip()

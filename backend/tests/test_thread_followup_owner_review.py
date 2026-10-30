@@ -136,8 +136,15 @@ def test_model_save_on_plain_reply_cannot_reopen_import_or_choice(case):
     env=rows[0]['envelope']
     receipt=case.c.store.get_recorded_decision(env,binding=rows[0]['binding'])
     result=case.c.router.resolver.resolve_verified_intent(env,receipt)
-    assert result.reason_code=='followup_save_requires_mention' and result.choice_intent is None
+    # The verified ordinary-followup tool now has no save action. A provider
+    # ignoring that schema is held, rather than receiving any decision receipt.
+    assert receipt is None and result.reason_code=='semantic_recorded_decision_required'
+    assert result.choice_intent is None
     assert not result.choice_options and len(case.c.model.requests)==1
+    from app.assistant.semantic_resolution import semantic_source_key
+    recorded=case.c.store.lookup_receipt(semantic_source_key(env))
+    assert recorded['state']=='held' and recorded['reason_code']=='semantic_response_invalid'
+    assert recorded['usage']['total_tokens']==20 and recorded['dispatchable'] is False
 
 
 def test_queue_reuses_time_refresh_but_rejects_changed_frozen_anchor_or_quality(case,tmp_path):

@@ -7,7 +7,7 @@ The agent process must use this API and must never start an ingestion worker.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import json
 import math
 import os
@@ -18,10 +18,11 @@ import stat
 import threading
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 
 from app.mention_agent.contracts import Binding
 from app.models.entities import KnowledgeBase, KnowledgeBaseVideo, VideoCache
+from app.services.worker import WorkerBusyError
 from app.storage_guard import (guarded_sqlite_file, StorageGuardError,
     verified_readonly_connection, SqliteOwnershipError, assert_no_orphan_sqlite_files)
 
@@ -257,11 +258,12 @@ class MentionIngestionService:
     def _facts(self, payload):
         with self.sessions() as db:
             cache = db.scalar(select(VideoCache).where(VideoCache.platform_item_id == payload["video_id"]))
-            membership = (db.get(KnowledgeBase, payload["knowledge_base_id"]) is not None
+            library_live = self._live_library_exists(db, payload["knowledge_base_id"])
+            membership = (library_live
                 and db.get(KnowledgeBaseVideo, (payload["knowledge_base_id"], payload["video_id"])) is not None)
             status = cache.status if cache else "missing"
         count, readable = 0, True
-        if status == "done":
+        if library_live and status == "done":
             try:
                 documents = self.index_reader(payload["video_id"])
                 count = sum(1 for item in documents if isinstance(item, dict)
@@ -303,7 +305,23 @@ class MentionIngestionService:
             "state": state, "membership_exists": membership, "cache_status": cache_status,
             "indexed_content_chunks": count}
 
+    @staticmethod
+    def _live_library_exists(db, knowledge_base_id):
+        columns = {column["name"] for column in inspect(db.connection()).get_columns("knowledge_bases")}
+        query = select(KnowledgeBase.id).where(KnowledgeBase.id == knowledge_base_id)
+        if "deleted_at" in columns:
+            query = query.where(KnowledgeBase.deleted_at.is_(None))
+        return db.scalar(query) is not None
+
     def submit(self, payload):
+        guard = getattr(self.worker, "submission_guard", None)
+        try:
+            with guard() if guard is not None else nullcontext():
+                return self._submit_reserved(payload)
+        except WorkerBusyError as exc:
+            raise MentionIngestionError("backend_worker_busy") from exc
+
+    def _submit_reserved(self, payload):
         payload = _validate(payload)
         # Nothing is created or changed when the original backend has no live worker.
         if not self._running():
@@ -329,7 +347,7 @@ class MentionIngestionService:
                 return self._result(existing)
             try:
                 with self.sessions() as db:
-                    if db.get(KnowledgeBase, payload["knowledge_base_id"]) is None:
+                    if not self._live_library_exists(db, payload["knowledge_base_id"]):
                         raise MentionIngestionError("library_not_found", 404)
                     cache = db.scalar(select(VideoCache).where(VideoCache.platform_item_id == payload["video_id"]))
                     if cache is None:
@@ -386,6 +404,9 @@ class MentionIngestionService:
             payload = json.loads(row["payload"])
             try:
                 self._check_scope(payload, self._binding_for(payload))
+                with self.sessions() as db:
+                    if not self._live_library_exists(db, payload["knowledge_base_id"]):
+                        raise MentionIngestionError("library_not_found", 404)
             except MentionIngestionError:
                 self._state(request_id, "failed")
                 return

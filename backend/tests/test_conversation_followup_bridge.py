@@ -196,12 +196,12 @@ def test_missing_recorded_meaning_never_falls_back_to_raw_regex(tmp_path):
 def test_semantic_save_from_plain_child_is_clarification_no_import(tmp_path):
     values=prepared(tmp_path);b,a,e,r,m,q,h,c,old,anchor,backend,adapter=values
     env,task,budget,semantic,planner,resolution=planned_child(tmp_path,values,action='save')
-    assert resolution.action=='clarify' and resolution.reason_code=='followup_save_requires_mention'
+    assert resolution.action=='clarify' and resolution.reason_code=='semantic_response_invalid'
     bridge=LegacyBridge(r,q,c,agent_path=a.path,conversation=h,database=tmp_path/'never.db',semantic_store=semantic,
         usage_budget=budget,adapter=adapter,model_factory=lambda:pytest.fail('fixed clarification must not call model'))
     done=AssistantRuntime(q,c,execute=bridge.execute).execute_once()
-    assert done['state']=='ready_to_publish' and backend.posts==1 and planner.calls==1
-    assert a.get_reply(done['agent_task_id'])['kind']=='clarification'
+    assert done['state']=='needs_review' and backend.posts==1 and planner.calls==1
+    assert len(a.list_tasks())==1  # only the already-published ancestor save
     assert AgentService(a,resolution.binding,allow_import=True,knowledge=Knowledge(),model=AllModel()).process(env)['reason_code']=='followup_query_only'
     assert AgentEngine(AllModel(),AllKnowledge()).run(resolution.binding,env).review_code=='semantic_decision_unverified'
 

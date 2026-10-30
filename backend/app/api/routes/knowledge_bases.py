@@ -1,13 +1,15 @@
 """Manage user-created knowledge bases; removal affects membership only."""
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
+from app.assistant.routes import local_request
 from app.services.knowledge_base_service import (
     DuplicateKnowledgeBaseName, FavoriteCollectionNotFound, KnowledgeBaseNotFound, knowledge_base_service,
 )
+from app.services.worker import WorkerBusyError, worker
 
 router = APIRouter(prefix="/knowledge-bases", tags=["自建知识库"])
 
@@ -20,6 +22,10 @@ class CollectionKnowledgeBase(BaseModel):
     collection_id: str
 
 
+class DeleteKnowledgeBaseBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
 def _error(exc: ValueError) -> HTTPException:
     code = 404 if isinstance(exc, (KnowledgeBaseNotFound, FavoriteCollectionNotFound)) else 409 if isinstance(exc, DuplicateKnowledgeBaseName) else 400
     return HTTPException(status_code=code, detail=str(exc))
@@ -28,7 +34,8 @@ def _error(exc: ValueError) -> HTTPException:
 @router.get("")
 async def list_knowledge_bases(db: Session = Depends(get_db)):
     items = knowledge_base_service.list(db)
-    return {"success": True, "items": items, "total": len(items)}
+    return {"success": True, "items": items, "total": len(items),
+            "capabilities": {"delete_knowledge_base": True}}
 
 
 @router.post("", status_code=201)
@@ -90,3 +97,25 @@ async def remove_knowledge_base_video(knowledge_base_id: int, platform_item_id: 
     except ValueError as exc:
         raise _error(exc) from exc
     return {"success": True, "removed_count": count}
+
+
+@router.delete("/{knowledge_base_id}", dependencies=[Depends(local_request)])
+async def delete_knowledge_base(knowledge_base_id: int = Path(..., gt=0),
+                                body: DeleteKnowledgeBaseBody | None = None,
+                                db: Session = Depends(get_db)):
+    try:
+        # Keep the guard until commit: a new import must not validate the live
+        # library while its tombstone is still invisible to another transaction.
+        with worker.maintenance_guard():
+            try:
+                result = knowledge_base_service.delete(db, knowledge_base_id)
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+    except WorkerBusyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="有资料正在处理或排队，请等待入库任务结束后再删除知识库。") from exc
+    except ValueError as exc:
+        raise _error(exc) from exc
+    return {"success": True, **result}

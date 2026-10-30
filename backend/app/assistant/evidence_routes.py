@@ -34,10 +34,8 @@ class EvidenceBody(BaseModel):
 
 
 def original_comment_focus(envelope):
-    current = r"(?:这个|当前|这条|本条|本|该)\s*视频"
-    body = envelope["comment_text"]
-    return envelope["video_id"] if (re.search(current, body) and not re.search(
-        r"(?:不要|不用|不必|别|不是|并非).{0,8}" + current + r"|对比|比较|另一个视频|其他视频|其它视频", body)) else None
+    from .evidence_focus import default_current_video
+    return default_current_video(envelope)
 
 
 class EvidenceService:
@@ -156,10 +154,10 @@ def get_service():
     return _service
 
 
-router = APIRouter(prefix="/assistant/evidence", tags=["助手原文证据"], dependencies=[Depends(local_request)])
+router = APIRouter(prefix="/assistant", tags=["助手原文证据"], dependencies=[Depends(local_request)])
 
 
-@router.post("/query")
+@router.post("/evidence/query")
 async def query(request: Request, service=Depends(get_service)):
     execution_token = request.headers.get(EXECUTION_CLAIM_HEADER)
     if not valid_execution_claim(execution_token):
@@ -179,3 +177,65 @@ async def query(request: Request, service=Depends(get_service)):
         raise HTTPException(error.status_code, detail={"code": error.code}) from None
     except Exception:
         raise HTTPException(503, detail={"code": "evidence_query_unavailable"}) from None
+
+
+_operator_draft_service = None
+
+
+def configure_operator_draft_service(service):
+    global _operator_draft_service
+    _operator_draft_service = service
+
+
+def get_operator_draft_service():
+    global _operator_draft_service
+    if _operator_draft_service is None:
+        from .routes import get_service as get_assistant_service
+        from .integration import STATE, AGENT_PATH, configured_database, registry_if_configured, receiver_configuration
+        from .operator_draft_service import OperatorDraftService, existing_agent_readonly
+        try:
+            backend = get_assistant_service()
+            database = configured_database()
+            registry = registry_if_configured(STATE, database)
+            if registry is None:
+                raise ValueError()
+            _operator_draft_service = OperatorDraftService(backend.queue, registry, database,
+                existing_agent_readonly(AGENT_PATH), STATE, control=backend.control,
+                receiver_provider=receiver_configuration)
+        except Exception:
+            raise HTTPException(409, detail={'code': 'operator_draft_service_unavailable'}) from None
+    return _operator_draft_service
+
+
+async def _operator_draft_call(action, *args):
+    from .operator_draft_service import OperatorDraftError
+    try:
+        return await run_in_threadpool(action, *args)
+    except OperatorDraftError as error:
+        raise HTTPException(error.status_code, detail={'code': error.code}) from None
+    except Exception:
+        raise HTTPException(503, detail={'code': 'operator_draft_unavailable'}) from None
+
+
+@router.get('/operator-query-draft/{task_id}/evidence')
+async def operator_draft_evidence(task_id: str, service=Depends(get_operator_draft_service)):
+    return await _operator_draft_call(service.evidence, task_id)
+
+
+@router.post('/operator-query-draft/{task_id}')
+async def operator_draft_register(task_id: str, request: Request, service=Depends(get_operator_draft_service)):
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw.extend(chunk)
+        if len(raw) > MAX_REQUEST_BYTES:
+            raise HTTPException(413, detail={'code': 'operator_draft_request_too_large'})
+    try:
+        body = decode_json(bytes(raw))
+    except (ValueError, TypeError, UnicodeError):
+        raise HTTPException(422, detail={'code': 'operator_draft_request_invalid'}) from None
+    return await _operator_draft_call(service.register, task_id, body)
+
+
+@router.get('/operator-query-draft/{task_id}/bundle')
+async def operator_draft_bundle(task_id: str, service=Depends(get_operator_draft_service)):
+    return await _operator_draft_call(service.bundle, task_id)

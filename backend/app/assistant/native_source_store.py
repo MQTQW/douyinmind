@@ -7,11 +7,13 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import hashlib
+import hmac
 import json
 import math
 import os
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 import time
 import urllib.parse
@@ -21,6 +23,13 @@ from .native_events import canonical_profile, validate_notice_identifier_diagnos
 from .native_transport import decimal_id
 from app.storage_guard import (StorageGuardError, assert_no_orphan_sqlite_files,
                                guarded_sqlite_file, verified_readonly_connection)
+
+
+# Only known, pre-admission ordinary-reply lookup failures may spend the
+# existing one-shot operator READ. Unknown leases and effect/scope failures do not.
+_FOLLOWUP_REVIEW_HOLD_CODES = frozenset({
+    'native_reply_parent_unresolved', 'native_ui_unverified', 'native_followup_ui_unverified',
+})
 
 
 class NativeStoreError(RuntimeError):
@@ -75,6 +84,49 @@ def _safe_json(value, *, depth=0):
 
 
 _LEGACY_REVIEW_BRAND = object()
+_FOLLOWUP_NO_EFFECTS_BRAND = object()
+_FOLLOWUP_NO_EFFECTS_MAC = secrets.token_bytes(32)
+_FOLLOWUP_NO_EFFECTS_REVIEW_KEYS = frozenset({'operation','reviewed_at','root_task_id','root_agent_task_id',
+    'ui_reference_id','ui_digest','cross_ledger_digest','operator_reason'})
+
+
+def _followup_no_effects_review(review):
+    if (type(review) is not dict or set(review) != _FOLLOWUP_NO_EFFECTS_REVIEW_KEYS
+            or review.get('operation') != 'owner_fresh_followup_no_effects_review'
+            or review.get('operator_reason') != 'explicit_operator_followup_no_effects_recovery'
+            or type(review.get('reviewed_at')) not in (int,float) or not math.isfinite(review['reviewed_at'])
+            or review['reviewed_at'] <= 0
+            or any(type(review.get(key)) is not str or re.fullmatch(r'[a-f0-9]{32}',review[key]) is None
+                   for key in ('root_task_id','root_agent_task_id'))
+            or any(type(review.get(key)) is not str or re.fullmatch(r'[a-f0-9]{64}',review[key]) is None
+                   for key in ('ui_digest','cross_ledger_digest'))
+            or type(review.get('ui_reference_id')) is not str
+            or re.fullmatch(r'[A-Za-z0-9_.:-]{1,512}',review['ui_reference_id']) is None):
+        raise NativeStoreError('native_followup_no_effects_review_required')
+    return json.loads(_dump(review))
+
+
+class _FollowupNoEffectsPermit:
+    """Private owner review, not a serialized/no-effects request assertion."""
+    __slots__ = ('store','snapshot','review','_seal')
+
+    def __init__(self,store,snapshot,review,*,_brand=None):
+        if _brand is not _FOLLOWUP_NO_EFFECTS_BRAND or type(snapshot) is not dict:
+            raise NativeStoreError('native_followup_no_effects_review_required')
+        self.store = store
+        self.snapshot = json.loads(_dump(snapshot))
+        self.review = _followup_no_effects_review(review)
+        self._seal = self._signature()
+
+    def _signature(self):
+        payload = _dump({'store':id(self.store),'snapshot':self.snapshot,'review':self.review}).encode('utf-8')
+        return hmac.new(_FOLLOWUP_NO_EFFECTS_MAC,payload,hashlib.sha256).digest()
+
+
+def _followup_no_effects_permit(store,snapshot,review):
+    # Only the paused owner lane may issue this after its complete cross-ledger
+    # audit. SourceStore cannot infer external effects from empty source links.
+    return _FollowupNoEffectsPermit(store,snapshot,review,_brand=_FOLLOWUP_NO_EFFECTS_BRAND)
 
 
 class _LegacyPrequeuePermit:
@@ -832,6 +884,40 @@ class NativeSourceStore:
                 "attempts_preserved": row["attempts"], "maximum_requests": 1,
                 "audit_recorded": True, "dispatchable": False}
 
+    def _followup_native_facts(self,db,row,candidate,source_id,now):
+        """The same strict native31/comment2/channel7 proof for both reviews."""
+        from .native_transport import NativeTransportError
+        try:
+            if (candidate.get('namespace')!='douyin_web_v1'
+                    or candidate.get('source_kind')!='native_reply_notice_candidate'
+                    or type(candidate.get('notice_type')) is not int or candidate['notice_type']!=31
+                    or type(candidate.get('comment_type')) is not int or candidate['comment_type']!=2
+                    or candidate.get('dispatchable') is not False or candidate.get('relation_status')!='unknown'
+                    or candidate.get('root_comment_id') is not None or candidate.get('parent_comment_id') is not None
+                    or candidate['sender_uid']==self.receiver_uid
+                    or row['video_id']!=candidate['video_id'] or row['cid']!=candidate['native_comment_id']
+                    or source_id!='native:'+_digest(['douyin_web_v1',self.receiver_uid,candidate['video_id'],candidate['native_comment_id']])):
+                raise ValueError()
+            for key in ('sender_uid','recipient_uid','video_id','native_comment_id','native_notice_id'):
+                if type(candidate.get(key)) is not str or decimal_id(candidate[key])!=candidate[key]:raise ValueError()
+            created=candidate.get('created_time')
+            armed=float(db.execute("SELECT value FROM meta WHERE key='armed_at'").fetchone()[0])
+            if (type(created) is not str or decimal_id(created,zero=True)!=created
+                    or not math.isfinite(armed) or not 0<armed<int(created)<=now+5):raise ValueError()
+            ref=db.execute('SELECT source_id,notice_type FROM notice_refs WHERE notice_id=?',
+                (candidate['native_notice_id'],)).fetchone()
+            facts=db.execute('SELECT fact FROM observations WHERE source_id=? AND notice_id=? AND channel=7',
+                (source_id,candidate['native_notice_id'])).fetchone()
+            fact=json.loads(facts[0]) if facts else None
+            if (ref is None or ref['source_id']!=source_id or type(ref['notice_type']) is not int or ref['notice_type']!=31
+                    or type(fact) is not dict or fact.get('source_kind')!='native_reply_notice_candidate'
+                    or type(fact.get('notice_type')) is not int or fact['notice_type']!=31
+                    or fact.get('native_notice_id')!=candidate['native_notice_id']
+                    or fact.get('created_time')!=created or fact.get('parent_id_hint')!=candidate.get('parent_id_hint')):
+                raise ValueError()
+        except (ValueError,TypeError,KeyError,IndexError,NativeTransportError):
+            raise NativeStoreError('native_followup_review_not_allowed') from None
+
     def request_followup_review(self,source_id,*,operator_reason):
         """One explicit READ for an unspent plain reply, never a task grant.
 
@@ -840,7 +926,6 @@ class NativeSourceStore:
         This Store knows only native identity, immutable source and its fences;
         it cannot certify those external permissions. No poll invokes this.
         """
-        from .native_transport import NativeTransportError
         if (type(source_id) is not str or not re.fullmatch(r'native:[a-f0-9]{64}',source_id)
                 or type(operator_reason) is not str or operator_reason!='explicit_operator_thread_followup_review'):
             raise NativeStoreError('native_followup_review_request_invalid')
@@ -853,42 +938,13 @@ class NativeSourceStore:
                     (audit_key,'ui_recheck_v1:'+source_id,'ui_read_fix_recheck_v1:'+source_id)).fetchone():
                 raise NativeStoreError('native_followup_review_already_requested')
             row=db.execute('SELECT * FROM sources WHERE source_id=?',(source_id,)).fetchone()
-            if (row is None or row['state']!='held' or row['hold_code']!='native_reply_parent_unresolved'
+            if (row is None or row['state']!='held' or row['hold_code'] not in _FOLLOWUP_REVIEW_HOLD_CODES
                     or row['historical'] or row['has_reply']!=1 or row['has_at']!=0 or row['attempts']!=1
                     or row['plan'] is not None or row['task_id'] is not None or row['reference_id'] is not None
                     or type(row['claim_token']) is not str or not re.fullmatch(r'[a-f0-9]{32}',row['claim_token'])):
                 raise NativeStoreError('native_followup_review_not_allowed')
             candidate=self._prequeue_identity(db,row,fresh=True)
-            try:
-                if (candidate.get('namespace')!='douyin_web_v1'
-                        or candidate.get('source_kind')!='native_reply_notice_candidate'
-                        or type(candidate.get('notice_type')) is not int or candidate['notice_type']!=31
-                        or type(candidate.get('comment_type')) is not int or candidate['comment_type']!=2
-                        or candidate.get('dispatchable') is not False or candidate.get('relation_status')!='unknown'
-                        or candidate.get('root_comment_id') is not None or candidate.get('parent_comment_id') is not None
-                        or candidate['sender_uid']==self.receiver_uid
-                        or row['video_id']!=candidate['video_id'] or row['cid']!=candidate['native_comment_id']
-                        or source_id!='native:'+_digest(['douyin_web_v1',self.receiver_uid,candidate['video_id'],candidate['native_comment_id']])):
-                    raise ValueError()
-                for key in ('sender_uid','recipient_uid','video_id','native_comment_id','native_notice_id'):
-                    if type(candidate.get(key)) is not str or decimal_id(candidate[key])!=candidate[key]:raise ValueError()
-                created=candidate.get('created_time')
-                armed=float(db.execute("SELECT value FROM meta WHERE key='armed_at'").fetchone()[0])
-                if (type(created) is not str or decimal_id(created,zero=True)!=created
-                        or not math.isfinite(armed) or not 0<armed<int(created)<=now+5):raise ValueError()
-                ref=db.execute('SELECT source_id,notice_type FROM notice_refs WHERE notice_id=?',
-                    (candidate['native_notice_id'],)).fetchone()
-                facts=db.execute('SELECT fact FROM observations WHERE source_id=? AND notice_id=? AND channel=7',
-                    (source_id,candidate['native_notice_id'])).fetchone()
-                fact=json.loads(facts[0]) if facts else None
-                if (ref is None or ref['source_id']!=source_id or type(ref['notice_type']) is not int or ref['notice_type']!=31
-                        or type(fact) is not dict or fact.get('source_kind')!='native_reply_notice_candidate'
-                        or type(fact.get('notice_type')) is not int or fact['notice_type']!=31
-                        or fact.get('native_notice_id')!=candidate['native_notice_id']
-                        or fact.get('created_time')!=created or fact.get('parent_id_hint')!=candidate.get('parent_id_hint')):
-                    raise ValueError()
-            except (ValueError,TypeError,KeyError,IndexError,NativeTransportError):
-                raise NativeStoreError('native_followup_review_not_allowed') from None
+            self._followup_native_facts(db,row,candidate,source_id,now)
             audit={'version':1,'operation':'request_followup_review','source_id':source_id,
                 'operator_reason':operator_reason,'request_one_count':1,'maximum_requests':1,
                 'old_state':row['state'],'old_hold_code':row['hold_code'],'old_attempts':row['attempts'],
@@ -901,6 +957,111 @@ class NativeSourceStore:
             db.execute("UPDATE sources SET state='fresh',hold_code=NULL,claim_owner=NULL,claim_token=NULL,lease_until=NULL WHERE source_id=? AND state='held' AND attempts=1",(source_id,))
         return {'source_id':source_id,'status':'followup_ui_review_requested','attempts_preserved':1,
             'maximum_requests':1,'audit_recorded':True,'dispatchable':False}
+
+    def _followup_no_effects_snapshot(self,db,source_id):
+        key='followup_no_effects_review_v1:'+source_id
+        prior_key='thread_followup_review_v1:'+source_id
+        keys={item[0] for item in db.execute('SELECT key FROM meta WHERE instr(key,?)>0',(source_id,))}
+        if key in keys:
+            raise NativeStoreError('native_followup_no_effects_review_already_used')
+        if keys != {prior_key}:
+            raise NativeStoreError('native_followup_no_effects_review_not_allowed')
+        row=db.execute('SELECT * FROM sources WHERE source_id=?',(source_id,)).fetchone()
+        now=self._clock()
+        if (row is None or type(now) not in (int,float) or not math.isfinite(now) or now<=0
+                or row['state']!='held' or row['hold_code']!='native_unknown_lease'
+                or type(row['attempts']) is not int or row['attempts']!=2 or row['historical']!=0
+                or row['has_at']!=0 or row['has_reply']!=1
+                or any(row[field] is not None for field in ('plan','task_id','reference_id'))
+                or type(row['lease_until']) not in (int,float) or not math.isfinite(row['lease_until'])
+                or row['lease_until']>=now or row['lease_until']<=0
+                or type(row['claim_token']) is not str or re.fullmatch(r'[a-f0-9]{32}',row['claim_token']) is None
+                or type(row['claim_owner']) is not str or not 1<=len(row['claim_owner'])<=100
+                or any(type(row[field]) not in (int,float) or not math.isfinite(row[field]) or row[field]<=0
+                       for field in ('first_seen','last_seen')) or row['last_seen']<row['first_seen']
+                or row['last_seen']>now+5 or row['lease_until']<row['first_seen']):
+            raise NativeStoreError('native_followup_no_effects_review_not_allowed')
+        candidate=self._prequeue_identity(db,row,fresh=True)
+        self._followup_native_facts(db,row,candidate,source_id,now)
+        saved=db.execute('SELECT value FROM meta WHERE key=?',(prior_key,)).fetchone()
+        try:
+            prior=json.loads(saved[0])
+            expected={'version','operation','source_id','operator_reason','request_one_count','maximum_requests',
+                'old_state','old_hold_code','old_attempts','old_claim_sha256','old_lease_until','immutable_hash',
+                'identity_revision','source_first_seen','source_last_seen','requested_at','old_hold_at',
+                'hold_timestamp_was_not_recorded','permission_scope'}
+            if (type(prior) is not dict or set(prior)!=expected or type(prior.get('version')) is not int or prior['version']!=1
+                    or prior.get('operation')!='request_followup_review' or prior.get('source_id')!=source_id
+                    or prior.get('operator_reason')!='explicit_operator_thread_followup_review'
+                    or any(type(prior.get(field)) is not int or prior[field]!=1
+                           for field in ('request_one_count','maximum_requests','old_attempts'))
+                    or prior.get('old_state')!='held' or prior.get('old_hold_code') not in _FOLLOWUP_REVIEW_HOLD_CODES
+                    or prior.get('immutable_hash')!=row['immutable_hash'] or prior.get('identity_revision')!=row['identity_revision']
+                    or prior.get('source_first_seen')!=row['first_seen'] or prior.get('permission_scope')!='fresh_ui_read_only'
+                    or prior.get('old_hold_at') is not None or prior.get('hold_timestamp_was_not_recorded') is not True
+                    or type(prior.get('old_claim_sha256')) is not str or re.fullmatch(r'[a-f0-9]{64}',prior['old_claim_sha256']) is None
+                    or prior['old_claim_sha256']==hashlib.sha256(row['claim_token'].encode()).hexdigest()
+                    or any(type(prior.get(field)) not in (int,float) or not math.isfinite(prior[field]) or prior[field]<=0
+                           for field in ('old_lease_until','requested_at','source_first_seen','source_last_seen'))
+                    or not row['first_seen']<=prior['requested_at']<=now
+                    or not row['first_seen']<=prior['source_last_seen']<=row['last_seen']):
+                raise ValueError()
+        except (ValueError,TypeError,KeyError,IndexError):
+            raise NativeStoreError('native_followup_no_effects_review_not_allowed') from None
+        identity=self.path.stat()
+        return {'source_id':source_id,'state':row['state'],'hold_code':row['hold_code'],'attempts':row['attempts'],
+            'store_owner':self._owner,'store_identity':[identity.st_dev,identity.st_ino],
+            'immutable_hash':row['immutable_hash'],'identity_revision':row['identity_revision'],
+            'first_seen':row['first_seen'],'last_seen':row['last_seen'],'lease_until':row['lease_until'],
+            'claim_owner':row['claim_owner'],'claim_fingerprint':hashlib.sha256(row['claim_token'].encode()).hexdigest(),
+            'prior_audit_hash':_digest(prior),'candidate':candidate}
+
+    def followup_no_effects_review_snapshot(self,source_id):
+        """Strict snapshot only; external no-effects evidence belongs to Lane."""
+        if type(source_id) is not str or re.fullmatch(r'native:[a-f0-9]{64}',source_id) is None:
+            raise NativeStoreError('native_followup_no_effects_review_not_allowed')
+        with self._connection() as db:
+            return self._followup_no_effects_snapshot(db,source_id)
+
+    def _commit_followup_no_effects_review(self,permit):
+        try:
+            valid=(type(permit) is _FollowupNoEffectsPermit and permit.store is self
+                and type(permit._seal) is bytes and hmac.compare_digest(permit._seal,permit._signature()))
+        except Exception:
+            valid=False
+        if not valid:
+            raise NativeStoreError('native_followup_no_effects_review_required')
+        snapshot=permit.snapshot
+        review=_followup_no_effects_review(permit.review)
+        _safe_json(snapshot);_safe_json(review)
+        source_id=snapshot.get('source_id')
+        if type(source_id) is not str or re.fullmatch(r'native:[a-f0-9]{64}',source_id) is None:
+            raise NativeStoreError('native_followup_no_effects_review_required')
+        with self._connection(write=True) as db:
+            current=self._followup_no_effects_snapshot(db,source_id)
+            if current!=snapshot:
+                raise NativeStoreError('native_followup_no_effects_review_scope_changed')
+            now=self._clock()
+            if not -5<=now-review['reviewed_at']<=120:
+                raise NativeStoreError('native_followup_no_effects_review_expired')
+            audit={'version':1,'operation':'followup_no_effects_review_resume','source_id':source_id,
+                'maximum_requests':1,'old_state':snapshot['state'],'old_hold_code':snapshot['hold_code'],
+                'old_attempts':snapshot['attempts'],'attempts_preserved':2,'old_lease_until':snapshot['lease_until'],
+                'old_claim_owner':snapshot['claim_owner'],'old_claim_sha256':snapshot['claim_fingerprint'],
+                'immutable_hash':snapshot['immutable_hash'],'identity_revision':snapshot['identity_revision'],
+                'source_first_seen':snapshot['first_seen'],'source_last_seen':snapshot['last_seen'],
+                'store_owner':snapshot['store_owner'],'store_identity':snapshot['store_identity'],
+                'prior_audit_hash':snapshot['prior_audit_hash'],'review':review,'requested_at':now,
+                'permission_scope':'fresh_ui_read_only','dispatchable':False,
+                'evidence_boundary':'current_owner_no_effects_review_not_historical_interruption'}
+            _safe_json(audit)
+            db.execute('INSERT INTO meta(key,value) VALUES(?,?)',('followup_no_effects_review_v1:'+source_id,_dump(audit)))
+            # This does not grant the expired claim another turn. Its fields
+            # remain archived in place until the NORMAL fresh claim overwrites
+            # them and increments attempts. No Queue/Agent/send barrier moves.
+            db.execute("UPDATE sources SET state='fresh',hold_code=NULL WHERE source_id=?",(source_id,))
+            return {'source_id':source_id,'status':'followup_no_effects_review_queued',
+                'attempts_preserved':2,'dispatchable':False}
 
     def request_ui_recheck_after_read_fix(self, source_id, *, expected_old_code, operator_reason):
         """One further explicit READ after an evidenced pre-admission fix.

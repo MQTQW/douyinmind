@@ -10,7 +10,9 @@ from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
+import json
 import re
+import sqlite3
 import threading
 import time
 
@@ -22,6 +24,7 @@ from .choice_intent import (choice_prompt, selection_forms, parse_library_select
     semantic_choice_catalog,semantic_choice_owner)
 from .commands import CommandResolver, Resolution, library_forms
 from .library_choice import LibraryChoiceError
+from .reply_style import reply_body_budget, style_reply_text
 
 
 def _digest(value):
@@ -86,9 +89,10 @@ class ChoiceController:
         except (ValueError,TypeError,KeyError,AttributeError):return False
 
     @staticmethod
-    def _menu(resolution):
-        return choice_prompt(resolution.choice_options,catalog_count=resolution.catalog_count,
-            catalog_scope=resolution.catalog_scope,max_chars=280)
+    def _menu(resolution, reply_prefix=''):
+        body = choice_prompt(resolution.choice_options,catalog_count=resolution.catalog_count,
+            catalog_scope=resolution.catalog_scope,max_chars=reply_body_budget(280, reply_prefix))
+        return style_reply_text(body, reply_prefix, maximum=280)
 
     @staticmethod
     def _ask_ref(task,resolution,ask_text):
@@ -123,16 +127,17 @@ class ChoiceController:
             return None
         try:
             resolution=self._root_resolution(task)
+            prefix = self.agent.reply_prefix('assistant:' + task['id']) or ''
             if (resolution.reason_code!='save_library_required' or resolution.action!='clarify'
                     or resolution.binding!=self._binding(task) or resolution.authorization!=task['authorization']
                     or not resolution.choice_intent or resolution.choice_intent.get('catalog_public_reply_allowed') is not True
-                    or self._menu(resolution)!=session['ask_text']
+                    or self._menu(resolution, prefix)!=session['ask_text']
                     or self._ask_ref(task,resolution,session['ask_text'])!=session['ask_ref']
                     or self._eligible_options(resolution)!=session['options']):return None
         except (ValueError,TypeError,KeyError,AttributeError):return None
         return task,resolution
 
-    def prepare_ask(self,task,resolution):
+    def prepare_ask(self,task,resolution,*,reply_prefix=''):
         if (self.should_stop() or not isinstance(resolution,Resolution) or resolution.reason_code!='save_library_required'
                 or not resolution.choice_intent or not self._authorized_task(task)):return None
         existing=self.store.get_for_root_task(task['id'])
@@ -148,7 +153,8 @@ class ChoiceController:
                     or current.binding.public_reply_allowed is not True):return None
             options=self._eligible_options(current)
             if not options:return None
-            ask=self._menu(current)
+            prefix = self.agent.freeze_reply_prefix('assistant:' + task['id'], reply_prefix)
+            ask=self._menu(current, prefix)
             return self.store.create(root_task_id=task['id'],root_binding=task['binding'],root_envelope=task['envelope'],
                 ask_ref=self._ask_ref(task,current,ask),ask_text=ask,options=options,authorization=task['authorization'])
         except (ValueError,TypeError,KeyError,AttributeError):
@@ -191,6 +197,112 @@ class ChoiceController:
         session=self.store.get_for_root_task(task['id'])
         return (session is None or session['state'] not in {'needs_review','cancelled'}
             and self._fresh_root(session) is not None)
+
+    def _published_reply(self, task, kind):
+        """Verify an already spent direct B-visible send; no new capability."""
+        from app.mention_agent.store import _verified_target
+        old = self.agent.lookup_existing(task['binding_id'], task['envelope'])
+        if (old is None or task.get('agent_task_id') != old['task_id'] or old['state'] != 'b_view_visible'):
+            return None
+        reply = self.agent.get_reply(old['task_id'])
+        if (not reply or reply['kind'] != kind or reply['state'] != 'b_view_visible'
+                or re.fullmatch(r'[a-f0-9]{48}', reply.get('send_token') or '') is None):
+            return None
+        proof, verification = reply.get('evidence'), reply.get('verification')
+        if (not isinstance(proof, dict) or proof.get('submit_gate_passed') is not True
+                or proof.get('exact_body_in_original_thread') is not True
+                or proof.get('reply_sha256') != hashlib.sha256(reply['text'].encode()).hexdigest()
+                or not _verified_target(reply['target'], verification, task['binding'])):
+            return None
+        for record in (proof, verification):
+            observed = datetime.fromisoformat(record['observed_at_utc'].replace('Z', '+00:00'))
+            if observed.tzinfo is None:
+                return None
+        if any(reply['target'].get(key) != task['envelope'][key] for key in task['envelope'] if key != 'evidence'):
+            return None
+        if any(reply['target'].get(key) != task['binding'][key] for key in ('binding_id','instance_id','knowledge_base_id')):
+            return None
+        return reply
+
+    def published_followup_anchor_current(self, task):
+        """Historical proof for a completed choice child, never dispatch authority.
+
+        Pending menus still use authority_current/_fresh_root. A spent reply's
+        frozen menu is checked against its original ledgers, not today's catalog.
+        """
+        try:
+            if (self.should_stop() or not isinstance(task, dict) or task.get('state') != 'b_view_visible'
+                    or task.get('envelope', {}).get('evidence', {}).get('source_kind') != 'library_choice_reply'
+                    or re.fullmatch(r'[a-f0-9]{48}', task.get('publication_token') or '') is None
+                    or not self._authorized_task(task)):
+                return False
+            current = self.queue.get_task(task['id'])
+            if (not current or current['state'] != 'b_view_visible'
+                    or any(current.get(key) != task.get(key) for key in
+                           ('immutable','binding','authorization','user_id','device_id','agent_task_id','publication_token'))
+                    or _identity(current['envelope']) != _identity(task['envelope'])):
+                return False
+            session = self._session_for_task(current)
+            if not session or session['state'] != 'handed_off' or session['child_task_id'] != current['id']:
+                return False
+            frozen = self._frozen_selected_resolution(session)
+            if (frozen is None or not self._matches_child(current, session, frozen)
+                    or self.registry.authorize_snapshot(frozen.authorization, action='import') != frozen.binding):
+                return False
+            root = self.queue.get_task(session['root_task_id'])
+            if (not root or root['state'] not in {'b_view_visible','waiting_library'}
+                    or not self._authorized_task(root) or root['binding'] != session['root_binding']
+                    or root['authorization'] != session['authorization_snapshot']
+                    or _identity(root['envelope']) != _identity(session['root_envelope'])):
+                return False
+            identity = {'instance_id':session['root_binding']['instance_id'],
+                'sender':session['root_binding']['sender_profile_url'],'receiver':session['root_binding']['receiver_profile_url'],
+                'video_id':session['root_envelope']['video_id'],'source_mode':session['root_envelope']['source_mode'],
+                'root_reference_id':session['root_envelope']['reference_id']}
+            if session['choice_id'] != _digest({'kind':'library_choice_v1','root':identity,'ask_ref':session['ask_ref'],
+                    'options':session['options'],'authorization_snapshot':session['authorization_snapshot']}):
+                return False
+            selection = session['selection_envelope']
+            selection_identity = {'instance_id':identity['instance_id'],'sender':identity['sender'],'receiver':identity['receiver'],
+                'source_mode':selection['source_mode'],'reference':selection['native_comment_id'] if selection['reference_quality']=='native' else session['selection_ref'],
+                'quality':selection['reference_quality']}
+            selection_key = _digest(selection_identity)
+            with self.store._db() as db:  # Owned read-only transaction; never hold/requeue/repair history.
+                sealed = db.execute('SELECT immutable FROM choice_sessions WHERE choice_id=?', (session['choice_id'],)).fetchone()
+                refs = db.execute('SELECT * FROM choice_selection_refs WHERE choice_id=?', (session['choice_id'],)).fetchall()
+            expected = {key:session[key] for key in ('root_task_id','root_binding','root_envelope','authorization_snapshot','ask_ref','ask_text','options')}
+            if (sealed is None or json.loads(sealed['immutable']) != expected or len(refs) != 1
+                    or refs[0]['selection_key'] != selection_key or session['selection_key'] != selection_key
+                    or refs[0]['envelope_hash'] != _digest(_identity(selection))
+                    or session['child_key'] != 'choice-child-' + _digest({'choice_id':session['choice_id'],
+                        'selection_key':selection_key,'knowledge_base_id':session['selected_kb_id']})):
+                return False
+            ask = self._published_reply(root, 'clarification')
+            child = self._published_reply(current, 'import_status')
+            if (ask is None or child is None or ask['text'] != session['ask_text']
+                    or child.get('import_state') not in {'succeeded','failed','failed_no_submit'}):
+                return False
+            proof = session['ask_proof']
+            expected_ask = {'source_kind':'library_choice_ask','sender_profile_url':identity['sender'],
+                'receiver_profile_url':identity['receiver'],'ask_author_profile_url':identity['receiver'],
+                'video_id':identity['video_id'],'root_reference_id':identity['root_reference_id'],
+                'root_comment_text':session['root_envelope']['comment_text'],'ask_ref':session['ask_ref'],
+                'ask_text':session['ask_text'],'ask_reply_ref':session['ask_reply_ref']}
+            if (not isinstance(proof, dict) or any(proof.get(key) != value for key,value in expected_ask.items())
+                    or proof.get('receiver_verified') is not True or proof.get('exact_body_in_original_thread') is not True
+                    or type(proof.get('unique_count')) is not int or proof['unique_count'] != 1
+                    or proof.get('reference_quality') not in {'native','verified_ui'}
+                    or proof.get('observed_at_utc') != ask['evidence'].get('observed_at_utc')
+                    or session['ask_reply_ref'] != choice_ask_reference(root_reference_id=identity['root_reference_id'],
+                        ask_ref=session['ask_ref'],ask_text=session['ask_text'],receiver_profile_url=identity['receiver'],video_id=identity['video_id'])):
+                return False
+            native = proof.get('native_comment_id')
+            if (proof['reference_quality'] == 'native' and (type(native) is not str or re.fullmatch(r'[0-9]{5,30}',native) is None)
+                    or proof['reference_quality'] == 'verified_ui' and native is not None):
+                return False
+            return True
+        except (ValueError, TypeError, KeyError, AttributeError, sqlite3.Error, OSError):
+            return False
 
     def after_publish(self,task,outcome):
         session=self.store.get_for_root_task(task['id'])

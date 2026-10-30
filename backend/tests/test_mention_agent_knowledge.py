@@ -78,6 +78,26 @@ def test_describe_only_fixed_library_and_all_reads_preserve_business_bytes(datab
     assert sha256(database.read_bytes()).hexdigest() == before
 
 
+def test_pre_migration_library_schema_remains_readable_without_writing(database):
+    with sqlite3.connect(database) as db:
+        db.execute("ALTER TABLE knowledge_bases DROP COLUMN deleted_at")
+    before = database.read_bytes()
+    assert LocalKnowledgeTools(database, 1, rag=FakeRag()).describe()["id"] == 1
+    assert database.read_bytes() == before
+
+
+def test_deleted_library_never_becomes_all_local_or_reaches_retrieval(database):
+    with sqlite3.connect(database) as db:
+        db.execute("UPDATE knowledge_bases SET deleted_at='2026-01-01' WHERE id=1")
+    fake = FakeRag([hit("ready-B")])
+    tools = LocalKnowledgeTools(database, 1, rag=fake)
+    with pytest.raises(KnowledgeBaseNotFound):
+        tools.describe()
+    with pytest.raises(KnowledgeBaseNotFound):
+        tools.query("合成已删除范围")
+    assert fake.calls == []
+
+
 def test_retrieval_never_receives_global_scope_and_rechecks_injected_hits(database):
     foreign = hit("ready-B", "foreign", body="外库私密正文")
     pending = hit("pending-A", "pending", body="未完成正文")

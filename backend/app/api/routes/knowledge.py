@@ -141,8 +141,16 @@ async def delete_video(platform_item_id: str, db: Session = Depends(get_db)):
     :return: 删除结果
     """
     try:
-        result = knowledge_service.delete_video(db, platform_item_id)
+        with worker.maintenance_guard():
+            try:
+                result = knowledge_service.delete_video(db, platform_item_id)
+            except BaseException:
+                db.rollback()
+                raise
         return {"success": True, **result}
+    except WorkerBusyError:
+        db.rollback()
+        return {"success": False, "message": "有资料正在处理或排队，请等待入库任务结束后再删除。"}
     except ValueError as exc:
         return {"success": False, "message": str(exc)}
 
@@ -156,7 +164,7 @@ async def get_knowledge_stats(db: Session = Depends(get_db)):
     :return: VideoCache 各状态数量 + ChromaDB 存储统计
     """
     stats = knowledge_service.get_stats(db)
-    return {"success": True, **stats}
+    return {"success": True, **stats, "capabilities": {"guarded_video_delete": True}}
 
 
 @router.get("/videos/{platform_item_id}/content")

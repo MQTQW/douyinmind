@@ -11,6 +11,7 @@ from .intake import make_envelope, should_receive_notice
 from .knowledge import LocalKnowledgeTools
 from .model import DeepSeekToolModel, IncompleteModelResponse
 from .store import AgentStore, AgentStoreError
+from app.assistant.reply_style import normalize_reply_prefix
 
 
 def read_binding(path: Path) -> Binding:
@@ -37,7 +38,7 @@ class AgentService:
                  allowed_library_names=(), conversation_context=None, allow_private_execution=False,
                  automatic_import_receipt=False, usage_budget=None, trusted_save_selection=None,
                  budget_scope_id=None, budget_scope_linker=None, trusted_semantic_decision=None,
-                 trusted_semantic_grant_id=None, trusted_semantic_owner_scope=None):
+                 trusted_semantic_grant_id=None, trusted_semantic_owner_scope=None, reply_prefix=''):
         if type(allow_import) is not bool:
             raise ValueError("视频入库开关必须明确设置为布尔值")
         if binding.is_all_local and allow_import:
@@ -68,6 +69,7 @@ class AgentService:
         if type(automatic_import_receipt) is not bool:
             raise ValueError("自动回执开关无效")
         self.automatic_import_receipt = automatic_import_receipt
+        self.reply_prefix = normalize_reply_prefix(reply_prefix)
         self.usage_budget = usage_budget
         self.trusted_save_selection = trusted_save_selection
         # Only the internal Bridge supplies this from a typed semantic receipt.
@@ -140,7 +142,7 @@ class AgentService:
             if self.usage_budget is not None:
                 from app.assistant.usage_model import BudgetedModel
                 model = BudgetedModel(model, self.usage_budget, self.budget_scope_id or task_id)
-            engine_options = {}
+            engine_options = {'reply_prefix': self.reply_prefix}
             if self.trusted_semantic_decision is not None:
                 engine_options.update(trusted_semantic_decision=self.trusted_semantic_decision,
                     trusted_semantic_grant_id=self.trusted_semantic_grant_id,
@@ -191,7 +193,7 @@ class AgentService:
             if result.proposal is None:
                 self.store.needs_review(task_id, token, result.review_code or "no_reply_proposal")
             else:
-                self.store.complete(task_id, token, result.proposal)
+                self.store.complete(task_id, token, result.proposal, reply_prefix=self.reply_prefix)
         except Exception as error:
             # Never persist provider error strings: they can contain URLs,
             # headers or model input. An uncertain request is not retried.

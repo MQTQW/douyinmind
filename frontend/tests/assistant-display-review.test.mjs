@@ -194,7 +194,8 @@ test('compact main display retains all 18 filter values, statistics, and distinc
     for (const label of ['开启助手', '暂停处理', '停止', '账号与设备']) assert.ok(buttons(tree).some(n => text(n) === label));
     assert.ok(!buttons(tree).some(n => text(n) === '管理设置'));
     assert.doesNotMatch(text(tree), /暂停处理时，新指令继续排队/);
-    assert.match(text(tree), /仅反映可见通知，不代表全部提醒已收齐/);
+    assert.doesNotMatch(text(tree), /仅反映可见通知，不代表全部提醒已收齐/);
+    assert.match(text(tree), /最近核对抖音通知/);
     assert.equal(fakeAPI.calls.some(c => ['control', 'action'].includes(c[0])), false);
   });
 });
@@ -204,7 +205,8 @@ test('configuration recovery CTA, manual verification entry and abnormal explana
     heartbeat_at: new Date().toISOString(), manual_verification: { available: true, active: false, url: 'http://127.0.0.1:8767/' } } }, async ({ tree }) => {
     assert.ok(buttons(tree).some(n => text(n) === '核对原有设置'));
     assert.equal(nodes(tree, n => n.type === 'a' && n.props.href === 'http://127.0.0.1:8767/').length, 1);
-    assert.match(text(tree), /不要把密码或验证码发到聊天|助手仍暂停/);
+    const copy = nodes(tree, n => n.props.className === 'assistant-control-copy')[0];
+    assert.match(nodes(copy, n => n.type === 'h4')[0].props.title, /不要把密码或验证码发到聊天|助手仍暂停/);
     assert.equal(buttons(tree).find(n => text(n) === '开启助手').props.disabled, true);
   });
 });
@@ -215,7 +217,8 @@ test('data-format and worker errors retain their explanation even with a fresh r
     { worker_state: 'error' },
   ]) {
     await withPanel({ control: { state: 'running', receiver_state: 'ready', heartbeat_at: new Date().toISOString(), ...control } }, async ({ tree }) => {
-      assert.match(text(tree), control.worker_state ? /工具处理出现问题，任务记录已保留/ : /不用为这个数据问题输入验证码/);
+      assert.match(text(tree), control.worker_state ? /工具处理出现问题，任务记录已保留/ : /通知数据格式需要核对，收件已暂停/);
+      assert.doesNotMatch(text(tree), /助手正在留意新指令/);
     });
   }
 });
@@ -263,7 +266,8 @@ test('native cooldown heading and help describe notification wait without reques
     const copy = nodes(tree, n => n.props.className === 'assistant-control-copy')[0];
     assert.match(renderToStaticMarkup(copy), /接口暂时等待/);
     assert.match(text(copy), /稍后继续读取通知/);
-    assert.match(text(copy), /无需重发评论，也不用为这次接口等待输入验证码/);
+    assert.match(nodes(copy, n => n.type === 'h4')[0].props.title, /无需重发评论，也不用为这次接口等待输入验证码/);
+    assert.doesNotMatch(text(copy), /无需重发评论，也不用为这次接口等待输入验证码/);
     assert.doesNotMatch(text(copy), /先恢复助手页面|等待本人核验|助手窗口/);
     assert.equal(buttons(tree).filter(n => ['开启助手', '暂停处理', '停止'].includes(text(n))).length, 3);
     assert.equal(nodes(tree, n => n.type === 'a' && n.props.href === 'http:\/\/127.0.0.1:8767/').length, 0);
@@ -276,8 +280,10 @@ test('generic page failure stays uncertain and cannot be relabelled by old nativ
     native_session_status: { state: 'cooldown' }, heartbeat_at: new Date().toISOString() } }, async ({ tree }) => {
     const copy = nodes(tree, n => n.props.className === 'assistant-control-copy')[0];
     assert.match(text(copy), /收件暂时受阻，请核对通知状态/);
-    assert.match(text(copy), /后台通知或页面暂时无法读取/);
-    assert.match(text(copy), /不要重复发送评论/);
+    const help = nodes(copy, n => n.type === 'h4')[0].props.title;
+    assert.match(help, /后台通知或页面暂时无法读取/);
+    assert.match(help, /不要重复发送评论/);
+    assert.doesNotMatch(text(copy), /后台通知或页面暂时无法读取|不要重复发送评论/);
     assert.doesNotMatch(text(copy), /接口暂时等待|稍后继续读取通知|先恢复助手页面/);
   });
 });
@@ -304,7 +310,7 @@ test('configuration failure controls badge and help while preserving the recover
     assert.ok(nodes(tree, n => n.props.className?.includes('assistant-configuration-error'))[0]);
     assert.match(renderToStaticMarkup(copy), /设置需核对/);
     assert.match(text(copy), /先核对原有设置，任务记录会保留/);
-    assert.match(text(copy), /请先核对原有设置，确认后再开启助手/);
+    assert.match(nodes(copy, n => n.type === 'h4')[0].props.title, /请先核对原有设置，确认后再开启助手/);
     assert.doesNotMatch(renderToStaticMarkup(copy), /接口暂时等待|稍后继续读取通知|收件接口正在短暂等待/);
     assert.equal(buttons(tree).find(n => text(n) === '开启助手').props.disabled, true);
     assert.equal(nodes(tree, n => n.type === 'a' && n.props.href === 'http:\/\/127.0.0.1:8767/').length, 0);

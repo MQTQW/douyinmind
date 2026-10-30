@@ -41,6 +41,8 @@ def parsed_intent_from_receipt(envelope,user,device,grants,receipt):
         frozen_ui_digest=ui_semantic_digest(envelope),
         owner_scope=owner_scope_from_envelope(envelope,user,device),
         catalog_snapshot=catalog_snapshot_from_grants(grants))
+    from .semantic_intent_model import FOLLOWUP_CONTEXT
+    query_followup=value.get('followup_context')==FOLLOWUP_CONTEXT
     action,target,grant=value['action'],value['target_state'],value['grant_id']
     if envelope.get('evidence',{}).get('source_kind')=='conversation_followup' and action=='save':
         return ParsedIntent('clarify',reason_code='followup_save_requires_mention',
@@ -50,7 +52,8 @@ def parsed_intent_from_receipt(envelope,user,device,grants,receipt):
             clarification='好的，这次不保存，也不执行其他操作。')
     if target in {'ambiguous','unknown'}:
         return ParsedIntent('clarify',reason_code='semantic_library_ambiguous' if target=='ambiguous' else 'unknown_library',
-            clarification='还没能确定你指的是哪个知识库，请再说明一下；本次尚未保存。',explicit_library=True)
+            clarification=('还没能确定你指的是哪个知识库，请再说明要在哪个资料范围查询。' if query_followup
+                else '还没能确定你指的是哪个知识库，请再说明一下；本次尚未保存。'),explicit_library=True)
     if action=='save' and target=='unspecified':
         return ParsedIntent('clarify',reason_code='save_library_required',
             clarification='请先选择要保存到哪个知识库，选择前不会保存。')
@@ -62,4 +65,5 @@ def parsed_intent_from_receipt(envelope,user,device,grants,receipt):
     if action in {'save','query'}:
         return ParsedIntent(action,grant_id=grant,explicit_library=target=='one')
     return ParsedIntent('clarify',reason_code='semantic_intent_unclear',
-        clarification='还没确定你是想保存这条视频，还是根据资料提问，可以再具体说一下吗？')
+        clarification=('你想进一步了解当前视频的哪一部分？可以再具体说一下。' if query_followup
+            else '还没确定你是想保存这条视频，还是根据资料提问，可以再具体说一下吗？'))

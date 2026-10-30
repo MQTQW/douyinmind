@@ -9,6 +9,7 @@ interface Props {
   collectionId: string;
   statsRefreshKey: number;
   chatOnly?: boolean;
+  interactionDisabled?: boolean;
   knowledgeBaseId: number | null;
   knowledgeBaseName: string;
   openedSessionId: number | null;
@@ -32,6 +33,7 @@ interface Message {
 export default function ChatPanel({
   collectionId,
   chatOnly = false,
+  interactionDisabled = false,
   knowledgeBaseId,
   knowledgeBaseName,
   openedSessionId,
@@ -127,7 +129,7 @@ export default function ChatPanel({
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    if (loading || historyLoading || !historyReady || requestRef.current) return;
+    if (interactionDisabled || loading || historyLoading || !historyReady || requestRef.current) return;
     const { query: q, error } = api.inspectQuestion(input);
     if (error) {
       setInputError(error);
@@ -232,7 +234,7 @@ export default function ChatPanel({
             </div>
             <div className="flex flex-wrap gap-2 justify-center max-w-md">
               {promptChips.map((text, i) => (
-                <button key={i} onClick={() => { setInput(text); setInputError(''); }} disabled={!historyReady} className="prompt-chip">{text}</button>
+                <button key={i} onClick={() => { if (!interactionDisabled) { setInput(text); setInputError(''); } }} disabled={interactionDisabled || !historyReady} className="prompt-chip">{text}</button>
               ))}
             </div>
           </div>
@@ -291,10 +293,10 @@ export default function ChatPanel({
           aria-label="输入问题"
           aria-invalid={Boolean(shownInputError)}
           aria-describedby={shownInputError || showInputCount ? inputFeedbackId : undefined}
-          disabled={loading || historyLoading || !historyReady}
+          disabled={interactionDisabled || loading || historyLoading || !historyReady}
         />
         <div className="composer-footer"><span className="text-xs text-[var(--color-ink-muted)]">{chatOnly ? '体验模式 · 不使用收藏资料' : knowledgeBaseId != null ? `资料范围：${knowledgeBaseName}` : collectionId === 'all' ? '资料范围：全部已入库资料' : '资料范围：当前收藏夹'}</span>
-        <button type="submit" aria-label="发送问题" disabled={loading || historyLoading || !historyReady || !inputState.length} className="composer-send">
+        <button type="submit" aria-label="发送问题" disabled={interactionDisabled || loading || historyLoading || !historyReady || !inputState.length} className="composer-send">
           {loading ? <span className="animate-pulse">···</span> : <ArrowUp size={19} />}
         </button>
         </div>
@@ -305,7 +307,7 @@ export default function ChatPanel({
           </div>
         )}
         </div>
-        <p className="composer-note">Enter 发送 · Shift + Enter 换行{!chatOnly && ' · 回答附带来源，方便核对原文'}</p>
+        <p className="composer-note">Enter 发送 · Shift + Enter 换行</p>
         {copyError && <p role="status" className="mt-2 text-xs text-[var(--color-ink-muted)]">{copyError}</p>}
       </form>
     </div>

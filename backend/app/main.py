@@ -16,7 +16,7 @@ from app.core.config import settings
 from app.core.logging import setup_logging
 from app.db.base import Base
 from app.db.session import engine
-from app.db.migrations import ensure_chat_knowledge_base_column, ensure_video_analysis_columns
+from app.db.migrations import ensure_chat_knowledge_base_column, ensure_knowledge_base_tombstones, ensure_video_analysis_columns
 
 
 @asynccontextmanager
@@ -53,6 +53,7 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     ensure_video_analysis_columns(engine)
     ensure_chat_knowledge_base_column(engine)
+    ensure_knowledge_base_tombstones(engine)
     logger.info("数据库表初始化完成")
 
     # 启动后台 worker

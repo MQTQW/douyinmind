@@ -19,21 +19,23 @@ _RUN = re.compile(r'[a-f0-9]{32}\Z')
 _SOURCE = re.compile(r'native:[a-f0-9]{64}\Z')
 _HINT = re.compile(r'native-hint:[a-f0-9]{64}\Z')
 _TASK = re.compile(r'assistant-task:[a-f0-9]{32}\Z')
+_DRAFT = re.compile(r'assistant-draft:[a-f0-9]{32}:[a-f0-9]{64}\Z')
 _REQUEST = re.compile(r'([a-f0-9]{32})\.json\Z')
 OPERATIONS = frozenset({'review_legacy_prequeue', 'resume_interrupted_prequeue','request_visibility_ui_review',
                         'inspect_visibility_hint','recover_visibility_hint','inspect_reply','request_followup_ui_review',
-                        'inspect_thread_followup'})
+                        'inspect_thread_followup','review_unexecuted_followup','finalize_query_draft'})
 _MARKER = 'DouyinMind.native-review.v1'
 _BOOLS = ('reviewed', 'eligible', 'queued_for_fresh_ui', 'historical_preserved', 'dispatchable')
 _HANDLER_CODES = frozenset({'native_recovery_not_safe', 'native_recovery_scope_unavailable',
     'native_recovery_effects_unknown', 'native_recovery_stopped', 'native_recovery_identity_unverified',
-    'native_legacy_recovery_incomplete'})
+    'native_legacy_recovery_incomplete', 'native_recovery_effects_present'})
 MAX_BYTES = 1024
 
 
 def _source_for_operation(source_id,operation):
     if type(source_id) is not str or type(operation) is not str or operation not in OPERATIONS:return False
     if operation=='inspect_reply':return bool(_TASK.fullmatch(source_id))
+    if operation=='finalize_query_draft':return bool(_DRAFT.fullmatch(source_id))
     return bool((_HINT if operation in {'request_visibility_ui_review','inspect_visibility_hint','recover_visibility_hint'} else _SOURCE).fullmatch(source_id))
 
 
@@ -297,7 +299,9 @@ class NativeRecoveryMailbox:
                         code = ('assistant_reply_inspected' if value['operation'] == 'inspect_reply' else
                             'native_visibility_recovery_requested' if value['operation'] == 'recover_visibility_hint' else
                             'native_recovery_inspected' if value['operation'] == 'inspect_visibility_hint' else
-                            'native_recovery_reviewed' if value['operation'] == 'review_legacy_prequeue' else 'native_recovery_resume_requested')
+                            'native_recovery_reviewed' if value['operation'] == 'review_legacy_prequeue' else
+                            'operator_query_draft_finalized' if value['operation'] == 'finalize_query_draft' else
+                            'native_recovery_resume_requested')
                         result = self._safe(request_id, source_id, 'done', code, returned)
             except NativeRecoveryMailboxError as error:
                 code = error.code if error.code in {'native_recovery_request_invalid','native_recovery_request_expired','native_recovery_result_invalid'} else 'native_recovery_handler_failed'

@@ -27,6 +27,42 @@ from .commands import CommandResolver
 from .conversation import ConversationStore
 
 
+_FOLLOWUP_ANCHOR_COUNT_KEYS = frozenset({'user_count', 'device_count', 'root_task_count', 'origin_count'})
+_FOLLOWUP_ANCHOR_REASONS = frozenset('followup_anchor_' + name for name in (
+    'checking', 'not_checked', 'matched', 'candidate_invalid', 'parent_hint_invalid', 'user_not_unique',
+    'device_not_unique', 'no_published_task', 'task_id_invalid', 'lineage_cycle', 'lineage_limit',
+    'task_missing', 'task_state', 'agent_task_missing', 'binding_invalid', 'operation_stopped',
+    'agent_store_unavailable', 'source_authorizer_rejected', 'source_authorizer_error',
+    'registry_snapshot_rejected', 'registry_binding_mismatch', 'binding_inactive',
+    'registry_authorization_error', 'followup_permission_rejected', 'followup_permission_error',
+    'choice_authority_rejected', 'choice_authority_error', 'semantic_permission_rejected',
+    'published_choice_authority_rejected', 'published_choice_authority_error',
+    'semantic_permission_error', 'authorization_rejected', 'public_reply_disabled', 'source_mode',
+    'ancestor_not_unique', 'ancestor_scope', 'root_evidence', 'agent_missing', 'reply_missing',
+    'active_binding_missing', 'reply_unreserved', 'agent_binding_mismatch', 'binding_changed',
+    'agent_envelope_mismatch', 'reply_readback_unconfirmed', 'reply_state', 'proposal_kind',
+    'proposal_text', 'reply_target', 'read_unconfirmed', 'lineage_scope', 'lineage_kind',
+    'lineage_predecessor', 'parent_native_unmatched', 'origin_conflict', 'origins_ambiguous',
+))
+
+
+def _followup_anchor_note(bridge, reason, *, fallback=False):
+    """Owner-thread memory only: fixed enums, never task/body/profile data."""
+    guard = getattr(bridge, '_followup_anchor_guard', None)
+    if guard is None or not getattr(guard, 'diagnostic_active', False):
+        return
+    value = getattr(guard, 'diagnostic', None)
+    if (not isinstance(value, dict) or reason not in _FOLLOWUP_ANCHOR_REASONS
+            or fallback and value.get('code') not in {'followup_anchor_checking', 'followup_anchor_matched'}):
+        return
+    value['code'] = reason
+
+
+def _followup_anchor_reject(bridge, reason, *, fallback=False):
+    _followup_anchor_note(bridge, reason, fallback=fallback)
+    return None
+
+
 @contextmanager
 def _followup_owned_ro(store):
     """Existing owned ledgers only; never an ordinary RW getter/transaction."""
@@ -181,20 +217,70 @@ class LegacyBridge:
     def _binding(self, task):
         return Binding.from_dict(task['binding'])
 
-    def _authorized(self, task):
-        binding = self._binding(task)
-        if self.should_stop() or not self.agent_path.is_file():
+    def reset_followup_anchor_diagnostic(self):
+        self._followup_anchor_guard.diagnostic = {}
+
+    @property
+    def last_followup_anchor_diagnostic(self):
+        value = getattr(self._followup_anchor_guard, 'diagnostic', None)
+        if (not isinstance(value, dict) or type(value.get('code')) is not str
+                or value['code'] not in _FOLLOWUP_ANCHOR_REASONS):
+            return {}
+        counts = value.get('counts', {})
+        counts = counts if isinstance(counts, dict) else {}
+        return {'code': value['code'], 'counts': {key: number for key, number in counts.items()
+            if key in _FOLLOWUP_ANCHOR_COUNT_KEYS and type(number) is int and 0 <= number <= 1000000}}
+
+    def _future_reply_prefix(self, task, user_id):
+        key = 'assistant:' + task['id']
+        prefix = self.agent.reply_prefix(key)
+        if prefix is not None:
+            return prefix
+        old = self._find(task)
+        if old is not None and self.agent.get_reply(old['task_id']) is not None:
+            # A pre-preference draft has an empty frozen style. Never backfill it.
+            return self.agent.reply_prefix('agent:' + old['task_id']) or ''
+        if self.choices is not None and self.choices.store.get_for_root_task(task['id']) is not None:
+            # A legacy menu may have been frozen before its Agent draft existed.
+            return ''
+        getter = getattr(self.registry, 'get_reply_prefix', None)
+        prefix = getter(user_id) if user_id and callable(getter) else ''
+        return self.agent.freeze_reply_prefix(key, prefix)
+
+    def _authorized(self, task, *, published_anchor=False):
+        try:
+            binding = self._binding(task)
+        except Exception:
+            _followup_anchor_note(self, 'followup_anchor_binding_invalid')
+            raise
+        if self.should_stop():
+            _followup_anchor_note(self, 'followup_anchor_operation_stopped')
+            return False
+        if not self.agent_path.is_file():
+            _followup_anchor_note(self, 'followup_anchor_agent_store_unavailable')
             return False
         if self.source_authorizer is not None:
             try:
                 if self.source_authorizer(task) is not True:
+                    _followup_anchor_note(self, 'followup_anchor_source_authorizer_rejected')
                     return False
             except Exception:
+                _followup_anchor_note(self, 'followup_anchor_source_authorizer_error')
                 return False
         authorization = task.get('authorization')
-        fresh = (self.registry.authorize_snapshot(authorization)
-                 if isinstance(authorization, dict) else None)
+        try:
+            fresh = (self.registry.authorize_snapshot(authorization)
+                     if isinstance(authorization, dict) else None)
+        except Exception:
+            _followup_anchor_note(self, 'followup_anchor_registry_authorization_error')
+            raise
         authorized = fresh == binding and binding.active
+        if fresh is None:
+            _followup_anchor_note(self, 'followup_anchor_registry_snapshot_rejected')
+        elif fresh != binding:
+            _followup_anchor_note(self, 'followup_anchor_registry_binding_mismatch')
+        elif not binding.active:
+            _followup_anchor_note(self, 'followup_anchor_binding_inactive')
         proof = task.get('envelope', {}).get('evidence', {})
         if authorized and proof.get('source_kind') == 'conversation_followup':
             try:
@@ -209,14 +295,33 @@ class LegacyBridge:
                     and all(anchor['root_envelope'][key] == task['envelope'][key] for key in
                             ('sender_profile_url','receiver_profile_url','video_id'))
                     and task.get('kind') != 'save')
+                if not authorized:
+                    _followup_anchor_note(self, 'followup_anchor_followup_permission_rejected', fallback=True)
             except Exception:
+                _followup_anchor_note(self, 'followup_anchor_followup_permission_error')
                 authorized = False
         if authorized and self.choices is not None:
-            authorized = self.choices.authority_current(task)
+            published_choice = published_anchor is True and proof.get('source_kind') == 'library_choice_reply'
+            try:
+                if published_choice:
+                    current = getattr(self.choices, 'published_followup_anchor_current', None)
+                    authorized = callable(current) and current(task)
+                else:
+                    authorized = self.choices.authority_current(task)
+            except Exception:
+                _followup_anchor_note(self, 'followup_anchor_published_choice_authority_error'
+                    if published_choice else 'followup_anchor_choice_authority_error')
+                raise
+            if not authorized:
+                _followup_anchor_note(self, 'followup_anchor_published_choice_authority_rejected'
+                    if published_choice else 'followup_anchor_choice_authority_rejected')
         if authorized and self.semantic_store is not None:
             try:
                 authorized = self._semantic_permission_current(task)
+                if not authorized:
+                    _followup_anchor_note(self, 'followup_anchor_semantic_permission_rejected')
             except Exception:
+                _followup_anchor_note(self, 'followup_anchor_semantic_permission_error')
                 authorized = False
         return authorized
 
@@ -280,22 +385,32 @@ class LegacyBridge:
 
     def _followup_root_anchor(self, task_id):
         """One published B reply and its actual real-@ ancestor, no effects."""
+        _followup_anchor_note(self, 'followup_anchor_checking')
         if type(task_id) is not str or not re.fullmatch(r'[a-f0-9]{32}', task_id):
-            return None
+            return _followup_anchor_reject(self, 'followup_anchor_task_id_invalid')
         previous = getattr(self._followup_anchor_guard, 'tasks', ())
-        if task_id in previous or len(previous) >= 8:
-            return None
+        if task_id in previous:
+            return _followup_anchor_reject(self, 'followup_anchor_lineage_cycle')
+        if len(previous) >= 8:
+            return _followup_anchor_reject(self, 'followup_anchor_lineage_limit')
         self._followup_anchor_guard.tasks = (*previous, task_id)
         try:
             with _followup_owned_ro(self.queue) as db:
                 row = db.execute('SELECT * FROM assistant_tasks WHERE id=?', (task_id,)).fetchone()
                 task = self.queue._raw(row)
-            if (task is None or task['state'] != 'b_view_visible' or not task.get('agent_task_id')
-                    or not self._authorized(task) or not self._binding(task).public_reply_allowed):
-                return None
+            if task is None:
+                return _followup_anchor_reject(self, 'followup_anchor_task_missing')
+            if task['state'] != 'b_view_visible':
+                return _followup_anchor_reject(self, 'followup_anchor_task_state')
+            if not task.get('agent_task_id'):
+                return _followup_anchor_reject(self, 'followup_anchor_agent_task_missing')
+            if not self._authorized(task, published_anchor=True):
+                return _followup_anchor_reject(self, 'followup_anchor_authorization_rejected', fallback=True)
+            if not self._binding(task).public_reply_allowed:
+                return _followup_anchor_reject(self, 'followup_anchor_public_reply_disabled')
             envelope, binding = task['envelope'], self._binding(task)
             if envelope.get('source_mode') != 'live_ui':
-                return None
+                return _followup_anchor_reject(self, 'followup_anchor_source_mode')
             ancestor = envelope
             proof = envelope.get('evidence', {})
             if proof.get('source_kind') in {'library_choice_reply', 'conversation_followup'}:
@@ -304,38 +419,48 @@ class LegacyBridge:
                     ancestors = db.execute("SELECT * FROM assistant_tasks WHERE json_extract(envelope,'$.reference_id')=? AND json_extract(envelope,'$.source_mode')='live_ui' AND json_extract(envelope,'$.sender_profile_url')=? AND json_extract(envelope,'$.receiver_profile_url')=? AND json_extract(envelope,'$.video_id')=?",
                         (reference, envelope['sender_profile_url'], envelope['receiver_profile_url'], envelope['video_id'])).fetchall()
                     if len(ancestors) != 1:
-                        return None
+                        return _followup_anchor_reject(self, 'followup_anchor_ancestor_not_unique')
                     original = self.queue._raw(ancestors[0])
                 if (original['user_id'] != task['user_id'] or original['device_id'] != task['device_id']
                         or original['binding']['instance_id'] != binding.instance_id):
-                    return None
+                    return _followup_anchor_reject(self, 'followup_anchor_ancestor_scope')
                 ancestor = original['envelope']
             actual = ancestor.get('evidence', {})
             if (actual.get('real_mention') is not True or actual.get('sender_verified') is not True
                     or actual.get('video_verified') is not True or type(actual.get('unique_count')) is not int
                     or actual['unique_count'] != 1 or ancestor.get('source_mode') != 'live_ui'
                     or actual.get('source_kind') in {'library_choice_reply','conversation_followup'}):
-                return None
+                return _followup_anchor_reject(self, 'followup_anchor_root_evidence')
             with _followup_owned_ro(self.agent) as db:
                 agent = db.execute('SELECT task_id,binding_id,envelope,state FROM agent_tasks WHERE task_id=?', (task['agent_task_id'],)).fetchone()
                 reply = db.execute('SELECT reply_id,proposal,target,state,created_at,send_token IS NOT NULL AS reserved FROM agent_replies WHERE task_id=?', (task['agent_task_id'],)).fetchone()
                 active_binding = db.execute('SELECT payload FROM agent_bindings WHERE binding_id=?', (task['binding_id'],)).fetchone()
-                if (agent is None or reply is None or active_binding is None or not reply['reserved']
-                        or agent['binding_id'] != task['binding_id']
-                        or json.loads(active_binding[0]) != binding.to_dict()):
-                    return None
+                if agent is None:
+                    return _followup_anchor_reject(self, 'followup_anchor_agent_missing')
+                if reply is None:
+                    return _followup_anchor_reject(self, 'followup_anchor_reply_missing')
+                if active_binding is None:
+                    return _followup_anchor_reject(self, 'followup_anchor_active_binding_missing')
+                if not reply['reserved']:
+                    return _followup_anchor_reject(self, 'followup_anchor_reply_unreserved')
+                if agent['binding_id'] != task['binding_id']:
+                    return _followup_anchor_reject(self, 'followup_anchor_agent_binding_mismatch')
+                if json.loads(active_binding[0]) != binding.to_dict():
+                    return _followup_anchor_reject(self, 'followup_anchor_binding_changed')
                 from app.mention_agent.store import _canonical_reference
                 if _canonical_reference(json.loads(agent['envelope'])) != _canonical_reference(envelope):
-                    return None
+                    return _followup_anchor_reject(self, 'followup_anchor_agent_envelope_mismatch')
                 if reply['state'] == 'delivery_unknown':
                     if agent['state'] != 'delivery_unknown' or self.agent._checked_reply_readback(db, task['agent_task_id']) is None:
-                        return None
+                        return _followup_anchor_reject(self, 'followup_anchor_reply_readback_unconfirmed')
                 elif reply['state'] != 'b_view_visible' or agent['state'] != 'b_view_visible':
-                    return None
+                    return _followup_anchor_reject(self, 'followup_anchor_reply_state')
                 proposal = json.loads(reply['proposal'])
                 text = proposal.get('text')
-                if proposal.get('kind') not in {'answer','import_status'} or type(text) is not str or not 1 <= len(text) <= 8000:
-                    return None
+                if proposal.get('kind') not in {'answer','import_status'}:
+                    return _followup_anchor_reject(self, 'followup_anchor_proposal_kind')
+                if type(text) is not str or not 1 <= len(text) <= 8000:
+                    return _followup_anchor_reject(self, 'followup_anchor_proposal_text')
                 target = json.loads(reply['target'])
                 expected = {k:v for k,v in envelope.items() if k != 'evidence'}
                 expected.update(binding_id=binding.binding_id, instance_id=binding.instance_id, knowledge_base_id=binding.knowledge_base_id)
@@ -346,7 +471,8 @@ class LegacyBridge:
                 elif proof.get('source_kind') == 'conversation_followup':
                     expected['followup_evidence'] = proof
                 if target != expected:
-                    return None
+                    return _followup_anchor_reject(self, 'followup_anchor_reply_target')
+            _followup_anchor_note(self, 'followup_anchor_matched')
             return {'root_task_id':task['id'], 'root_agent_task_id':task['agent_task_id'],
                 'root_envelope':deepcopy(ancestor), 'prior_reply_text':text,
                 'prior_reply_sha256':hashlib.sha256(text.encode()).hexdigest(),
@@ -356,7 +482,7 @@ class LegacyBridge:
                 'predecessor_task_id':proof.get('root_task_id')
                     if proof.get('source_kind') == 'conversation_followup' else None}
         except Exception:
-            return None
+            return _followup_anchor_reject(self, 'followup_anchor_read_unconfirmed', fallback=True)
         finally:
             self._followup_anchor_guard.tasks = previous
 
@@ -376,50 +502,66 @@ class LegacyBridge:
         seen, family = set(), None
         for _ in range(8):
             if task_id in seen:
-                return None
+                return _followup_anchor_reject(self, 'followup_anchor_lineage_cycle')
             seen.add(task_id)
             anchor = self._followup_root_anchor(task_id)
             if anchor is None or any(type(anchor.get(key)) is not str or not anchor[key]
                     for key in ('user_id', 'device_id', 'instance_id')):
-                return None
+                return _followup_anchor_reject(self, 'followup_anchor_lineage_scope', fallback=True)
             scope = {key: deepcopy(anchor[key]) for key in
                 ('user_id', 'device_id', 'instance_id', 'root_envelope')}
             if family is None:
                 family = scope
             elif scope != family:
-                return None
+                return _followup_anchor_reject(self, 'followup_anchor_lineage_scope')
             kind, predecessor = anchor.get('anchor_source_kind'), anchor.get('predecessor_task_id')
             if kind != 'conversation_followup':
-                return anchor if kind in (None, 'library_choice_reply') and predecessor is None else None
+                if kind in (None, 'library_choice_reply') and predecessor is None:
+                    return anchor
+                return _followup_anchor_reject(self, 'followup_anchor_lineage_kind')
             if type(predecessor) is not str or not re.fullmatch(r'[a-f0-9]{32}', predecessor):
-                return None
+                return _followup_anchor_reject(self, 'followup_anchor_lineage_predecessor')
             task_id = predecessor
-        return None
+        return _followup_anchor_reject(self, 'followup_anchor_lineage_limit')
 
     def followup_anchors(self, candidate):
-        """At most three published origins; distinct derivations stay ambiguous."""
+        """At most three published origins; diagnostics never grant authority."""
+        guard = self._followup_anchor_guard
+        previous_active = getattr(guard, 'diagnostic_active', False)
+        guard.diagnostic = {'code': 'followup_anchor_checking',
+            'counts': {key: 0 for key in _FOLLOWUP_ANCHOR_COUNT_KEYS}}
+        guard.diagnostic_active = True
         try:
             if type(candidate) is not dict or candidate.get('source_kind') != 'native_reply_notice_candidate':
+                _followup_anchor_note(self, 'followup_anchor_candidate_invalid')
                 return []
             sender, receiver, video = (candidate[k] for k in ('sender_profile_url','receiver_profile_url','video_id'))
             hint = candidate.get('parent_id_hint')
             if type(hint) is not str or not re.fullmatch(r'[1-9][0-9]{0,29}', hint):
+                _followup_anchor_note(self, 'followup_anchor_parent_hint_invalid')
                 return []
             snapshot = self.registry.snapshot()
             users = [u for u in snapshot['users'] if u['sender_profile_url'] == sender and u['receiver_profile_url'] == receiver
                      and u.get('active') is True and u.get('verification_status') == 'verified']
+            guard.diagnostic['counts']['user_count'] = len(users)
             if len(users) != 1:
+                _followup_anchor_note(self, 'followup_anchor_user_not_unique')
                 return []
             user = users[0]
             devices = [d for d in user['devices'] if d.get('is_local') is True and d.get('enabled') is True
                        and not d.get('revoked') and d.get('verification_status') == 'verified'
                        and (not user.get('default_device_id') or d['device_id'] == user['default_device_id'])]
+            guard.diagnostic['counts']['device_count'] = len(devices)
             if len(devices) != 1:
+                _followup_anchor_note(self, 'followup_anchor_device_not_unique')
                 return []
             device = devices[0]
             with _followup_owned_ro(self.queue) as db:
                 roots = [self.queue._raw(r) for r in db.execute("SELECT * FROM assistant_tasks WHERE state='b_view_visible' AND user_id=? AND device_id=? AND json_extract(binding,'$.instance_id')=? AND json_extract(envelope,'$.sender_profile_url')=? AND json_extract(envelope,'$.receiver_profile_url')=? AND json_extract(envelope,'$.video_id')=? ORDER BY updated_at DESC LIMIT 24",
                     (user['user_id'], device['device_id'], device['instance_id'], sender, receiver, video))]
+            guard.diagnostic['counts']['root_task_count'] = len(roots)
+            if not roots:
+                _followup_anchor_note(self, 'followup_anchor_no_published_task')
             result = []
             origins = {}
             for task in roots:
@@ -428,11 +570,11 @@ class LegacyBridge:
                     continue
                 native = anchor['root_envelope'].get('native_comment_id')
                 if native != hint:
-                    # A UI-null native ID may use only this root's already
-                    # admitted native row as a locator, never unrelated history.
+                    # The same existing admitted-source locator; no new lineage or DOM inference.
                     from .native_source_store import NativeSourceStore
                     path = self.queue.path.parent/'native-receiver'/'sources.sqlite3'
                     if not path.is_file():
+                        _followup_anchor_note(self, 'followup_anchor_parent_native_unmatched')
                         continue
                     native_store = NativeSourceStore(path, candidate['recipient_uid'], receiver)
                     with native_store._connection() as db:
@@ -442,19 +584,29 @@ class LegacyBridge:
                                    and json.loads(r[1]).get('receiver_profile_url') == receiver
                                    and json.loads(r[1]).get('video_id') == video]
                         if len(matches) != 1:
+                            _followup_anchor_note(self, 'followup_anchor_parent_native_unmatched')
                             continue
                 origin = (anchor['root_task_id'], anchor['root_agent_task_id'])
                 if origin in origins:
                     if origins[origin] != anchor:
+                        _followup_anchor_note(self, 'followup_anchor_origin_conflict')
                         return []
                     continue
                 origins[origin] = anchor
                 result.append(anchor)
+                guard.diagnostic['counts']['origin_count'] = len(origins)
                 if len(result) == 3:
                     break
+            if len(result) == 1:
+                _followup_anchor_note(self, 'followup_anchor_matched')
+            elif len(result) > 1:
+                _followup_anchor_note(self, 'followup_anchor_origins_ambiguous')
             return result
         except Exception:
+            _followup_anchor_note(self, 'followup_anchor_read_unconfirmed', fallback=True)
             return []
+        finally:
+            guard.diagnostic_active = previous_active
 
     def _semantic_steps(self, task):
         """Exact comment billing, including paid but non-executable plans."""
@@ -523,8 +675,11 @@ class LegacyBridge:
                 if tokens:
                     metadata['usage'] = tokens
             public_steps.append({'kind':public_kind, 'metadata':metadata, 'created_at':step['created_at']})
+        source_fields = {'source_id','id','platform_item_id','chunk_id','title','url','source_type','time_range'}
+        public_sources = [{key:value for key,value in source.items() if key in source_fields}
+                          for source in reply['sources']] if reply else []
         return {'reply_text':reply['text'] if reply else '', 'library_name':name,
-                'sources':reply['sources'] if reply else [], 'steps':public_steps}
+                'sources':public_sources, 'steps':public_steps}
 
     def _snapshot(self, task, *, override=None):
         binding = self._binding(task)
@@ -645,6 +800,7 @@ class LegacyBridge:
             if resolution is None:
                 return {'state':'needs_review','reason_code':'binding_changed'}
             binding = resolution.binding
+            reply_prefix = self._future_reply_prefix(task, resolution.user_id)
             retry_action_id = task.get('_query_retry_action_id')
             if retry_action_id is not None and (resolution.action!='query' or not self.queue.query_retry_execution_current(
                     task['id'],retry_action_id,task.get('execution_token'))):
@@ -659,7 +815,7 @@ class LegacyBridge:
                            for item in resolution.choice_options) if is_choice else False
             if is_choice and eligible and self.choices is None:
                 return {'state': 'needs_review', 'reason_code': 'library_choice_store_not_initialized'}
-            choice = self.choices.prepare_ask(task, resolution) if self.choices is not None else None
+            choice = self.choices.prepare_ask(task, resolution, reply_prefix=reply_prefix) if self.choices is not None else None
             if is_choice and eligible and choice is None:
                 return {'state': 'needs_review', 'reason_code': 'library_choice_preparation_unconfirmed'}
             clarification = resolution.clarification or '请明确选择一个允许的知识库。'
@@ -676,12 +832,10 @@ class LegacyBridge:
             if claim is not None:
                 self.agent.complete(old['task_id'],claim['claim_token'],
                     {'kind':'clarification','text':choice['ask_text'] if choice else clarification,
-                     'source_ids':[],'sources':[]})
+                     'source_ids':[],'sources':[]}, reply_prefix=reply_prefix)
             return self._with_execution_time(self._snapshot(task), started)
-        current_video = r'(?:这个|当前|这条|本条|本|该)\s*视频'
-        body=task['envelope']['comment_text']
-        focus=bool(re.search(current_video,body) and not re.search(
-            r'(?:不要|不用|不必|别|不是|并非).{0,8}'+current_video+r'|对比|比较|另一个视频|其他视频|其它视频',body))
+        from .evidence_focus import default_current_video
+        focus = default_current_video(task['envelope']) is not None
         knowledge=(self.knowledge_factory(binding) if self.knowledge_factory is not None else
                    BackendKnowledgeTools(self.database,binding.knowledge_base_id,task['id'],
                        focus_video_id=task['envelope']['video_id'] if focus and resolution.action=='query' else None,
@@ -690,7 +844,7 @@ class LegacyBridge:
                    'allow_import':resolution.action=='save',
                    'scope_authorizer':lambda current: current==binding and self._authorized(task),
                    'allowed_library_names':tuple(resolution.library.get('accepted_names',resolution.library.get('aliases',[]))),
-                   'conversation_context':history, 'allow_private_execution':True}
+                   'conversation_context':history, 'allow_private_execution':True, 'reply_prefix':reply_prefix}
         if self.usage_budget is not None:
             options['usage_budget'] = self.usage_budget
         semantic_receipt = self._semantic_receipt(task)
@@ -1019,6 +1173,28 @@ class LegacyBridge:
             if retry['state']!='armed':
                 raise ValueError('query_retry_already_used')
             return self._snapshot(task)
+
+    def finalize_operator_query_draft(self, task_id, *, expected_candidate_sha256, reverify_identity):
+        from .operator_draft_owner import finalize_query_draft
+        self.last_operator_draft_diagnostic = {'stage':'operator_query_draft_finalize','code':'checking'}
+        try:
+            result = finalize_query_draft(self, task_id, expected_candidate_sha256=expected_candidate_sha256,
+                reverify_identity=reverify_identity)
+        except Exception as error:
+            allowed = {'operator_query_draft_not_safe','operator_query_draft_scope_changed',
+                'operator_query_draft_budget_unverified','operator_query_draft_ui_unverified',
+                'operator_query_draft_snapshot_changed','operator_query_draft_style_missing',
+                'operator_query_draft_evidence_changed','operator_query_draft_text_unverified',
+                'operator_query_draft_target_unsupported'}
+            code = str(error)
+            self.last_operator_draft_diagnostic = {'stage':'operator_query_draft_finalize',
+                'code':code if code in allowed else 'operator_query_draft_unconfirmed',
+                'exception_type':type(error).__name__ if type(error).__name__ in
+                    {'QueryDraftOwnerError','AgentStoreError','OperatorDraftError','ReceiverInterventionRequired',
+                     'ReceiverPageError','ReceiverDetailError','TimeoutError'} else 'local_error'}
+            raise
+        self.last_operator_draft_diagnostic = {'stage':'operator_query_draft_finalize','code':'first_draft_ready_no_send'}
+        return result
 
     def publish(self, task):
         if self.adapter is None or threading.get_ident()!=self.browser_owner_thread_id:

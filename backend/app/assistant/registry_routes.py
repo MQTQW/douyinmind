@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from app.storage_guard import StorageGuardError, assert_no_orphan_sqlite_files
 from .registry import DEFAULT_PATH, REQUIRED_MARKER_NAME, Registry, RegistryError, read_local_catalog
 from .routes import local_request
+from .reply_style import normalize_reply_prefix
 
 
 BACKEND = Path(__file__).resolve().parents[2]
@@ -144,6 +145,15 @@ class UserRequest(StrictBody):
     label: str = Field(default="新账号", max_length=128)
 
 
+class ReplyPrefixRequest(StrictBody):
+    reply_prefix: str = Field(strict=True, max_length=24)
+
+    @field_validator('reply_prefix')
+    @classmethod
+    def safe_prefix(cls, value):
+        return normalize_reply_prefix(value)
+
+
 class DeviceRequest(StrictBody):
     label: str = Field(default="本机设备", max_length=128)
     instance_id: str | None = Field(default=None, max_length=128)
@@ -176,6 +186,8 @@ class LocalOwnerAccessRequest(Confirmation):
 def fail(error):
     messages = {
         "record_not_found": "这项账号、设备或授权不存在。",
+        "reply_prefix_local_binding_required": "请先核对已验证的本人本机账号和设备绑定，再设置回复称呼。",
+        "invalid_reply_prefix": "回复称呼仅支持简短文字，不支持链接、账号标记或多行内容。",
         "local_owner_verified_device_required": "请先明确验证本人的本机账号和设备；远端不会继承本机全部资料权限。",
         "catalog_owner_confirmation_required": "登记当前全部库的保存权限，需要同时明确允许查看本人本机库目录。",
         "local_owner_scope_required": "请先明确允许全部资料查询或本机库目录，不会单独开启没有范围的公开许可。",
@@ -246,6 +258,16 @@ def create_user(body: UserRequest, actor=Depends(admin_request)):
 @router.post("/users/{user_id}/verify")
 def verify_user(user_id: str, body: Confirmation, actor=Depends(admin_request)):
     return perform(lambda: get_registry(create=True).verify_user(user_id, verified_by=actor, method="local_admin"))
+
+
+@router.put('/users/{user_id}/reply-prefix')
+def update_reply_prefix(user_id: str, body: ReplyPrefixRequest):
+    def update():
+        registry = get_registry()
+        if registry is None:
+            raise RegistryError('reply_prefix_local_binding_required')
+        return registry.set_reply_prefix(user_id, body.reply_prefix)
+    return perform(update)
 
 
 @router.post("/users/{user_id}/revoke")

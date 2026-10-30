@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import threading
 import time
@@ -13,6 +14,42 @@ from .integration import STATE, STORAGE, RECEIVER_STATE, AGENT_PATH, registry_if
 from .queue import AssistantQueue, utc
 from .background_mode import product_browser_headless
 from .native_configuration import build_intake_lane
+
+
+def record_native_read_diagnostic(control, run_id, lane, previous):
+    """Report only a new, fixed-shape READ observation; never affect intake."""
+    try:
+        value = getattr(lane, 'last_native_read_diagnostic', None)
+        if value is previous or type(value) is not dict:
+            return False
+        stages = {'original_ui_lookup', 'choice_ui_read', 'followup_prepare'}
+        codes = {'native_read_checking', 'native_read_complete', 'native_read_no_result',
+                 'native_read_page_unready', 'native_read_detail_unverified',
+                 'native_read_intervention', 'native_read_unconfirmed',
+                 'native_followup_no_resolution'}
+        kinds = {None, 'ReceiverPageError', 'ReceiverDetailError',
+                 'ReceiverInterventionRequired', 'NativeLaneError', 'TimeoutError',
+                 'ValueError', 'TypeError', 'KeyError', 'local_error'}
+        if (value.get('stage') not in stages or value.get('code') not in codes
+                or value.get('exception_type') not in kinds):
+            return False
+        counts = value.get('viewport_counts')
+        safe = {key: value[key] for key in ('stage', 'code', 'exception_type')}
+        safe['viewport_counts'] = {key: number for key, number in counts.items()
+            if key in {'configured', 'expanded', 'restored', 'restore_failed'}
+            and type(number) is int and number in (0, 1)} if type(counts) is dict else {}
+        lookup_stage = value.get('lookup_stage_index')
+        if type(lookup_stage) is int and 0 <= lookup_stage <= 10:
+            safe['lookup_stage_index'] = lookup_stage
+        safe['observed_at'] = utc()
+        def record(current):
+            if current.get('run_id') == run_id:
+                current['native_read_diagnostic'] = safe
+            return current
+        control.queue.update_control(record)
+        return True
+    except Exception:
+        return False
 
 
 def receive_bounded_batch(runtime, lane, admission_lock, should_stop):
@@ -375,7 +412,8 @@ def run_registered(queue, control, *, poll_seconds=45, publish_gap_seconds=30):
                 from .native_recovery_owner import NativeRecoveryOwner
                 recovery_mailbox=NativeRecoveryMailbox(queue.path.parent,run_id,control)
                 recovery_owner=NativeRecoveryOwner(lane,control,queue,run_id,admission_lock,manual_hold,
-                    owner_review,worker_inflight,lambda:manual_needs_owner(manual_server),reply_inspector=bridge.inspect_existing_reply)
+                    owner_review,worker_inflight,lambda:manual_needs_owner(manual_server),reply_inspector=bridge.inspect_existing_reply,
+                    draft_finalizer=bridge.finalize_operator_query_draft)
                 native_ui_wakeup=threading.Event()
 
                 def work():
@@ -487,7 +525,11 @@ def run_registered(queue, control, *, poll_seconds=45, publish_gap_seconds=30):
                                 native_ready=native_status['armed']
                                 from .native_visibility_diagnostics import record_visibility_probe
                                 record_visibility_probe(control,run_id,lane)
-                            admitted=receive_bounded_batch(runtime,lane,admission_lock,page_operations_stop)
+                            previous_read = getattr(lane, 'last_native_read_diagnostic', None)
+                            try:
+                                admitted=receive_bounded_batch(runtime,lane,admission_lock,page_operations_stop)
+                            finally:
+                                record_native_read_diagnostic(control,run_id,lane,previous_read)
                             if should_stop():
                                 break
                             control.record_capture(run_id,admitted_count=len(admitted),
@@ -497,6 +539,7 @@ def run_registered(queue, control, *, poll_seconds=45, publish_gap_seconds=30):
                                 reason_code=None if native_ready else 'native_history_baseline_in_progress')
                             next_capture=time.monotonic()+poll_seconds
                         elif native_ui_wakeup.is_set():
+                            previous_read = getattr(lane, 'last_native_read_diagnostic', None)
                             try:
                                 receive_native_ui_wakeup(native_ui_wakeup,runtime,lane,admission_lock,page_operations_stop)
                             except ReceiverInterventionRequired:
@@ -505,6 +548,8 @@ def run_registered(queue, control, *, poll_seconds=45, publish_gap_seconds=30):
                                 # No new API capture, lease retry or timer reset.
                                 # Unknown read outcomes retain their original ledger.
                                 control.set_receiver_health(run_id,'page_unavailable',reason_code='native_ui_wakeup_unconfirmed')
+                            finally:
+                                record_native_read_diagnostic(control,run_id,lane,previous_read)
                         runtime.process_action_once()
                         # This lane only reads already attempted public replies.
                         # Unknown send reservations never become publish jobs.
@@ -579,10 +624,21 @@ def main(argv=None):
     recovery.add_argument('--inspect-assistant-reply',help='仅登记已发表任务的B侧原线程只读检查，填写32位任务ID')
     recovery.add_argument('--review-thread-followup',help='明确登记一条从未执行的普通追问重新核对原线程，填写完整native来源号')
     recovery.add_argument('--inspect-thread-followup',help='只读定位一条未处理追问，不理解、不创建任务或发送')
+    recovery.add_argument('--review-unexecuted-followup',help='完整审计无执行记录及真实原线程后，为中断追问登记独立一次新读取；不重发任何结果')
+    recovery.add_argument('--finalize-query-draft',help='核验已登记的操作员问答首稿，只生成未发草稿，不重跑模型或发送；填写32位任务号')
+    parser.add_argument('--candidate-sha256',help='与操作员首稿请求一起固定已核对候选的64位SHA256，不能单独使用')
     args=parser.parse_args(argv)
+    draft_provided = args.finalize_query_draft is not None
+    candidate_provided = args.candidate_sha256 is not None
+    if draft_provided != candidate_provided:
+        parser.error('首稿任务号与候选SHA256必须一起提交。')
+    if draft_provided and not re.fullmatch(r'[a-f0-9]{32}', args.finalize_query_draft):
+        parser.error('首稿任务号格式不符。')
+    if candidate_provided and not re.fullmatch(r'[a-f0-9]{64}', args.candidate_sha256):
+        parser.error('候选SHA256格式不符。')
     if args.state_dir.absolute()!=STATE or args.state_dir.resolve()!=STATE:
         parser.error('助手目录由项目固定，不能指定其他文件或数据库。')
-    if args.run_registered and (args.review_native_source or args.resume_native_source or args.review_native_visibility_hint or args.inspect_native_visibility_hint or args.recover_native_visibility_hint or args.inspect_assistant_reply or args.review_thread_followup or args.inspect_thread_followup):
+    if args.run_registered and (args.review_native_source or args.resume_native_source or args.review_native_visibility_hint or args.inspect_native_visibility_hint or args.recover_native_visibility_hint or args.inspect_assistant_reply or args.review_thread_followup or args.inspect_thread_followup or args.review_unexecuted_followup or args.finalize_query_draft):
         parser.error('后台运行与本机审查请求不能合并。')
     queue=AssistantQueue(STATE/'queue.sqlite3',protected_paths=(STORAGE/'douyinrag.db',STORAGE/'mention_agent',
         RECEIVER_STATE,STORAGE/'chroma',STATE/'registry.sqlite3',STATE/'conversation.sqlite3'))
@@ -591,17 +647,20 @@ def main(argv=None):
     launching_run=initial.get('run_id') if args.run_registered and initial.get('state')=='starting' else None
     try:
         start_guard()
-        if args.review_native_source or args.resume_native_source or args.review_native_visibility_hint or args.inspect_native_visibility_hint or args.recover_native_visibility_hint or args.inspect_assistant_reply or args.review_thread_followup or args.inspect_thread_followup:
+        if args.review_native_source or args.resume_native_source or args.review_native_visibility_hint or args.inspect_native_visibility_hint or args.recover_native_visibility_hint or args.inspect_assistant_reply or args.review_thread_followup or args.inspect_thread_followup or args.review_unexecuted_followup or args.finalize_query_draft:
             from .native_recovery_mailbox import NativeRecoveryMailbox
             request=NativeRecoveryMailbox(STATE,initial.get('run_id'),control).submit(
                 ('assistant-task:'+args.inspect_assistant_reply) if args.inspect_assistant_reply else
-                (args.review_native_source or args.resume_native_source or args.review_native_visibility_hint or args.inspect_native_visibility_hint or args.recover_native_visibility_hint or args.review_thread_followup or args.inspect_thread_followup),
+                ('assistant-draft:'+args.finalize_query_draft+':'+args.candidate_sha256) if args.finalize_query_draft else
+                (args.review_native_source or args.resume_native_source or args.review_native_visibility_hint or args.inspect_native_visibility_hint or args.recover_native_visibility_hint or args.review_thread_followup or args.inspect_thread_followup or args.review_unexecuted_followup),
                 'review_legacy_prequeue' if args.review_native_source else
                 'resume_interrupted_prequeue' if args.resume_native_source else
                 'inspect_visibility_hint' if args.inspect_native_visibility_hint else
                 'recover_visibility_hint' if args.recover_native_visibility_hint else
                 'inspect_reply' if args.inspect_assistant_reply else
+                'finalize_query_draft' if args.finalize_query_draft else
                 'inspect_thread_followup' if args.inspect_thread_followup else
+                'review_unexecuted_followup' if args.review_unexecuted_followup else
                 'request_followup_ui_review' if args.review_thread_followup else 'request_visibility_ui_review')
             print(json.dumps(request,ensure_ascii=False))
             return 0

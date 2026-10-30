@@ -156,6 +156,11 @@ class SemanticIntentInterpreter:
             user,device,grants=context
             owner=owner_scope_from_envelope(envelope,user,device)
             catalog=catalog_snapshot_from_grants(grants)
+            followup_context=None
+            if envelope.get('evidence',{}).get('source_kind')=='conversation_followup':
+                carrier=self.registry.intake_binding(envelope['sender_profile_url'],envelope['receiver_profile_url'])
+                followup_context=self.store.verified_followup_context(envelope,binding=carrier,owner_scope=owner,
+                    source_checkpoint=source_checkpoint,should_stop=self.should_stop)
             def authorized():
                 if self.should_stop():return False
                 if source_checkpoint is not None and (not callable(source_checkpoint) or source_checkpoint() is not True):return False
@@ -180,7 +185,7 @@ class SemanticIntentInterpreter:
                 receipt=self.store.run_once(source_key=semantic_source_key(envelope),
                     frozen_ui_digest=ui_semantic_digest(envelope),owner_scope=owner,catalog_snapshot=catalog,
                     mode='root',original_text=envelope['comment_text'],model=self.model,budget=self.budget,
-                    scope_authorizer=authorized,should_stop=self.should_stop)
+                    scope_authorizer=authorized,should_stop=self.should_stop,followup_context=followup_context)
             if not authorized():raise SemanticPlanError('semantic_scope_unavailable')
             return self.resolver.resolve_verified_intent(envelope,receipt,preferred_binding_id=preferred_binding_id)
         except Exception as error:

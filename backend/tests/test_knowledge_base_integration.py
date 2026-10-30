@@ -6,7 +6,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from app.db.base import Base
-from app.models.entities import ChatSession, KnowledgeBase, KnowledgeBaseVideo, VideoCache
+from app.models.entities import ChatMessage, ChatSession, KnowledgeBase, KnowledgeBaseVideo, VideoCache
 from app.services import knowledge_service as knowledge_module
 from app.services import rag_service as rag_module
 
@@ -169,6 +169,25 @@ def test_history_keeps_the_original_library_when_continued(context):
     assert followup["session_id"] == result["session_id"]
     assert service.list_sessions(context.db)[0]["knowledge_base_id"] == context.first.id
     assert "CONTENT_second" not in str(context.prompts)
+
+
+def test_deleted_history_scope_is_retained_and_cannot_become_global(context):
+    history = ChatSession(title="合成删除前历史", knowledge_base_id=context.first.id)
+    context.db.add(history); context.db.flush()
+    context.db.add(ChatMessage(session_id=history.id, role="user", content="合成原有消息"))
+    context.db.commit()
+    knowledge_module.knowledge_base_service.delete(context.db, context.first.id)
+    context.db.commit()
+    rag = rag_module.RagService()
+    with pytest.raises(ValueError):
+        rag.answer(context.db, "继续合成问题", history.id, knowledge_base_id=context.first.id)
+    with pytest.raises(ValueError, match="另一个知识库"):
+        rag.answer(context.db, "不能切成全部资料", history.id, knowledge_base_id=None)
+    events = list(rag.answer_stream(context.db, "继续合成问题", history.id, knowledge_base_id=context.first.id))
+    assert [name for name, _ in events] == ["error"]
+    assert context.prompts == context.retrievals == []
+    assert rag.list_sessions(context.db)[0]["knowledge_base_id"] == context.first.id
+    assert rag.get_messages(context.db, history.id)[0]["content"] == "合成原有消息"
 
 
 def test_shared_video_deletion_removes_every_membership(context, monkeypatch, tmp_path):

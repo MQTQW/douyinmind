@@ -30,3 +30,23 @@ def ensure_chat_knowledge_base_column(engine: Engine) -> None:
         if "knowledge_base_id" not in columns:
             connection.execute(text("ALTER TABLE chat_sessions ADD COLUMN knowledge_base_id INTEGER REFERENCES knowledge_bases(id)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_chat_sessions_knowledge_base_id ON chat_sessions (knowledge_base_id)"))
+
+
+def ensure_knowledge_base_tombstones(engine: Engine) -> None:
+    """Retain library IDs and stop legacy writers assigning deleted scopes."""
+    with engine.begin() as connection:
+        inspector = inspect(connection)
+        tables = inspector.get_table_names()
+        if "knowledge_bases" not in tables:
+            return
+        columns = {column["name"] for column in inspector.get_columns("knowledge_bases")}
+        if "deleted_at" not in columns:
+            connection.execute(text("ALTER TABLE knowledge_bases ADD COLUMN deleted_at DATETIME"))
+        if connection.dialect.name != "sqlite" or "knowledge_base_videos" not in tables:
+            return
+        for operation, suffix in (("INSERT", "insert"), ("UPDATE OF knowledge_base_id", "update")):
+            connection.execute(text(f"""CREATE TRIGGER IF NOT EXISTS prevent_deleted_library_membership_{suffix}
+                BEFORE {operation} ON knowledge_base_videos
+                WHEN EXISTS (SELECT 1 FROM knowledge_bases
+                             WHERE id = NEW.knowledge_base_id AND deleted_at IS NOT NULL)
+                BEGIN SELECT RAISE(ABORT, 'knowledge_base_deleted'); END"""))

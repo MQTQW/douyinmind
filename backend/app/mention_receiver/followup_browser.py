@@ -15,7 +15,7 @@ from app.mention_agent.contracts import public_profile,canonical_json
 from app.mention_agent.followup_evidence import make_followup_envelope,validate_followup_envelope
 from .browser import ReceiverDetailError,ReceiverInterventionRequired,ReceiverPageError,REPLY_SEND_SELECTOR
 from .choice_browser import (CHOICE_THREAD_JS,CHOICE_EXPAND_HANDLE_JS,CHOICE_ROW_IDENTITY_JS,
-                             _choice_checkpoint,_choice_should_stop)
+                             _choice_checkpoint,_choice_should_stop,_readback_viewport)
 
 
 FOLLOWUP_HELPERS_JS=r"""
@@ -155,7 +155,9 @@ def _read(receiver,args):
     names={'original_root_count':'root_count','ask_count':'prior_reply_count','selection_count':'followup_candidate_count',
         'choice_sender_row_count':'sender_row_count','choice_receiver_target_row_count':'reply_to_B_count',
         'choice_body_candidate_count':'body_candidate_count','readback_more_count':'more_count',
-        'readback_unsupported_more_count':'unsupported_more_count','readback_loaded_row_count':'loaded_row_count'}
+        'readback_unsupported_more_count':'unsupported_more_count','readback_loaded_row_count':'loaded_row_count',
+        'detail_ok':'detail_ok','sender_match_count':'sender_match_count','command_match_count':'command_match_count',
+        'visible_comment_count':'visible_comment_count','video_id_count':'video_id_count'}
     safe={names[k]:v for k,v in counts.items() if k in names and type(v) is int and 0<=v<=1000000}
     _diagnostic(receiver,{'stage':'followup_dom_read','reason_code':_reason(value.get('reason_code','ok')) if isinstance(value,dict) else 'followup_structure_unknown',
         'counts':safe})
@@ -253,7 +255,8 @@ def _read_followup_reply(receiver,anchor,candidate,*,keep_open=True):
 
 def read_followup_reply(receiver,anchor,candidate,*,keep_open=True):
     try:
-        return _read_followup_reply(receiver,anchor,candidate,keep_open=keep_open)
+        with _readback_viewport(receiver):
+            return _read_followup_reply(receiver,anchor,candidate,keep_open=keep_open)
     except ReceiverInterventionRequired:
         value=getattr(receiver,'last_followup_diagnostic',{})
         value.update(reason_code='followup_intervention');_diagnostic(receiver,value)
@@ -290,6 +293,11 @@ def _target_args(target):
 
 
 def followup_reply_state(receiver,target,text):
+    with _readback_viewport(receiver):
+        return _followup_reply_state(receiver,target,text)
+
+
+def _followup_reply_state(receiver,target,text):
     from app.mention_agent.publisher import ReplyPreflightError
     _,_,args=_target_args(target);_choice_checkpoint(receiver)
     args.update(reply=text,identity_fresh=0<=time.monotonic()-getattr(receiver,'_reply_identity_checked_at',-10000)<=120,
@@ -301,6 +309,11 @@ def followup_reply_state(receiver,target,text):
 
 
 def prepare_followup_reply(receiver,target,text):
+    with _readback_viewport(receiver):
+        return _prepare_followup_reply(receiver,target,text)
+
+
+def _prepare_followup_reply(receiver,target,text):
     from app.mention_agent.publisher import ReplyPreflightError
     anchor,candidate,args=_target_args(target)
     detail=read_followup_reply(receiver,anchor,candidate,keep_open=True)

@@ -25,6 +25,7 @@ import unicodedata
 import uuid
 
 from app.mention_agent.contracts import Binding, public_profile
+from .reply_style import normalize_reply_prefix
 from app.storage_guard import (StorageGuardError, SqliteOwnershipError, guarded_sqlite_file,
                                assert_no_orphan_sqlite_files, verified_readonly_connection)
 
@@ -195,8 +196,12 @@ def read_local_catalog(database_path):
     try:
         with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
             db.execute("PRAGMA query_only=ON")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(knowledge_bases)")}
+            # Only pre-migration databases omit the predicate. SQL failures after
+            # the column exists must not retry an unfiltered legacy catalog.
+            live = " WHERE deleted_at IS NULL" if "deleted_at" in columns else ""
             return [{"id": row[0], "name": row[1]}
-                    for row in db.execute("SELECT id,name FROM knowledge_bases ORDER BY id")]
+                    for row in db.execute("SELECT id,name FROM knowledge_bases" + live + " ORDER BY id")]
     except sqlite3.Error:
         raise RegistryError("catalog_unavailable") from None
 
@@ -843,6 +848,10 @@ class Registry:
         for user in users:
             value = {key: user[key] for key in ("user_id", "label", "sender_profile_url", "receiver_profile_url",
                 "verification_status", "verification_method", "verified_by", "default_device_id", "version", "auth_revision")}
+            try:
+                value['reply_prefix'] = normalize_reply_prefix(metadata.get('reply_prefix:' + user['user_id'], ''))
+            except ValueError:
+                raise RegistryError('invalid_reply_prefix') from None
             value["active"] = bool(user["active"])
             value["devices"] = []
             for device in devices:
@@ -870,6 +879,38 @@ class Registry:
 
     def get_user(self, user_id):
         return next((item for item in self.snapshot(allow_unavailable_catalog=True)["users"] if item["user_id"] == user_id), None)
+
+    def get_reply_prefix(self, user_id):
+        user_id = _identity(user_id)
+        with self._db() as db:
+            self._required(db, 'assistant_users', 'user_id', user_id)
+            row = db.execute('SELECT value FROM registry_metadata WHERE key=?', ('reply_prefix:' + user_id,)).fetchone()
+            try:
+                return normalize_reply_prefix(row[0] if row else '')
+            except ValueError:
+                raise RegistryError('invalid_reply_prefix') from None
+
+    def set_reply_prefix(self, user_id, reply_prefix):
+        user_id = _identity(user_id)
+        try:
+            prefix = normalize_reply_prefix(reply_prefix)
+        except ValueError:
+            raise RegistryError('invalid_reply_prefix') from None
+        with self._db(write=True) as db:
+            user = self._required(db, 'assistant_users', 'user_id', user_id)
+            local = db.execute("SELECT value FROM registry_metadata WHERE key='local_instance_id'").fetchone()[0]
+            devices = [dict(row) for row in db.execute('SELECT * FROM assistant_devices WHERE user_id=?', (user_id,))]
+            owners = self._owner_rows(db)
+            eligible = any(device['instance_id'] == local and device['enabled'] and not device['revoked']
+                and device['verification_status'] == 'verified' and (
+                    db.execute('SELECT 1 FROM assistant_grants WHERE user_id=? AND device_id=? AND active=1 AND (can_query=1 OR can_import=1)',
+                        (user_id, device['device_id'])).fetchone() is not None
+                    or any(owner['user_id'] == user_id and owner['device_id'] == device['device_id'] and owner['active'] for owner in owners))
+                for device in devices)
+            if not user['active'] or user['verification_status'] != 'verified' or not eligible:
+                raise RegistryError('reply_prefix_local_binding_required')
+            db.execute('INSERT OR REPLACE INTO registry_metadata(key,value) VALUES(?,?)', ('reply_prefix:' + user_id, prefix))
+        return {'user_id': user_id, 'reply_prefix': prefix, 'applies_to': 'future_drafts_only'}
 
     def get_device(self, device_id):
         return next((device for user in self.snapshot(allow_unavailable_catalog=True)["users"] for device in user["devices"]

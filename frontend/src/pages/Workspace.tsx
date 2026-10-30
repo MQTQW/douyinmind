@@ -25,6 +25,8 @@ export default function Workspace({ onLogout, loggedIn }: Props) {
   const [conversationVersion, setConversationVersion] = useState(0);
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
   const [chatBusy, setChatBusy] = useState(false);
+  const [materialMutationBusy, setMaterialMutationBusy] = useState(false);
+  const interactionBusy = chatBusy || materialMutationBusy;
   const containerRef = useRef<HTMLDivElement>(null);
 
   const handleBuildDone = useCallback(() => setStatsRefreshKey(key => key + 1), []);
@@ -33,15 +35,15 @@ export default function Workspace({ onLogout, loggedIn }: Props) {
   useEffect(() => subscribePageReturn(handleBuildDone), [handleBuildDone]);
   const refreshHistory = useCallback(() => setHistoryRefreshKey(key => key + 1), []);
   const startNewChat = useCallback(() => {
-    if (chatBusy) return;
+    if (interactionBusy) return;
     setCurrentSession(null);
     setOpenedSessionId(null);
     setConversationVersion(version => version + 1);
     setShowSources(false);
     setView('chat');
-  }, [chatBusy]);
+  }, [interactionBusy]);
   const selectKnowledgeBase = useCallback((base: api.KnowledgeBaseItem | null) => {
-    if (chatBusy) return;
+    if (interactionBusy) return;
     if ((selectedKnowledgeBase?.id ?? null) !== (base?.id ?? null)) {
       setCurrentSession(null);
       setOpenedSessionId(null);
@@ -51,9 +53,9 @@ export default function Workspace({ onLogout, loggedIn }: Props) {
     setSelectedCollectionId('all');
     setView('chat');
     setShowSources(false);
-  }, [chatBusy, selectedKnowledgeBase?.id]);
+  }, [interactionBusy, selectedKnowledgeBase?.id]);
   const selectCollection = useCallback((id: string) => {
-    if (chatBusy) return;
+    if (interactionBusy) return;
     setSelectedKnowledgeBase(null);
     setSelectedCollectionId(id);
     setCurrentSession(null);
@@ -61,9 +63,9 @@ export default function Workspace({ onLogout, loggedIn }: Props) {
     setConversationVersion(version => version + 1);
     setView('chat');
     setShowSources(false);
-  }, [chatBusy]);
+  }, [interactionBusy]);
   const selectSession = useCallback((session: api.SessionItem, base: api.KnowledgeBaseItem | null = null) => {
-    if (chatBusy) return;
+    if (interactionBusy) return;
     if (currentSession?.id !== session.id) {
       setSelectedKnowledgeBase(base);
       setSelectedCollectionId('all');
@@ -73,7 +75,7 @@ export default function Workspace({ onLogout, loggedIn }: Props) {
     }
     setShowSources(false);
     setView('chat');
-  }, [chatBusy, currentSession?.id]);
+  }, [interactionBusy, currentSession?.id]);
   const sessionSaved = useCallback((id: number, title: string) => {
     setCurrentSession(previous => previous?.id === id ? previous : {id, title});
     refreshHistory();
@@ -86,6 +88,17 @@ export default function Workspace({ onLogout, loggedIn }: Props) {
     if (currentSession?.id === id) startNewChat();
     refreshHistory();
   }, [currentSession?.id, startNewChat, refreshHistory]);
+  const knowledgeBaseDeleted = useCallback((id: number) => {
+    if (selectedKnowledgeBase?.id === id) {
+      setSelectedKnowledgeBase(null);
+      setSelectedCollectionId('all');
+      setCurrentSession(null);
+      setOpenedSessionId(null);
+      setConversationVersion(version => version + 1);
+      setView('chat');
+    }
+    refreshHistory();
+  }, [selectedKnowledgeBase?.id, refreshHistory]);
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -161,11 +174,13 @@ export default function Workspace({ onLogout, loggedIn }: Props) {
             statsRefreshKey={statsRefreshKey}
             historyRefreshKey={historyRefreshKey}
             activeSessionId={currentSession?.id ?? null}
-            chatBusy={chatBusy}
+            chatBusy={interactionBusy}
             onSelectSession={selectSession}
             onNewChat={startNewChat}
             onSessionRenamed={sessionRenamed}
             onSessionDeleted={sessionDeleted}
+            onMutationBusyChange={setMaterialMutationBusy}
+            onKnowledgeBaseDeleted={knowledgeBaseDeleted}
             view={view} onChangeView={next => { setView(next); setShowSources(false); }} contentContainer={contentContainer} chatOnly={!loggedIn}
             onKnowledgeBaseUpdated={base => setSelectedKnowledgeBase(previous => previous?.id === base.id ? base : previous)}
           />
@@ -185,8 +200,8 @@ export default function Workspace({ onLogout, loggedIn }: Props) {
               {selectedKnowledgeBase && (view === 'chat' || view === 'materials') && <p className="mt-1 text-xs text-[var(--color-ink-muted)]">{selectedKnowledgeBase.video_count} 个视频 · {selectedKnowledgeBase.ready_count} 个可提问</p>}
             </div>
             {view !== 'assistant' && <div className="flex flex-wrap gap-2">
-              <button onClick={startNewChat} disabled={chatBusy} className="ui-button"><Plus size={16} />新对话</button>
-              {loggedIn && view !== 'collections' && <button onClick={() => setView('collections')} disabled={chatBusy} className="ui-button ui-button-primary"><Download size={16} />从收藏夹导入</button>}
+              <button onClick={startNewChat} disabled={interactionBusy} className="ui-button"><Plus size={16} />新对话</button>
+              {loggedIn && view !== 'collections' && <button onClick={() => setView('collections')} disabled={interactionBusy} className="ui-button ui-button-primary"><Download size={16} />从收藏夹导入</button>}
             </div>}
             {view === 'assistant' && <button className="text-button" onClick={() => setView('chat')}><ChevronLeft size={15} />返回知识库</button>}
           </div>
@@ -196,6 +211,7 @@ export default function Workspace({ onLogout, loggedIn }: Props) {
           </nav> : view === 'assistant' ? null : <div className="border-b border-[var(--color-border)] px-6 pb-3"><button className="text-button" onClick={() => setView('chat')}><ChevronLeft size={15} />返回知识库</button></div>}
           <div className={view === 'chat' ? 'flex-1 min-h-0' : 'hidden'}>
           <ChatPanel key={conversationVersion} collectionId={selectedKnowledgeBase ? 'all' : selectedCollectionId} statsRefreshKey={statsRefreshKey} chatOnly={!loggedIn}
+            interactionDisabled={materialMutationBusy}
             knowledgeBaseId={selectedKnowledgeBase?.id ?? null} knowledgeBaseName={selectedKnowledgeBase?.name ?? ''}
             openedSessionId={openedSessionId} sessionTitle={currentSession?.title ?? '新对话'}
             onSessionSaved={sessionSaved} onHistoryChanged={refreshHistory} onBusyChange={setChatBusy} onNewChat={startNewChat} />

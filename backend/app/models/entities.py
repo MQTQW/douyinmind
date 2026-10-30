@@ -201,6 +201,8 @@ class KnowledgeBase(Base):
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     # A normalized private key prevents names differing only by case or edge spaces.
     name_key: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
+    deleted_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)
+    """Tombstones reserve the original scope ID without deleting shared results/history."""
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()

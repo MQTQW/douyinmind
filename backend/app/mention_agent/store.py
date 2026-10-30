@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 
 from app.storage_guard import (guarded_sqlite_file, StorageGuardError,
     verified_readonly_connection, SqliteOwnershipError, assert_no_orphan_sqlite_files)
+from app.assistant.reply_style import normalize_reply_prefix, style_reply_text
 
 
 STEP_KINDS = frozenset({"model_request", "model_response", "tool_call", "tool_result", "decision", "error"})
@@ -47,10 +48,60 @@ _READBACK_FIELDS = frozenset({'outcome','exact_body_in_original_thread','verific
 _READBACK_COUNT_KEYS = frozenset({'matching_reply_count','existing_matching_reply_count',
     'strict_matching_reply_count','weak_matching_reply_count','verified_root_count',
     'verified_selection_count','selected_source_count'})
+_OPERATOR_QUERY_DRAFT_BRAND = object()
+_OPERATOR_QUERY_DRAFT_MAC = secrets.token_bytes(32)
+_OPERATOR_QUERY_DRAFT_PROOF_KEYS = frozenset({'operation','operator_reason','queue_task_id','queue_kind',
+    'run_id','current_pid','reviewed_at','authorization_current','fresh_ui_verified','fresh_ui_digest',
+    'evidence_sha_verified','reply_validated','budget_requests_settled','budget_snapshot_digest',
+    'reply_style_key','prefix_sha256'})
 
 
 class AgentStoreError(ValueError):
     """A fixed, non-sensitive state/validation error code."""
+
+
+def _operator_query_draft_proof(value):
+    if (type(value) is not dict or set(value) != _OPERATOR_QUERY_DRAFT_PROOF_KEYS
+            or value.get('operation') != 'operator_finalize_query_draft'
+            or value.get('operator_reason') != 'explicit_operator_grounded_first_reply'
+            or value.get('queue_kind') != 'query'
+            or any(type(value.get(key)) is not str or re.fullmatch(r'[a-f0-9]{32}',value[key]) is None
+                for key in ('queue_task_id','run_id'))
+            or type(value.get('current_pid')) is not int or value['current_pid'] <= 0
+            or type(value.get('reviewed_at')) not in (int,float) or not math.isfinite(value['reviewed_at'])
+            or value['reviewed_at'] <= 0
+            or any(value.get(key) is not True for key in ('authorization_current','fresh_ui_verified',
+                'evidence_sha_verified','reply_validated','budget_requests_settled'))
+            or any(type(value.get(key)) is not str or re.fullmatch(r'[a-f0-9]{64}',value[key]) is None
+                for key in ('fresh_ui_digest','budget_snapshot_digest','prefix_sha256'))
+            or type(value.get('reply_style_key')) is not str
+            or re.fullmatch(r'(?:assistant|agent):[a-f0-9]{32}',value['reply_style_key']) is None):
+        raise AgentStoreError('operator_query_draft_proof_required')
+    return json.loads(_public_json(value,8192))
+
+
+class _OperatorQueryDraftPermit:
+    """Owner-issued first-draft attestation, never a JSON/request flag."""
+    __slots__ = ('store','snapshot','proposal','proof','_seal')
+
+    def __init__(self,store,snapshot,proposal,proof,*,_brand=None):
+        if _brand is not _OPERATOR_QUERY_DRAFT_BRAND or type(snapshot) is not dict:
+            raise AgentStoreError('operator_query_draft_permit_required')
+        self.store = store
+        self.snapshot = json.loads(_public_json(snapshot,262144))
+        self.proposal = _proposal(proposal)
+        self.proof = _operator_query_draft_proof(proof)
+        self._seal = self._signature()
+
+    def _signature(self):
+        value = {'store':id(self.store),'snapshot':self.snapshot,'proposal':self.proposal,'proof':self.proof}
+        return hmac.new(_OPERATOR_QUERY_DRAFT_MAC,_public_json(value,393216).encode(),hashlib.sha256).digest()
+
+
+def _operator_query_draft_permit(store,snapshot,proposal,proof):
+    # Only the paused page owner may issue this after fresh authorization/UI,
+    # settled-budget, recorded-chunk SHA and full public-answer validation.
+    return _OperatorQueryDraftPermit(store,snapshot,proposal,proof,_brand=_OPERATOR_QUERY_DRAFT_BRAND)
 
 
 class _VerifiedReplyReadback(dict):
@@ -896,6 +947,216 @@ class AgentStore:
             return None, "stale_claim_token"
         return row, None
 
+    def _operator_query_draft_snapshot(self, db, task_id):
+        if type(task_id) is not str or re.fullmatch(r'[a-f0-9]{32}',task_id) is None:
+            raise AgentStoreError('operator_query_draft_not_eligible')
+        marker = 'operator_query_draft_v1:' + task_id
+        if db.execute('SELECT 1 FROM agent_meta WHERE key=?',(marker,)).fetchone():
+            raise AgentStoreError('operator_query_draft_already_used')
+        task = db.execute('SELECT * FROM agent_tasks WHERE task_id=?',(task_id,)).fetchone()
+        if (task is None or task['state'] != 'needs_review' or task['reason_code'] != 'model_round_budget_exceeded'
+                or type(task['attempts']) is not int or task['attempts'] < 1
+                or type(task['claim_token']) is not str or re.fullmatch(r'[a-f0-9]{48}',task['claim_token']) is None
+                or type(task['lease_until']) not in (int,float) or not math.isfinite(task['lease_until'])
+                or task['lease_until'] <= 0
+                or db.execute('SELECT 1 FROM agent_replies WHERE task_id=?',(task_id,)).fetchone()):
+            raise AgentStoreError('operator_query_draft_not_eligible')
+        for table in ('agent_task_ingestions','agent_query_retries','agent_reply_hold_releases',
+                      'agent_reply_revisions','agent_import_reply_updates'):
+            if (db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone()
+                    and db.execute('SELECT 1 FROM '+table+' WHERE task_id=?',(task_id,)).fetchone()):
+                raise AgentStoreError('operator_query_draft_prior_effect')
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_ingestion_events'").fetchone():
+            if db.execute("SELECT 1 FROM agent_ingestion_events WHERE json_extract(metadata,'$.task_id')=?",(task_id,)).fetchone():
+                raise AgentStoreError('operator_query_draft_prior_effect')
+        envelope = _envelope(json.loads(task['envelope']))
+        binding = _binding(self._binding_row(db,task['binding_id']))
+        immutable = {key:value for key,value in envelope.items() if key != 'evidence'}
+        if (binding['active'] is not True or binding['public_reply_allowed'] is not True
+                or any(binding[key] != envelope[key] for key in ('sender_profile_url','receiver_profile_url'))
+                or envelope['source_mode'] != 'live_ui'
+                or envelope['evidence'].get('source_kind') == 'library_choice_reply'
+                or hashlib.sha256(_public_json(immutable,16384).encode()).hexdigest() != task['immutable_hash']):
+            raise AgentStoreError('operator_query_draft_scope_changed')
+        _checked_followup(envelope,binding)
+        peers = self._reference_rows(db,task['binding_id'],envelope['reference_id'])
+        if len(peers) != 1 or peers[0]['task_id'] != task_id:
+            raise AgentStoreError('operator_query_draft_reference_ambiguous')
+        steps = db.execute('SELECT * FROM agent_steps WHERE task_id=? ORDER BY id LIMIT 1001',(task_id,)).fetchall()
+        if not steps or len(steps) > 1000:
+            raise AgentStoreError('operator_query_draft_steps_unconfirmed')
+        pending_model = pending_tool = None
+        completed, request_ids, refs, rejected = 0, [], {}, 0
+        allowed = {'list_knowledge_bases','query_knowledge_base','propose_reply'}
+        for step in steps:
+            meta = json.loads(step['metadata'])
+            if type(meta) is not dict or type(meta.get('round')) is not int or not 1 <= meta['round'] <= 6:
+                raise AgentStoreError('operator_query_draft_steps_unconfirmed')
+            kind = step['kind']
+            if kind == 'model_request':
+                request = meta.get('budget_request_id')
+                if (pending_model is not None or pending_tool is not None or meta['round'] != completed+1
+                        or type(request) is not str or re.fullmatch(r'live-[a-f0-9]{48}',request) is None
+                        or request in request_ids):
+                    raise AgentStoreError('operator_query_draft_request_unconfirmed')
+                pending_model = (meta['round'],request)
+                request_ids.append(request)
+            elif kind == 'model_response':
+                usage = meta.get('usage')
+                if (pending_model != (meta['round'],meta.get('budget_request_id'))
+                        or type(usage) is not dict or type(usage.get('total_tokens')) is not int
+                        or usage['total_tokens'] < 0
+                        or any(key in usage and (type(usage[key]) is not int or usage[key] < 0)
+                               for key in ('prompt_tokens','completion_tokens'))):
+                    raise AgentStoreError('operator_query_draft_request_unconfirmed')
+                completed += 1
+                pending_model = None
+            elif kind == 'tool_call':
+                if (pending_model is not None or pending_tool is not None or meta['round'] != completed
+                        or meta.get('tool_name') not in allowed):
+                    raise AgentStoreError('operator_query_draft_tool_unconfirmed')
+                pending_tool = (meta['round'],meta['tool_name'])
+            elif kind == 'tool_result':
+                name = meta.get('tool_name')
+                if pending_model is not None or pending_tool != (meta['round'],name):
+                    raise AgentStoreError('operator_query_draft_tool_unconfirmed')
+                pending_tool = None
+                if name == 'propose_reply':
+                    if meta.get('status') != 'error' or meta.get('code') != 'invalid_public_reply':
+                        raise AgentStoreError('operator_query_draft_prior_decision')
+                    rejected += 1
+                elif meta.get('status') != 'ok':
+                    raise AgentStoreError('operator_query_draft_tool_unconfirmed')
+                elif name == 'query_knowledge_base':
+                    evidence = meta.get('evidence_refs')
+                    if (type(evidence) is not list or not 1 <= len(evidence) <= 8
+                            or meta.get('knowledge_base_id') != binding['knowledge_base_id']
+                            or binding['knowledge_base_id'] is not None and type(meta.get('knowledge_base_id')) is not int):
+                        raise AgentStoreError('operator_query_draft_evidence_unconfirmed')
+                    for ref in evidence:
+                        if (type(ref) is not dict or set(ref) != {'source_id','platform_item_id','chunk_id','text_sha256'}
+                                or type(ref.get('source_id')) is not str or not ref['source_id'].strip() or len(ref['source_id']) > 128
+                                or type(ref.get('platform_item_id')) is not str or re.fullmatch(r'[0-9]{5,30}',ref['platform_item_id']) is None
+                                or type(ref.get('chunk_id')) is not str or not ref['chunk_id'].strip() or len(ref['chunk_id']) > 256
+                                or type(ref.get('text_sha256')) is not str or re.fullmatch(r'[a-f0-9]{64}',ref['text_sha256']) is None):
+                            raise AgentStoreError('operator_query_draft_evidence_unconfirmed')
+                        key = ref['source_id']
+                        if key in refs and refs[key] != ref:
+                            raise AgentStoreError('operator_query_draft_evidence_conflict')
+                        refs[key] = dict(ref)
+            else:
+                raise AgentStoreError('operator_query_draft_steps_unconfirmed')
+        last = json.loads(steps[-1]['metadata'])
+        if (pending_model is not None or pending_tool is not None or completed != len(request_ids)
+                or not 1 <= completed <= 6 or not refs or len(refs) > 64 or not rejected
+                or steps[-1]['kind'] != 'tool_result' or last.get('tool_name') != 'propose_reply'
+                or last.get('code') != 'invalid_public_reply'):
+            raise AgentStoreError('operator_query_draft_steps_unconfirmed')
+        observed = self.path.stat()
+        archived = dict(task)
+        archived['claim_fingerprint'] = hashlib.sha256(archived.pop('claim_token').encode()).hexdigest()
+        snapshot = {'version':1,'task_id':task_id,'store_identity':{'component':_COMPONENT,
+            'device':observed.st_dev,'inode':observed.st_ino},'task':archived,
+            'task_sha256':hashlib.sha256(_public_json(dict(task),65536).encode()).hexdigest(),
+            'steps_sha256':hashlib.sha256(_public_json([dict(step) for step in steps],5242880).encode()).hexdigest(),
+            'envelope':envelope,'binding':binding,'recorded_refs':list(refs.values()),
+            'budget_request_ids':request_ids,'completed_model_rounds':completed,
+            'agent_prefix':self._reply_prefix(db,'agent:'+task_id)}
+        return json.loads(_public_json(snapshot,262144))
+
+    def operator_query_draft_snapshot(self, task_id):
+        """Read eligibility without a write transaction, model or budget action."""
+        with self._file_lock():
+            self._guard()
+            before = self.path.stat()
+            with verified_readonly_connection(self.path,self._owned,guard=self._guard) as db:
+                db.row_factory = sqlite3.Row
+                db.execute('PRAGMA query_only=ON')
+                db.execute('BEGIN')
+                result = self._operator_query_draft_snapshot(db,task_id)
+            self._guard()
+            after = self.path.stat()
+            if (before.st_dev,before.st_ino) != (after.st_dev,after.st_ino):
+                raise AgentStoreError('operator_query_draft_store_changed')
+            return result
+
+    def _commit_operator_query_draft(self, permit):
+        """Create the FIRST ready answer only; never reclaim or rerun paid work."""
+        try:
+            valid = (type(permit) is _OperatorQueryDraftPermit and permit.store is self
+                and type(permit._seal) is bytes and hmac.compare_digest(permit._seal,permit._signature()))
+        except Exception:
+            valid = False
+        if not valid:
+            raise AgentStoreError('operator_query_draft_permit_required')
+        proof = _operator_query_draft_proof(permit.proof)
+        proposal = _proposal(permit.proposal)
+        if (proposal['kind'] != 'answer' or not 1 <= len(proposal['source_ids']) <= 8
+                or len(set(proposal['source_ids'])) != len(proposal['source_ids'])):
+            raise AgentStoreError('operator_query_draft_answer_required')
+        with self._tx() as db:
+            snapshot = self._operator_query_draft_snapshot(db,permit.snapshot.get('task_id'))
+            if snapshot != permit.snapshot:
+                raise AgentStoreError('operator_query_draft_snapshot_changed')
+            now = time.time()
+            if (proof['current_pid'] != os.getpid() or not -5 <= now-proof['reviewed_at'] <= 120
+                    or proof['reviewed_at'] < snapshot['task']['updated_at']-1):
+                raise AgentStoreError('operator_query_draft_review_expired')
+            task_id = snapshot['task_id']
+            if proof['reply_style_key'] not in {'assistant:'+proof['queue_task_id'],'agent:'+task_id}:
+                raise AgentStoreError('operator_query_draft_style_changed')
+            prefix = self._reply_prefix(db,proof['reply_style_key'])
+            if (prefix is None or hashlib.sha256(prefix.encode()).hexdigest() != proof['prefix_sha256']
+                    or snapshot['agent_prefix'] is not None and snapshot['agent_prefix'] != prefix):
+                raise AgentStoreError('operator_query_draft_style_changed')
+            recorded = {ref['source_id']:ref for ref in snapshot['recorded_refs']}
+            if (not set(proposal['source_ids']) <= recorded.keys()
+                    or len(proposal['sources']) != len(proposal['source_ids'])):
+                raise AgentStoreError('operator_query_draft_evidence_changed')
+            chosen = {}
+            for source in proposal['sources']:
+                key = source.get('source_id')
+                ref = recorded.get(key)
+                if (key in chosen or key not in proposal['source_ids'] or ref is None
+                        or source.get('platform_item_id') != ref['platform_item_id']
+                        or source.get('chunk_id') != ref['chunk_id']
+                        or 'text_sha256' in source and source['text_sha256'] != ref['text_sha256']
+                        or source.get('url') != 'https://www.douyin.com/video/'+ref['platform_item_id']
+                        or type(source.get('title')) is not str or not source['title'].strip() or len(source['title']) > 512):
+                    raise AgentStoreError('operator_query_draft_evidence_changed')
+                chosen[key] = source
+            if set(chosen) != set(proposal['source_ids']):
+                raise AgentStoreError('operator_query_draft_evidence_changed')
+            styled = self._styled_proposal(proposal,prefix)
+            if (len(styled['text']) > 320 or '@' in styled['text'] or re.search(r'https?://',styled['text'],re.I)
+                    or any(ord(char) < 32 and char not in '\n\t' for char in styled['text'])):
+                raise AgentStoreError('operator_query_draft_public_reply_invalid')
+            envelope, binding = snapshot['envelope'], snapshot['binding']
+            target = {key:value for key,value in envelope.items() if key != 'evidence'}
+            if _checked_followup(envelope,binding):
+                target['followup_evidence'] = envelope['evidence']
+            target.update(binding_id=binding['binding_id'],instance_id=binding['instance_id'],
+                knowledge_base_id=binding['knowledge_base_id'])
+            if binding.get('query_scope') == 'all_local':
+                target['query_scope'] = 'all_local'
+            reply_id = secrets.token_hex(16)
+            audit = {'version':1,'operation':'operator_authored_first_query_draft','maximum_requests':1,
+                'task_id':task_id,'reply_id':reply_id,'created_at':now,'snapshot':snapshot,'proof':proof,
+                'proposal_sha256':hashlib.sha256(_public_json(styled,65536).encode()).hexdigest(),
+                'provenance':'operator_authored_grounded_answer_not_recorded_model_draft',
+                'model_replayed':False,'query_replayed':False,'ingestion_submitted':False,'dispatchable':False}
+            db.execute('INSERT INTO agent_meta(key,value) VALUES(?,?)',
+                ('operator_query_draft_v1:'+task_id,_public_json(audit,393216)))
+            if snapshot['agent_prefix'] is None:
+                db.execute('INSERT INTO agent_meta(key,value) VALUES(?,?)',
+                    (self._reply_style_key('agent:'+task_id),prefix))
+            db.execute("INSERT INTO agent_replies(reply_id,task_id,proposal,target,state,created_at) VALUES(?,?,?,?,'ready',?)",
+                (reply_id,task_id,_public_json(styled,65536),_public_json(target,32768),now))
+            db.execute("UPDATE agent_tasks SET state='answer_ready',updated_at=? WHERE task_id=?",(now,task_id))
+            return {'task_id':task_id,'reply_id':reply_id,'status':'operator_query_draft_ready',
+                'state':'answer_ready','dispatchable':False,'audit_recorded':True}
+
+
     def record_step(self, task_id, claim_token, kind, metadata):
         if not isinstance(kind, str) or kind not in STEP_KINDS or not isinstance(metadata, dict):
             raise AgentStoreError("invalid_step")
@@ -907,17 +1168,68 @@ class AgentStore:
         if error:
             raise AgentStoreError(error)
 
-    def complete(self, task_id, claim_token, proposal):
+    @staticmethod
+    def _reply_style_key(key):
+        if type(key) is not str or re.fullmatch(r'(?:assistant|agent):[a-f0-9]{32,64}', key) is None:
+            raise AgentStoreError('invalid_reply_style_key')
+        return 'reply_prefix:' + key
+
+    @staticmethod
+    def _reply_prefix(db, key):
+        row = db.execute('SELECT value FROM agent_meta WHERE key=?', (AgentStore._reply_style_key(key),)).fetchone()
+        if row is None:
+            return None
+        try:
+            prefix = normalize_reply_prefix(row[0])
+            if prefix != row[0]:
+                raise ValueError('invalid_reply_prefix')
+            return prefix
+        except ValueError:
+            raise AgentStoreError('invalid_reply_style') from None
+
+    def reply_prefix(self, key):
+        with self._tx() as db:
+            return self._reply_prefix(db, key)
+
+    def freeze_reply_prefix(self, key, prefix):
+        try:
+            prefix = normalize_reply_prefix(prefix)
+        except ValueError:
+            raise AgentStoreError('invalid_reply_style') from None
+        with self._tx() as db:
+            current = self._reply_prefix(db, key)
+            if current is not None:
+                return current
+            db.execute('INSERT INTO agent_meta(key,value) VALUES(?,?)', (self._reply_style_key(key), prefix))
+            return prefix
+
+    @staticmethod
+    def _styled_proposal(proposal, prefix):
+        try:
+            return _proposal({**proposal, 'text': style_reply_text(proposal['text'], prefix, maximum=8000)})
+        except ValueError as error:
+            raise AgentStoreError('invalid_reply_style_text') from error
+
+    def complete(self, task_id, claim_token, proposal, *, reply_prefix=''):
         proposal = _proposal(proposal)
         with self._tx() as db:
             existing = db.execute("SELECT * FROM agent_replies WHERE task_id=?", (task_id,)).fetchone()
             task = db.execute("SELECT * FROM agent_tasks WHERE task_id=?", (task_id,)).fetchone()
             if existing:
-                if task["claim_token"] == claim_token and json.loads(existing["proposal"]) == proposal:
+                frozen_prefix = self._reply_prefix(db, 'agent:' + task_id) or ''
+                if task["claim_token"] == claim_token and json.loads(existing["proposal"]) == self._styled_proposal(proposal, frozen_prefix):
                     return self._reply(existing)
                 raise AgentStoreError("reply_conflict")
             task, error = self._checked_claim(db, task_id, claim_token)
             if error is None:
+                frozen_prefix = self._reply_prefix(db, 'agent:' + task_id)
+                if frozen_prefix is None:
+                    try:
+                        frozen_prefix = normalize_reply_prefix(reply_prefix)
+                    except ValueError:
+                        raise AgentStoreError('invalid_reply_style') from None
+                    db.execute('INSERT INTO agent_meta(key,value) VALUES(?,?)', (self._reply_style_key('agent:' + task_id), frozen_prefix))
+                proposal = self._styled_proposal(proposal, frozen_prefix)
                 envelope = json.loads(task["envelope"])
                 peers = self._reference_rows(db, task["binding_id"], _text(envelope["reference_id"], 512))
                 if self._reference_choice(db, peers)["task_id"] != task_id:
@@ -1405,6 +1717,7 @@ class AgentStore:
                     or previous["import_job_id"] != proposal["import_job_id"]):
                 raise AgentStoreError("import_proposal_job_mismatch")
             self._checked_import_proposal(db, task_id, proposal)
+            proposal = self._styled_proposal(proposal, self._reply_prefix(db, 'agent:' + task_id) or '')
             if previous == proposal:
                 return self._reply(reply)
             if previous["import_state"] in {"succeeded", "failed", "failed_no_submit", "needs_review"}:

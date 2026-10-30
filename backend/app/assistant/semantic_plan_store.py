@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -23,7 +24,7 @@ import uuid
 from app.storage_guard import (guarded_sqlite_file, verified_readonly_connection,
     assert_no_orphan_sqlite_files, StorageGuardError)
 from app.mention_agent.contracts import Binding, public_profile
-from .semantic_intent_model import INTENT_TOOLS, intent_messages, parse_intent_turn, SemanticIntentError
+from .semantic_intent_model import FOLLOWUP_CONTEXT, intent_tools, intent_messages, parse_intent_turn, SemanticIntentError
 from .usage_budget import UsageBudgetExceeded
 
 
@@ -38,6 +39,17 @@ _HEX = re.compile(r'[a-f0-9]{64}\Z', re.ASCII)
 _OWNER = {'user_id','device_id','instance_id','sender_profile_url','receiver_profile_url',
           'video_id','root_reference_id','reference_id'}
 _BRAND = object()
+_FOLLOWUP_CONTEXT_BRAND = object()
+
+
+class _VerifiedFollowupContext:
+    """In-process verified input; JSON flags are never this issuer-backed context."""
+    __slots__=('_store','_snapshot','_checkpoint','_stop','_seal')
+    def __init__(self,store,snapshot,checkpoint,stop,*,_brand=None):
+        if _brand is not _FOLLOWUP_CONTEXT_BRAND:raise SemanticPlanError('semantic_followup_context_required')
+        self._store,self._snapshot,self._checkpoint,self._stop=store,snapshot,checkpoint,stop
+        self._seal=store._seal_followup_context(self)
+
 _SCHEMA = {
     'semantic_meta': 'CREATE TABLE semantic_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)',
     'semantic_plans': '''CREATE TABLE semantic_plans(
@@ -176,6 +188,46 @@ def verify_semantic_decision(receipt,*,mode,original_text,grant_id=None,frozen_u
 
 
 class SemanticPlanStore:
+    def _seal_followup_context(self, context):
+        key=getattr(self,'_followup_context_key',None)
+        if key is None:
+            key=self._followup_context_key=os.urandom(32)
+        value=context._snapshot+':'+str(id(context._checkpoint))+':'+str(id(context._stop))
+        return hmac.new(key,value.encode('utf-8'),hashlib.sha256).digest()
+
+    def verified_followup_context(self,envelope,*,binding,owner_scope,source_checkpoint,should_stop):
+        from app.mention_agent.followup_evidence import validate_followup_envelope
+        try:
+            if not callable(source_checkpoint) or not callable(should_stop) or should_stop() is not False or source_checkpoint() is not True:
+                raise ValueError()
+            validated=validate_followup_envelope(deepcopy(envelope),binding)
+            if validated['source_mode']!='live_ui':raise ValueError()
+            snapshot=_dump({'envelope':validated,'binding':_binding_dict(binding),'owner':_owner(owner_scope)})
+            context=_VerifiedFollowupContext(self,snapshot,source_checkpoint,should_stop,_brand=_FOLLOWUP_CONTEXT_BRAND)
+            self._followup_context_value(context,ui_semantic_digest(validated),owner_scope,validated['comment_text'])
+            return context
+        except Exception:
+            raise SemanticPlanError('semantic_scope_unavailable') from None
+
+    def _followup_context_value(self,context,ui,owner,text):
+        from app.mention_agent.followup_evidence import validate_followup_envelope
+        if type(context) is not _VerifiedFollowupContext or context._store is not self:
+            raise SemanticPlanError('semantic_followup_context_required')
+        try:
+            if not hmac.compare_digest(context._seal,self._seal_followup_context(context)):raise ValueError()
+            value=json.loads(context._snapshot)
+            envelope=validate_followup_envelope(value['envelope'],Binding.from_dict(value['binding']))
+            actual=_owner(value['owner'])
+            if (actual!=_owner(owner) or ui_semantic_digest(envelope)!=ui or envelope['comment_text']!=text
+                    or any(actual[key]!=envelope[key] for key in ('sender_profile_url','receiver_profile_url','video_id','reference_id'))
+                    or actual['instance_id']!=envelope['evidence']['instance_id']
+                    or actual['root_reference_id']!=actual['reference_id']):raise ValueError()
+            observed=datetime.fromisoformat(envelope['evidence']['observed_at_utc'].replace('Z','+00:00')).timestamp()
+            if not -5<=self._now()-observed<=120 or context._stop() is not False or context._checkpoint() is not True:raise ValueError()
+        except Exception:
+            raise SemanticPlanError('semantic_scope_unavailable') from None
+        return {**FOLLOWUP_CONTEXT,'ui_digest':ui,'owner_scope':actual}
+
     def __init__(self,path,*,create=False,clock=None,protected_paths=()):
         self.path=Path(path).absolute();self._clock=clock or time.time
         self.marker=self.path.with_suffix(self.path.suffix+'.owner.json')
@@ -282,11 +334,20 @@ class SemanticPlanStore:
             db.execute('UPDATE semantic_plans SET state=?,reason_code=?,decision=?,usage=?,updated_at=? WHERE plan_id=?',
                 (state,reason,_dump(decision) if decision is not None else None,_dump(usage or {}),self._now(),plan_id))
 
-    def run_once(self,*,source_key,frozen_ui_digest,owner_scope,catalog_snapshot,mode,original_text,model,budget,scope_authorizer,should_stop,native_facts=None,budget_parent_receipt=None):
+    def run_once(self,*,source_key,frozen_ui_digest,owner_scope,catalog_snapshot,mode,original_text,model,budget,scope_authorizer,should_stop,native_facts=None,budget_parent_receipt=None,followup_context=None):
         source_key=_key(source_key);owner=_owner(owner_scope);catalog=_catalog(catalog_snapshot);text=_text(original_text)
         if type(frozen_ui_digest) is not str or not _HEX.fullmatch(frozen_ui_digest) or mode not in ('root','choice','native'):
             raise SemanticPlanError('semantic_input_invalid')
         if mode=='root' and owner['root_reference_id']!=owner['reference_id']:raise SemanticPlanError('semantic_owner_invalid')
+        context_value=None
+        if followup_context is not None:
+            if mode!='root':raise SemanticPlanError('semantic_followup_context_required')
+            context_value=self._followup_context_value(followup_context,frozen_ui_digest,owner,text)
+        prompt_context=deepcopy(FOLLOWUP_CONTEXT) if context_value is not None else None
+        def gate():
+            self._gate(scope_authorizer,should_stop)
+            if followup_context is not None:
+                self._followup_context_value(followup_context,frozen_ui_digest,owner,text)
         facts_digest=None;facts=None
         if mode=='native':
             from .native_semantic_inbox import validate_native_message,native_message_source_key,native_message_digest
@@ -307,10 +368,11 @@ class SemanticPlanStore:
                 raise SemanticPlanError('semantic_budget_parent_invalid')
             scope=parent['budget_scope_id']
         identity={'source':source_key,'ui':frozen_ui_digest,'owner':owner,'catalog':catalog,'mode':mode,'text':_normal(text)}
+        if context_value is not None:identity['followup_context']=context_value
         if parent is not None:identity['budget_parent']={'plan_id':parent['plan_id'],'budget_scope_id':scope}
         immutable=_digest(identity)
         pid='semantic-'+_digest(['semantic-plan-v1',source_key]);request='semantic-request-'+pid[9:]
-        self._gate(scope_authorizer,should_stop)
+        gate()
         token=uuid.uuid4().hex;now=self._now()
         with self._connection(write=True) as db:
             old=db.execute('SELECT * FROM semantic_plans WHERE source_key=?',(source_key,)).fetchone()
@@ -325,8 +387,8 @@ class SemanticPlanStore:
                 db.execute('INSERT INTO semantic_budget_parents VALUES(?,?,?,?)',(pid,parent['plan_id'],scope,now))
         reserved=False;known_usage={}
         try:
-            self._gate(scope_authorizer,should_stop)
-            messages=intent_messages(mode,text,catalog);tools=deepcopy(INTENT_TOOLS)
+            gate()
+            messages=intent_messages(mode,text,catalog,followup_context=prompt_context);tools=intent_tools(followup_context=prompt_context)
             estimate=len(_dump({'messages':messages,'tools':tools}).encode())+1500+2048
             try:
                 reservation=budget.reserve(scope,request,estimate)
@@ -335,7 +397,7 @@ class SemanticPlanStore:
                 raise SemanticPlanError('model_budget_exceeded') from None
             reserved=True
             if reservation.get('may_request') is not True:raise SemanticPlanError('semantic_plan_unconfirmed')
-            self._gate(scope_authorizer,should_stop)
+            gate()
             turn=model.complete(deepcopy(messages),deepcopy(tools))
             settled=budget.settle(request,turn.usage)
             if settled.get('state')!='settled':raise SemanticPlanError('model_budget_unknown')
@@ -343,11 +405,11 @@ class SemanticPlanStore:
             for output,key in (('prompt_tokens','input_tokens'),('completion_tokens','output_tokens')):
                 if settled.get(key) is not None:usage[output]=settled[key]
             known_usage=deepcopy(usage)
-            try:decision=parse_intent_turn(turn,catalog)
+            try:decision=parse_intent_turn(turn,catalog,followup_context=prompt_context)
             except SemanticIntentError:
                 self._finish(pid,token,'held','semantic_response_invalid',usage=usage)
                 raise SemanticPlanError('semantic_response_invalid') from None
-            self._gate(scope_authorizer,should_stop)
+            gate()
             self._finish(pid,token,'complete',decision=decision,usage=usage)
             return RecordedSemanticDecision(self,pid,immutable,_brand=_BRAND)
         except BaseException as error:
@@ -377,6 +439,16 @@ class SemanticPlanStore:
             'budget_scope_id':row['budget_scope_id'],'request_key':row['request_key'],**value,'usage':json.loads(row['usage']),
             'created_at':row['created_at'],'updated_at':row['updated_at'],
             'original_text_sha256':hashlib.sha256(_normal(row['original_text']).encode()).hexdigest()}
+        # This marker is derived from the persisted immutable identity minted
+        # through the private UI/checkpoint issuer, never a model or JSON flag.
+        # Older paid rows retain their original metadata and resolver behavior.
+        result.pop('followup_context',None)
+        if row['mode']=='root' and receipt._view=='origin':
+            identity={'source':row['source_key'],'ui':ui,'owner':owner,'catalog':catalog,
+                'mode':'root','text':_normal(row['original_text']),
+                'followup_context':{**FOLLOWUP_CONTEXT,'ui_digest':ui,'owner_scope':owner}}
+            if _digest(identity)==row['immutable_hash']:
+                result['followup_context']=deepcopy(FOLLOWUP_CONTEXT)
         if row['mode']=='native':result.update(origin_mode='native',native_facts_digest=row['native_facts_digest'],origin_owner_scope=json.loads(row['owner_scope']))
         return result
 

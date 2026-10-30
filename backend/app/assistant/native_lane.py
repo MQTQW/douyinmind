@@ -12,6 +12,8 @@ from contextlib import contextmanager
 from datetime import datetime
 import hashlib
 import json
+import math
+import os
 import re
 import sqlite3
 import threading
@@ -22,7 +24,7 @@ from app.mention_receiver.browser import (
 )
 from .choice_intent import parse_library_selection, selection_forms
 from .native_lifecycle import project_native_session_status
-from .native_source_store import NativeStoreError, _legacy_prequeue_permit
+from .native_source_store import NativeStoreError, _legacy_prequeue_permit, _FOLLOWUP_REVIEW_HOLD_CODES
 
 
 _ID = re.compile(r"[1-9][0-9]{0,29}", re.ASCII)
@@ -33,6 +35,27 @@ _LOGIN = frozenset({'session_expired', 'authorization_expired', 'session_invalid
     'session_existing_draft', 'session_draft_state_unknown', 'session_context_changed'})
 _ITEM_KEYS = frozenset({'binding', 'envelope', 'video_title', 'kind',
     'notice_fingerprint', 'user_id', 'device_id', 'authorization'})
+_NOFX_LOG_TABLES = frozenset({'assistant_events', 'agent_steps', 'observations', 'audit'})
+_NOFX_AUDIT_TABLES = frozenset({'semantic_plans', 'semantic_agent_links', 'semantic_ui_bindings',
+    'semantic_budget_parents', 'usage_budget_requests', 'usage_budget_events', 'messages',
+    'observations', 'audit', 'assistant_tasks', 'assistant_events', 'assistant_actions',
+    'agent_tasks', 'agent_replies', 'agent_steps', 'agent_bindings', 'agent_command_aliases',
+    'agent_task_ingestions', 'agent_ingestion_jobs'})
+_NOFX_AUDIT_SUBSTAGES = frozenset('read_' + name for name in _NOFX_AUDIT_TABLES) | frozenset({
+    'trusted_stores', 'source_time', 'semantic_records', 'semantic_links', 'budget_times',
+    'native_records', 'native_observation_links', 'queue_attribution', 'queue_history_links',
+    'agent_attribution', 'agent_history_links', 'agent_replies', 'agent_ingestions', 'witness_digest'})
+_NOFX_AUDIT_EXCEPTION_TYPES = frozenset({'NativeLaneError', 'NativeStoreError', 'SemanticPlanError',
+    'UsageBudgetError', 'NativeSemanticInboxError', 'StorageGuardError', 'SqliteOwnershipError',
+    'OperationalError', 'DatabaseError', 'ValueError', 'TypeError', 'KeyError', 'OverflowError',
+    'OSError', 'ReceiverPageError', 'ReceiverDetailError', 'ReceiverInterventionRequired'})
+_NATIVE_READ_STAGES = frozenset({'original_ui_lookup', 'choice_ui_read', 'followup_prepare'})
+_NATIVE_READ_CODES = frozenset({'native_read_checking', 'native_read_complete', 'native_read_no_result',
+    'native_read_page_unready', 'native_read_detail_unverified', 'native_read_intervention',
+    'native_read_unconfirmed', 'native_followup_no_resolution'})
+_NATIVE_READ_EXCEPTION_TYPES = frozenset({'ReceiverPageError', 'ReceiverDetailError',
+    'ReceiverInterventionRequired', 'NativeLaneError', 'TimeoutError', 'ValueError', 'TypeError', 'KeyError', 'local_error'})
+_NATIVE_READ_VIEWPORT_KEYS = ('configured', 'expanded', 'restored', 'restore_failed')
 
 
 class NativeLaneError(ReceiverPageError):
@@ -103,6 +126,7 @@ class NativeLane:
         self._pending = {}
         self._more = False
         self.last_native_issue_code = None
+        self.last_native_read_diagnostic = {}
         self.visibility_hint_store = None  # Explicit local factory opt-in only.
         self.semantic_intake_ready = None
         self.semantic_candidate_action = None
@@ -207,11 +231,61 @@ class NativeLane:
             except Exception:
                 raise ReceiverInterventionRequired('本机会话、验证或原草稿尚未核对，自动操作继续暂停') from None
 
+    def _native_read_diagnostic(self, stage, code, error=None, *, capture_viewport=False):
+        """Reporting only: no source transition, effect receipt or retry right."""
+        previous = self.last_native_read_diagnostic if isinstance(self.last_native_read_diagnostic, dict) else {}
+        raw = previous.get('viewport_counts', {})
+        if capture_viewport:
+            try:
+                raw = getattr(self.adapter, 'last_choice_readback_viewport_diagnostics', {})
+            except Exception:
+                raw = {}
+        raw = raw if isinstance(raw, dict) else {}
+        counts = {key: raw.get(key) if type(raw.get(key)) is int and 0 <= raw[key] <= 1 else 0
+            for key in _NATIVE_READ_VIEWPORT_KEYS}
+        kind = None
+        if error is not None:
+            for cls in (ReceiverInterventionRequired, ReceiverDetailError, NativeLaneError, ReceiverPageError,
+                        TimeoutError, ValueError, TypeError, KeyError):
+                if isinstance(error, cls):
+                    kind = cls.__name__
+                    break
+            kind = kind or 'local_error'
+        diagnostic = {'stage':stage if type(stage) is str and stage in _NATIVE_READ_STAGES else 'original_ui_lookup',
+            'code':code if type(code) is str and code in _NATIVE_READ_CODES else 'native_read_unconfirmed',
+            'exception_type':kind, 'viewport_counts':counts}
+        lookup_stage = previous.get('lookup_stage_index')
+        if capture_viewport:
+            try:
+                lookup = getattr(self.adapter, 'last_original_lookup', {})
+                lookup_stage = lookup.get('lookup_stage_index') if type(lookup) is dict else None
+            except Exception:
+                lookup_stage = None
+        if type(lookup_stage) is int and 0 <= lookup_stage <= 10:
+            diagnostic['lookup_stage_index'] = lookup_stage
+        self.last_native_read_diagnostic = diagnostic
+
     def _read_with_interruption_receipt(self, claim, stage, read):
         self._owner()
+        self.last_native_read_diagnostic = {}
+        self._native_read_diagnostic(stage, 'native_read_checking')
+        # A viewport-entry checkpoint can fail before the inner reader seeds its
+        # own diagnostics. Never inherit a previous inspect's matched evidence.
+        seed = {'stage':'followup_read_started','reason_code':'checking','counts':{}}
+        for key, value in (('last_followup_diagnostic', seed), ('last_followup_diagnostics', seed),
+                           ('last_original_lookup', {}), ('last_choice_readback_viewport_diagnostics',
+                            {name:0 for name in _NATIVE_READ_VIEWPORT_KEYS})):
+            try:
+                setattr(self.adapter, key, value)
+            except Exception:
+                pass  # Optional diagnostics never replace or prevent the READ.
         try:
-            return read()
+            result = read()
+            self._native_read_diagnostic(stage, 'native_read_no_result' if result is None else 'native_read_complete',
+                capture_viewport=True)
+            return result
         except ReceiverInterventionRequired as error:
+            self._native_read_diagnostic(stage, 'native_read_intervention', error, capture_viewport=True)
             try:
                 receipt = self.source_store.record_prequeue_intervention(claim['source_id'],claim['claim_token'],
                     run_id=self.run_id or 'native-owner',stage=stage)
@@ -221,6 +295,11 @@ class NativeLane:
                 # No proof means no generic prequeue resume is available.
                 self.last_native_issue_code = 'native_interruption_receipt_unavailable'
             raise
+        except Exception as error:
+            code = ('native_read_detail_unverified' if isinstance(error, ReceiverDetailError) else
+                    'native_read_page_unready' if isinstance(error, ReceiverPageError) else 'native_read_unconfirmed')
+            self._native_read_diagnostic(stage, code, error, capture_viewport=True)
+            raise  # Keep the original claim/exception/unknown-outcome behavior.
 
     def _recovery_identity(self):
         if not self._checkpoint():raise NativeLaneError('native_recovery_stopped')
@@ -276,7 +355,10 @@ class NativeLane:
             raise NativeLaneError('native_recovery_not_safe')
         self._recovery_identity()
         row = self.source_store.get_source(source_id)
-        if not isinstance(row, dict):
+        if (not isinstance(row, dict) or row.get('state') != 'held'
+                or row.get('hold_code') not in _FOLLOWUP_REVIEW_HOLD_CODES
+                or row.get('historical') is not False
+                or any(row.get(key) is not None for key in ('plan', 'task_id', 'reference_id'))):
             raise NativeLaneError('native_recovery_scope_unavailable')
         candidate = self._candidate(row.get('candidate'))
         if (candidate['source_kind'] != 'native_reply_notice_candidate'
@@ -308,7 +390,7 @@ class NativeLane:
         self._recovery_identity()
         before = self.source_store.get_source(source_id)
         if (not isinstance(before, dict) or before.get('state') != 'held'
-                or before.get('hold_code') != 'native_reply_parent_unresolved'
+                or before.get('hold_code') not in _FOLLOWUP_REVIEW_HOLD_CODES
                 or before.get('historical') is not False
                 or any(before.get(key) is not None for key in ('plan', 'task_id', 'reference_id'))):
             raise NativeLaneError('native_recovery_scope_unavailable')
@@ -325,6 +407,11 @@ class NativeLane:
 
         envelope = None
         read_started = False
+        bridge = getattr(self.followup_coordinator, 'bridge', None)
+        reset_anchor_diagnostic = getattr(bridge, 'reset_followup_anchor_diagnostic', None)
+        fresh_anchor_diagnostic = callable(reset_anchor_diagnostic)
+        if fresh_anchor_diagnostic:
+            reset_anchor_diagnostic()
         def read_current(anchor, observed):
             nonlocal read_started
             read_started = True
@@ -341,6 +428,17 @@ class NativeLane:
             raise NativeLaneError('native_recovery_scope_unavailable')
         self.last_native_recovery_diagnostic = {'stage': 'followup_inspect_complete',
             'code': failure or 'followup_original_matched'}
+        if not read_started and failure == 'native_reply_parent_unresolved' and fresh_anchor_diagnostic:
+            from .legacy_bridge import _FOLLOWUP_ANCHOR_REASONS, _FOLLOWUP_ANCHOR_COUNT_KEYS
+            anchor_diagnostic = getattr(bridge, 'last_followup_anchor_diagnostic', None)
+            anchor_diagnostic = anchor_diagnostic if isinstance(anchor_diagnostic, dict) else {}
+            reason = anchor_diagnostic.get('code')
+            self.last_native_recovery_diagnostic['code'] = (reason if type(reason) is str and reason in _FOLLOWUP_ANCHOR_REASONS
+                else 'followup_anchor_not_checked')
+            counts = anchor_diagnostic.get('counts')
+            if isinstance(counts, dict):
+                self.last_native_recovery_diagnostic['anchor_counts'] = {key: value for key, value in counts.items()
+                    if key in _FOLLOWUP_ANCHOR_COUNT_KEYS and type(value) is int and 0 <= value <= 1000000}
         detail = getattr(self.adapter, 'last_followup_diagnostic', {}) if read_started else {}
         if isinstance(detail, dict):
             reason = detail.get('reason_code')
@@ -354,7 +452,8 @@ class NativeLane:
                     'choice_receiver_target_row_count', 'body_candidate_count', 'readback_more_count',
                     'readback_unsupported_more_count', 'readback_loaded_row_count', 'root_count',
                     'prior_reply_count', 'followup_candidate_count', 'sender_row_count', 'reply_to_B_count',
-                    'more_count', 'unsupported_more_count', 'loaded_row_count'}
+                    'more_count', 'unsupported_more_count', 'loaded_row_count', 'detail_ok',
+                    'sender_match_count', 'command_match_count', 'visible_comment_count', 'video_id_count'}
                 self.last_native_recovery_diagnostic['followup_counts'] = {key: value for key, value in counts.items()
                     if key in keys and type(value) is int and 0 <= value <= 1000000}
         lookup = getattr(self.adapter, 'last_original_lookup', {}) if read_started else {}
@@ -880,6 +979,427 @@ class NativeLane:
                         'ReplyPreflightError','TimeoutError'} else 'local_error'}
                 raise NativeLaneError('native_recovery_effects_unknown') from None
 
+    def _followup_no_effects_scope(self):
+        """Current owner scheduling facts, via an existing owned RO connection."""
+        from .legacy_bridge import _followup_owned_ro
+        self._owner()
+        with _followup_owned_ro(self.queue) as db:
+            row = db.execute("SELECT value FROM assistant_meta WHERE key='control'").fetchone()
+            state = json.loads(row[0]) if row else {}
+            busy = db.execute("SELECT COUNT(*) FROM assistant_tasks WHERE state IN "
+                "('queued','waiting_desktop','executing','waiting_ingestion','ready_to_publish','publishing',"
+                "'waiting_external','waiting_library','needs_reconcile')").fetchone()[0]
+        manual = state.get('manual_verification')
+        if (self.run_id is None or state.get('run_id') != self.run_id
+                or state.get('pid') != os.getpid() or state.get('process_alive') is False
+                or state.get('state') != 'paused' or state.get('desired_state') != 'paused'
+                or state.get('worker_state') != 'idle' or type(manual) is not dict
+                or manual.get('active') is not False or busy or self._pending
+                or self.browser_lane.pending or not self._checkpoint()):
+            raise NativeLaneError('native_recovery_not_safe')
+        return True
+
+    def _followup_no_effects_audit(self, candidate, snapshot, anchor, fresh_envelope=None):
+        """Fail-closed whole-ledger audit; never use executable-only getters."""
+        def substage(value):
+            self._followup_no_effects_audit_stage = value
+        substage('trusted_stores')
+        from .legacy_bridge import _followup_owned_ro
+        from .semantic_routing import SemanticIntentInterpreter
+        from .semantic_plan_store import (SemanticPlanStore, _owner as semantic_owner,
+            _text as semantic_text, _key as semantic_key, _catalog as semantic_catalog)
+        from .usage_budget import UsageBudget
+        from .native_semantic_inbox import (NativeSemanticInbox, validate_native_message,
+            native_message_source_key, native_message_digest)
+        from app.mention_agent.store import AgentStore
+        provider = getattr(self.browser_lane, 'semantic_resolution_provider', None)
+        bridge = self.followup_coordinator.bridge
+        if (type(provider) is not SemanticIntentInterpreter or type(provider.store) is not SemanticPlanStore
+                or type(provider.budget) is not UsageBudget or provider.store is not bridge.semantic_store
+                or provider.budget is not bridge.usage_budget or type(bridge.agent) is not AgentStore):
+            raise NativeLaneError('native_recovery_effects_unknown')
+        substage('source_time')
+        since = snapshot.get('first_seen')
+        audit_now = self.source_store._clock()
+        if (type(since) not in (int, float) or not math.isfinite(since) or since <= 0
+                or type(audit_now) not in (int, float) or not math.isfinite(audit_now)
+                or since > audit_now + 5):
+            raise NativeLaneError('native_recovery_effects_unknown')
+        refs = {fresh_envelope['reference_id']} if fresh_envelope else set()
+        scope = ('sender_profile_url', 'receiver_profile_url', 'video_id')
+        witness = {'store_identity': {}}
+        def identity(name, store):
+            observed = store.path.stat()
+            witness['store_identity'][name] = [observed.st_dev, observed.st_ino]
+        def rows(db, table):
+            if table not in _NOFX_AUDIT_TABLES:
+                raise NativeLaneError('native_recovery_effects_unknown')
+            substage('read_' + table)
+            if table in _NOFX_LOG_TABLES:
+                cursor = db.execute('SELECT * FROM '+table+' ORDER BY rowid')
+                value = []
+                while True:
+                    batch = cursor.fetchmany(500)
+                    if not batch:
+                        break
+                    value.extend(dict(row) for row in batch)
+                    # A refusal fence, never evidence that a truncated history is empty.
+                    if len(value) >= 50000:
+                        raise NativeLaneError('native_recovery_effects_unknown')
+            else:
+                value = [dict(row) for row in db.execute('SELECT * FROM '+table+' ORDER BY rowid LIMIT 1001')]
+                if len(value) > 1000:
+                    raise NativeLaneError('native_recovery_effects_unknown')
+            return value
+        def same_scope(value):
+            if (type(value) is not dict
+                    or any(type(value.get(k)) is not str or public_profile(value[k]) != value[k]
+                        for k in ('sender_profile_url', 'receiver_profile_url'))
+                    or value['sender_profile_url'] == value['receiver_profile_url']
+                    or type(value.get('video_id')) is not str or not re.fullmatch(r'[0-9]{5,30}', value['video_id'])):
+                raise NativeLaneError('native_recovery_effects_unknown')
+            return all(value[k] == candidate[k] for k in scope)
+        core = ('command_id', 'reference_id', 'reference_quality', 'native_comment_id',
+            'sender_profile_url', 'receiver_profile_url', 'video_id', 'comment_text', 'source_mode')
+        def checked_envelope(value):
+            same_scope(value)  # Validate attribution even when it is another actor/video.
+            if (not set(core) <= value.keys() or type(value.get('evidence')) is not dict
+                    or value['source_mode'] not in {'live_ui', 'isolated', 'replay'}
+                    or value['reference_quality'] not in {'native', 'verified_ui'}
+                    or any(type(value[k]) is not str or not value[k].strip() or len(value[k]) > 512
+                        or any(ord(ch) < 32 for ch in value[k]) for k in ('command_id', 'reference_id'))
+                    or type(value['comment_text']) is not str or not value['comment_text'].strip()
+                    or len(value['comment_text']) > 4000
+                    or any(ord(ch) < 32 and ch not in '\r\n\t' for ch in value['comment_text'])
+                    or value['native_comment_id'] is not None and (type(value['native_comment_id']) is not str
+                        or not re.fullmatch(r'[1-9][0-9]{4,29}', value['native_comment_id']))
+                    or value['reference_quality'] == 'native' and value['native_comment_id'] is None):
+                raise NativeLaneError('native_recovery_effects_unknown')
+            proof = value['evidence']
+            if proof.get('source_kind') not in (None, 'library_choice_reply', 'conversation_followup'):
+                raise NativeLaneError('native_recovery_effects_unknown')
+            return value
+        def overlaps(env):
+            env = checked_envelope(env)
+            proof = env['evidence']
+            return (env['native_comment_id'] == candidate['native_comment_id'] or env['reference_id'] in refs
+                or same_scope(env) and (_normal(env['comment_text']) == _normal(candidate['content'])
+                or proof.get('root_reference_id') == anchor['root_envelope']['reference_id'])
+            )
+        def reject():
+            raise NativeLaneError('native_recovery_effects_present')
+        with provider.store._connection() as db:
+            identity('semantic', provider.store)
+            semantic_tables = {name: rows(db, name) for name in ('semantic_plans', 'semantic_agent_links',
+                'semantic_ui_bindings', 'semantic_budget_parents')}
+        substage('semantic_records')
+        plans = {row['plan_id']: row for row in semantic_tables['semantic_plans']}
+        for row in plans.values():
+            if row['source_key'] == snapshot['source_id']:
+                reject()
+            owner = semantic_owner(json.loads(row['owner_scope']))
+            text = semantic_text(row['original_text'])
+            semantic_key(row['source_key']); semantic_key(row['budget_scope_id']); semantic_key(row['request_key'])
+            semantic_catalog(json.loads(row['catalog']))
+            if (row['mode'] not in {'root', 'choice', 'native'}
+                    or row['state'] not in {'reserved', 'unknown', 'held', 'budget_blocked', 'complete'}
+                    or type(row['ui_digest']) is not str or not re.fullmatch(r'[a-f0-9]{64}', row['ui_digest'])):
+                raise NativeLaneError('native_recovery_effects_unknown')
+            if row['mode'] == 'root' and owner['root_reference_id'] != owner['reference_id']:
+                raise NativeLaneError('native_recovery_effects_unknown')
+            if same_scope(owner) and (_normal(text) == _normal(candidate['content'])
+                    or owner['reference_id'] in refs):
+                reject()
+            if row.get('native_facts') is not None:
+                facts = validate_native_message(json.loads(row['native_facts']))
+                if (row['mode'] != 'native' or native_message_source_key(facts) != row['source_key']
+                        or native_message_digest(facts) != row['native_facts_digest']
+                        or any(owner[key] != facts[key] for key in scope) or text != facts['content']
+                        or owner['reference_id'] != row['source_key'] or owner['root_reference_id'] != row['source_key']):
+                    raise NativeLaneError('native_recovery_effects_unknown')
+                if facts['native_comment_id'] == candidate['native_comment_id'] or same_scope(facts) and _normal(facts['content']) == _normal(candidate['content']):
+                    reject()
+            elif row['mode'] == 'native' or row['native_facts_digest'] is not None:
+                raise NativeLaneError('native_recovery_effects_unknown')
+        substage('semantic_links')
+        for name in ('semantic_agent_links', 'semantic_ui_bindings', 'semantic_budget_parents'):
+            for row in semantic_tables[name]:
+                if row['plan_id'] not in plans or name == 'semantic_budget_parents' and row['parent_plan_id'] not in plans:
+                    raise NativeLaneError('native_recovery_effects_unknown')
+                if 'budget_scope_id' in row and row['budget_scope_id'] != plans[row['plan_id']]['budget_scope_id']:
+                    raise NativeLaneError('native_recovery_effects_unknown')
+                if name == 'semantic_budget_parents' and row['budget_scope_id'] != plans[row['parent_plan_id']]['budget_scope_id']:
+                    raise NativeLaneError('native_recovery_effects_unknown')
+                if name == 'semantic_ui_bindings':
+                    owner = semantic_owner(json.loads(row['owner_scope']))
+                    if same_scope(owner) and owner['reference_id'] in refs:
+                        reject()
+        witness['semantic'] = semantic_tables
+        with provider.budget._db() as db:
+            identity('budget', provider.budget)
+            budget_tables = {name: rows(db, name) for name in ('usage_budget_requests', 'usage_budget_events')}
+        substage('budget_times')
+        def epoch(value):
+            if type(value) is not str:
+                raise NativeLaneError('native_recovery_effects_unknown')
+            parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            if parsed.tzinfo is None:
+                raise NativeLaneError('native_recovery_effects_unknown')
+            value = parsed.timestamp()
+            if not math.isfinite(value) or value <= 0 or value > audit_now + 5:
+                raise NativeLaneError('native_recovery_effects_unknown')
+            return value
+        for row in budget_tables['usage_budget_requests']:
+            if max(epoch(row['admitted_at_utc']), epoch(row['updated_at_utc'])) >= since:
+                reject()
+        for row in budget_tables['usage_budget_events']:
+            if epoch(row['occurred_at_utc']) >= since:
+                reject()
+        witness['budget'] = budget_tables
+        inbox = provider.native_inbox
+        if inbox is not None:
+            if type(inbox) is not NativeSemanticInbox:
+                raise NativeLaneError('native_recovery_effects_unknown')
+            if inbox.receiver_uid != candidate['recipient_uid'] or inbox.receiver_profile_url != candidate['receiver_profile_url']:
+                raise NativeLaneError('native_recovery_effects_unknown')
+            with inbox._connection() as db:
+                identity('native_meaning', inbox)
+                native_tables = {name: rows(db, name) for name in ('messages', 'observations', 'audit')}
+            substage('native_records')
+            for row in native_tables['messages']:
+                facts = validate_native_message(json.loads(row['message']))
+                if (native_message_source_key(facts) != row['source_key']
+                        or native_message_digest(facts) != row['immutable_hash']):
+                    raise NativeLaneError('native_recovery_effects_unknown')
+                if (row['source_key'] == snapshot['source_id'] or facts['native_comment_id'] == candidate['native_comment_id']
+                        or same_scope(facts) and _normal(facts['content']) == _normal(candidate['content'])):
+                    reject()
+            substage('native_observation_links')
+            message_keys = {row['source_key'] for row in native_tables['messages']}
+            for row in native_tables['observations']:
+                if row['source_key'] not in message_keys:
+                    raise NativeLaneError('native_recovery_effects_unknown')
+                if row['source_key'] == snapshot['source_id'] or row['notice_id'] == candidate['native_notice_id']:
+                    reject()
+            witness['native_meaning'] = native_tables
+        with _followup_owned_ro(self.queue) as db:
+            identity('queue', self.queue)
+            tasks = rows(db, 'assistant_tasks')
+            queue_events = rows(db, 'assistant_events')
+            actions = rows(db, 'assistant_actions')
+        substage('queue_attribution')
+        allowed = {}
+        for row in tasks:
+            task = self.queue._raw(row)
+            checked_envelope(task['envelope'])
+            historical = Binding.from_dict(task['binding'])
+            if (task['binding_id'] != historical.binding_id
+                    or historical.sender_profile_url != task['envelope']['sender_profile_url']
+                    or historical.receiver_profile_url != task['envelope']['receiver_profile_url']):
+                raise NativeLaneError('native_recovery_effects_unknown')
+            if row['id'] == anchor['root_task_id']:
+                if (task['state'] != 'b_view_visible' or task['agent_task_id'] != anchor['root_agent_task_id']
+                        or not same_scope(task['envelope'])):
+                    raise NativeLaneError('native_recovery_effects_unknown')
+                allowed[task['agent_task_id']] = task
+            elif _identity(task['envelope']) == _identity(anchor['root_envelope']):
+                if task['kind'] != 'clarify' or not task.get('agent_task_id'):
+                    raise NativeLaneError('native_recovery_effects_unknown')
+                allowed[task['agent_task_id']] = task
+            elif overlaps(task['envelope']):
+                reject()
+        if anchor['root_agent_task_id'] not in allowed:
+            raise NativeLaneError('native_recovery_effects_unknown')
+        substage('queue_history_links')
+        task_ids = {row['id'] for row in tasks}
+        if any(row['task_id'] not in task_ids for row in queue_events + actions):
+            raise NativeLaneError('native_recovery_effects_unknown')
+        witness['queue'] = {'tasks': tasks, 'events': queue_events, 'actions': actions}
+        with _followup_owned_ro(bridge.agent) as db:
+            identity('agent', bridge.agent)
+            agents, replies, steps = rows(db, 'agent_tasks'), rows(db, 'agent_replies'), rows(db, 'agent_steps')
+            bindings = rows(db, 'agent_bindings')
+            extra = {}
+            names = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            for name in ('agent_command_aliases', 'agent_task_ingestions', 'agent_ingestion_jobs'):
+                if name in names:
+                    extra[name] = rows(db, name)
+        substage('agent_attribution')
+        seen_allowed = set()
+        all_agent_ids = {row['task_id'] for row in agents}
+        if any(row['agent_task_id'] not in all_agent_ids for row in semantic_tables['semantic_agent_links']):
+            raise NativeLaneError('native_recovery_effects_unknown')
+        historical_bindings = {row['binding_id']: Binding.from_dict(json.loads(row['payload'])) for row in bindings}
+        agent_envelopes = {}
+        agent_scopes = {}
+        for row in agents:
+            env = checked_envelope(json.loads(row['envelope']))
+            bound = historical_bindings.get(row['binding_id'])
+            if (bound is None or bound.sender_profile_url != env['sender_profile_url']
+                    or bound.receiver_profile_url != env['receiver_profile_url']):
+                raise NativeLaneError('native_recovery_effects_unknown')
+            agent_envelopes[row['task_id']] = env
+            agent_scopes[row['task_id']] = bound
+            if row['task_id'] in allowed:
+                task = allowed[row['task_id']]
+                if row['binding_id'] != task['binding_id'] or _identity(env) != _identity(task['envelope']):
+                    raise NativeLaneError('native_recovery_effects_unknown')
+                seen_allowed.add(row['task_id'])
+            elif overlaps(env):
+                reject()
+        substage('agent_history_links')
+        if seen_allowed != set(allowed) or any(row['task_id'] not in all_agent_ids for row in replies + steps):
+            raise NativeLaneError('native_recovery_effects_unknown')
+        substage('agent_replies')
+        for row in replies:
+            target = json.loads(row['target'])
+            if type(target) is not dict:
+                raise NativeLaneError('native_recovery_effects_unknown')
+            linked = agent_envelopes[row['task_id']]
+            proof = linked['evidence']
+            bound = agent_scopes[row['task_id']]
+            frozen_target = {key: linked[key] for key in core}
+            frozen_target.update(binding_id=bound.binding_id, instance_id=bound.instance_id,
+                knowledge_base_id=bound.knowledge_base_id)
+            if bound.is_all_local:
+                frozen_target['query_scope'] = 'all_local'
+            if proof.get('source_kind') == 'conversation_followup':
+                frozen_target['followup_evidence'] = proof
+            elif proof.get('source_kind') == 'library_choice_reply':
+                frozen_target['choice_evidence'] = proof
+            if target != frozen_target:
+                raise NativeLaneError('native_recovery_effects_unknown')
+            target_proof = (target.get('followup_evidence') if proof.get('source_kind') == 'conversation_followup'
+                else target.get('choice_evidence') if proof.get('source_kind') == 'library_choice_reply' else proof)
+            attributed = {key: target.get(key) for key in core}
+            attributed['evidence'] = target_proof
+            checked_envelope(attributed)
+            if (any(attributed[key] != linked[key] for key in core)
+                    or _identity(attributed) != _identity(linked)
+                    or proof.get('source_kind') is None and any(key in target for key in ('choice_evidence', 'followup_evidence'))):
+                raise NativeLaneError('native_recovery_effects_unknown')
+            if row['task_id'] not in allowed:
+                if overlaps(attributed):
+                    reject()
+                continue
+            task = allowed[row['task_id']]
+            proposal, evidence = json.loads(row['proposal']), json.loads(row['evidence'] or '{}')
+            expected = {k: v for k, v in task['envelope'].items() if k != 'evidence'}
+            binding = Binding.from_dict(task['binding'])
+            expected.update(binding_id=binding.binding_id, instance_id=binding.instance_id, knowledge_base_id=binding.knowledge_base_id)
+            if binding.is_all_local:
+                expected['query_scope'] = 'all_local'
+            proof = task['envelope']['evidence']
+            if proof.get('source_kind') == 'library_choice_reply':
+                expected['choice_evidence'] = proof
+            elif proof.get('source_kind') == 'conversation_followup':
+                expected['followup_evidence'] = proof
+            if (row['state'] != 'b_view_visible' or type(row['send_token']) is not str
+                    or not re.fullmatch(r'[a-f0-9]{48}', row['send_token']) or target != expected
+                    or evidence.get('submit_gate_passed') is not True
+                    or evidence.get('exact_body_in_original_thread') is not True
+                    or evidence.get('reply_sha256') != hashlib.sha256(proposal['text'].encode()).hexdigest()):
+                raise NativeLaneError('native_recovery_effects_unknown')
+            if row['task_id'] == anchor['root_agent_task_id']:
+                if proposal.get('kind') not in {'answer', 'import_status'} or proposal.get('text') != anchor['prior_reply_text']:
+                    raise NativeLaneError('native_recovery_effects_unknown')
+            else:
+                session = self.choice_controller.store.get_for_root_task(task['id']) if self.choice_controller else None
+                if (not session or session.get('state') != 'handed_off'
+                        or session.get('child_task_id') != anchor['root_task_id']
+                        or proposal.get('kind') != 'clarification' or proposal.get('text') != session.get('ask_text')):
+                    raise NativeLaneError('native_recovery_effects_unknown')
+        if {row['task_id'] for row in replies if row['task_id'] in allowed} != set(allowed):
+            raise NativeLaneError('native_recovery_effects_unknown')
+        substage('agent_ingestions')
+        links = extra.get('agent_task_ingestions', [])
+        for job in extra.get('agent_ingestion_jobs', []):
+            if job.get('video_id') == candidate['video_id']:
+                linked = [row for row in links if row['job_id'] == job['job_id']]
+                if not linked or any(row['task_id'] not in allowed for row in linked):
+                    raise NativeLaneError('native_recovery_effects_unknown')
+        if any(row['task_id'] not in all_agent_ids for row in extra.get('agent_command_aliases', []) + links):
+            raise NativeLaneError('native_recovery_effects_unknown')
+        witness['agent'] = {'tasks': agents, 'bindings': bindings, 'replies': replies, 'steps': steps, **extra}
+        substage('witness_digest')
+        return hashlib.sha256(canonical_json(witness).encode()).hexdigest()
+
+    def review_no_effects_followup(self, source_id):
+        """One explicit audited READ recovery; not a historical interruption receipt."""
+        from .native_source_store import _followup_no_effects_permit
+        from .semantic_plan_store import ui_semantic_digest
+        self._owner()
+        stage = 'followup_nofx_scope'
+        self.last_native_recovery_diagnostic = {'stage': stage, 'code': 'checking'}
+        bridge = getattr(self.followup_coordinator, 'bridge', None)
+        lock = getattr(bridge, 'admission_lock', None)
+        def failure_diagnostic(error, code):
+            current_stage = stage
+            substage = getattr(self, '_followup_no_effects_audit_stage', None)
+            if (stage in {'followup_nofx_audit_before', 'followup_nofx_audit_after'}
+                    and type(substage) is str and substage in _NOFX_AUDIT_SUBSTAGES):
+                current_stage = stage + '_' + substage
+            kind = type(error).__name__
+            self.last_native_recovery_diagnostic = {'stage': current_stage, 'code': code,
+                'exception_type': kind if kind in _NOFX_AUDIT_EXCEPTION_TYPES else 'local_error'}
+        if self.followup_coordinator is None or lock is None:
+            raise NativeLaneError('native_recovery_scope_unavailable')
+        try:
+            with lock:
+                self._followup_no_effects_scope()
+                self._recovery_identity()
+                snapshot = self.source_store.followup_no_effects_review_snapshot(source_id)
+                candidate = self._candidate(snapshot['candidate'])
+                if (candidate['source_kind'] != 'native_reply_notice_candidate'
+                        or not self._visibility_scope_current(candidate)):
+                    raise NativeLaneError('native_recovery_scope_unavailable')
+                anchors = self.followup_coordinator.anchors(candidate)
+                if len(anchors) != 1:
+                    raise NativeLaneError('native_recovery_scope_unavailable')
+                anchor = anchors[0]
+                def checkpoint():
+                    self._followup_no_effects_scope()
+                    return (self.source_store.followup_no_effects_review_snapshot(source_id) == snapshot
+                        and self._visibility_scope_current(candidate)
+                        and bridge.followup_anchor_current(anchor['root_task_id'], anchor['prior_reply_sha256']) is True)
+                if not checkpoint():
+                    raise NativeLaneError('native_recovery_scope_unavailable')
+                stage = 'followup_nofx_audit_before'
+                before = self._followup_no_effects_audit(candidate, snapshot, anchor)
+                stage = 'followup_nofx_fresh_read'
+                _, envelope, actual_anchor, failure = self.followup_coordinator.observe(candidate,
+                    checkpoint=checkpoint, read=lambda found, observed: self.adapter.read_followup_reply(found, observed, keep_open=True))
+                if envelope is None or failure is not None or actual_anchor != anchor:
+                    raise NativeLaneError('native_recovery_scope_unavailable')
+                self._recovery_identity()
+                if not checkpoint():
+                    raise NativeLaneError('native_recovery_scope_unavailable')
+                stage = 'followup_nofx_audit_after'
+                after = self._followup_no_effects_audit(candidate, snapshot, anchor, envelope)
+                if before != after or not checkpoint():
+                    raise NativeLaneError('native_recovery_effects_unknown')
+                review = {'operation': 'owner_fresh_followup_no_effects_review',
+                    'reviewed_at': datetime.fromisoformat(envelope['evidence']['observed_at_utc'].replace('Z', '+00:00')).timestamp(),
+                    'root_task_id': anchor['root_task_id'], 'root_agent_task_id': anchor['root_agent_task_id'],
+                    'ui_reference_id': envelope['reference_id'], 'ui_digest': ui_semantic_digest(envelope),
+                    'cross_ledger_digest': after, 'operator_reason': 'explicit_operator_followup_no_effects_recovery'}
+                stage = 'followup_nofx_commit'
+                result = self.source_store._commit_followup_no_effects_review(
+                    _followup_no_effects_permit(self.source_store, snapshot, review))
+                self.last_native_recovery_diagnostic = {'stage': stage, 'code': 'reviewed'}
+                return result
+        except (ReceiverInterventionRequired, NativeLaneError) as error:
+            code = getattr(error, 'code', None)
+            codes = {'native_recovery_not_safe', 'native_recovery_scope_unavailable',
+                'native_recovery_effects_present', 'native_recovery_effects_unknown',
+                'native_recovery_stopped', 'native_recovery_identity_unverified'}
+            failure_diagnostic(error, code if code in codes else 'native_recovery_identity_unverified')
+            raise
+        except Exception as error:
+            failure_diagnostic(error, 'native_recovery_effects_unknown')
+            raise NativeLaneError('native_recovery_effects_unknown') from None
+
+
     def clear_buffer(self):
         self._owner()
         # Durable plans are not deleted or unreserved. An enqueue may already
@@ -1243,6 +1763,8 @@ class NativeLane:
         if not rows:
             if failure is not None:
                 self._hold(claim, failure)
+            else:
+                self._native_read_diagnostic('followup_prepare', 'native_followup_no_resolution')
             return []
         self._plan(claim, rows[0], thread, correlation)
         return rows
@@ -1271,6 +1793,7 @@ class NativeLane:
 
     def collect(self):
         self._owner()
+        self.last_native_read_diagnostic = {}
         if self._pending: raise NativeLaneError('native_prior_admission_required')
         self._more = False
         self.browser_lane.last_detail_failure_count = 0

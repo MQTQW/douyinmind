@@ -19,7 +19,7 @@ import sqlite3
 from threading import Lock
 from typing import Iterator
 
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, func, inspect, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
@@ -78,7 +78,11 @@ class LocalKnowledgeTools:
             scope = set(db.scalars(select(VideoCache.platform_item_id).where(VideoCache.status == 'done')).all())
             return {'id':None,'name':'全部入库资料','total_count':len(scope),'ready_count':len(scope),
                     'query_scope':'all_local'}, scope
-        base = db.get(KnowledgeBase, self.knowledge_base_id)
+        columns = {column["name"] for column in inspect(db.connection()).get_columns("knowledge_bases")}
+        base_query = select(KnowledgeBase.id, KnowledgeBase.name).where(KnowledgeBase.id == self.knowledge_base_id)
+        if "deleted_at" in columns:
+            base_query = base_query.where(KnowledgeBase.deleted_at.is_(None))
+        base = db.execute(base_query).one_or_none()
         if base is None:
             raise KnowledgeBaseNotFound("这个知识库不存在，请刷新后重新选择。")
         total = db.scalar(

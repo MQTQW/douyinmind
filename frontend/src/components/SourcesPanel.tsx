@@ -30,9 +30,11 @@ interface Props {
   onNewChat: () => void;
   onSessionRenamed: (id: number, title: string) => void;
   onSessionDeleted: (id: number) => void;
+  onMutationBusyChange?: (busy: boolean) => void;
+  onKnowledgeBaseDeleted?: (id: number) => void;
 }
 
-export default function SourcesPanel({ view, onChangeView, contentContainer, chatOnly, onKnowledgeBaseUpdated, onBuildDone, selectedId, onSelectCollection, selectedKnowledgeBase, onSelectKnowledgeBase, statsRefreshKey, historyRefreshKey, activeSessionId, chatBusy, onSelectSession, onNewChat, onSessionRenamed, onSessionDeleted }: Props) {
+export default function SourcesPanel({ view, onChangeView, contentContainer, chatOnly, onKnowledgeBaseUpdated, onBuildDone, selectedId, onSelectCollection, selectedKnowledgeBase, onSelectKnowledgeBase, statsRefreshKey, historyRefreshKey, activeSessionId, chatBusy, onSelectSession, onNewChat, onSessionRenamed, onSessionDeleted, onMutationBusyChange, onKnowledgeBaseDeleted }: Props) {
   const [collections, setCollections] = useState<api.CollectionItem[]>([]);
   const [stats, setStats] = useState<any>(null);
   const collectionsRequestRef = useRef(0);
@@ -73,6 +75,24 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
   const [taskVideosError, setTaskVideosError] = useState('');
   const [taskVideosTotal, setTaskVideosTotal] = useState(0);
   const [taskVideosLoading, setTaskVideosLoading] = useState(false);
+  const [collectionSearch, setCollectionSearch] = useState('');
+  const [selectedMaterialIds, setSelectedMaterialIds] = useState<Set<string>>(new Set());
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [bulkFeedback, setBulkFeedback] = useState('');
+  const bulkDeletingRef = useRef(false);
+  const aliveRef = useRef(false);
+  const mutationBusyChangeRef = useRef(onMutationBusyChange);
+  mutationBusyChangeRef.current = onMutationBusyChange;
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => { aliveRef.current = false; mutationBusyChangeRef.current?.(false); };
+  }, []);
+  useEffect(() => { setSelectedMaterialIds(new Set()); setBulkFeedback(''); }, [selectedKnowledgeBase?.id, selectedId]);
+  useEffect(() => {
+    if (baseVideosLoading || baseVideosError) return;
+    const available = new Set(baseVideos.filter(video => video.status === 'done').map(video => video.platform_item_id));
+    setSelectedMaterialIds(previous => new Set([...previous].filter(id => available.has(id))));
+  }, [baseVideos, baseVideosLoading, baseVideosError]);
 
   const fetchStats = useCallback(async () => {
     const requestId = ++statsRequestRef.current;
@@ -288,7 +308,9 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
     setExpandedId(previous => previous === collectionId ? null : collectionId);
   };
 
-  const selectableVideos = expandedVideos.filter(video => ['pending', 'failed', 'done'].includes(video.status));
+  const searchTitle = collectionSearch.trim().normalize('NFKC').toLocaleLowerCase();
+  const visibleCollectionVideos = searchTitle ? expandedVideos.filter(video => (video.title || '').normalize('NFKC').toLocaleLowerCase().includes(searchTitle)) : expandedVideos;
+  const selectableVideos = visibleCollectionVideos.filter(video => ['pending', 'failed', 'done'].includes(video.status));
   const allVisibleSelected = selectableVideos.length > 0 && selectableVideos.every(video => selectedVideos.has(video.platform_item_id));
   const toggleVideo = (video: api.VideoItem) => {
     setSelectedVideos(previous => {
@@ -347,6 +369,62 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
   const isStuck = (processingCount > 0 && !stats?.current_task_id) || (failedCount > 0 && pendingCount === 0 && processingCount === 0);
   const analysisMode: api.AnalysisMode = stats?.analysis_mode === 'audio_visual' ? 'audio_visual' : 'audio';
   const resultDescription = analysisMode === 'audio_visual' ? '完整文字稿、画面分析和时间信息' : '完整文字稿和时间信息';
+  const selectableMaterials = baseVideos.filter(video => video.status === 'done');
+  const allMaterialsSelected = selectableMaterials.length > 0 && selectableMaterials.every(video => selectedMaterialIds.has(video.platform_item_id));
+  const mutationBlocked = chatBusy || chatOnly || building || processingCount > 0 || Boolean(stats?.current_task_id) || bulkDeleting || Boolean(removingVideoId);
+  const bulkDeleteSupported = stats?.capabilities?.guarded_video_delete === true;
+  const toggleMaterial = (id: string) => {
+    if (mutationBlocked) return;
+    setSelectedMaterialIds(previous => {
+      const next = new Set(previous);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+  const toggleAllMaterials = () => {
+    if (mutationBlocked) return;
+    setSelectedMaterialIds(allMaterialsSelected ? new Set() : new Set(selectableMaterials.map(video => video.platform_item_id)));
+  };
+  const bulkDeleteMaterials = async (mode: 'library' | 'global') => {
+    if (bulkDeletingRef.current || mutationBlocked || !bulkDeleteSupported || chatOnly || !aliveRef.current) return;
+    const targetBase = selectedKnowledgeBase;
+    if (mode === 'library' && !targetBase) return;
+    const plan = selectableMaterials.filter(video => selectedMaterialIds.has(video.platform_item_id)).map(video => video.platform_item_id);
+    if (!plan.length) return;
+    const confirmed = confirm(mode === 'library'
+      ? `仅从“${targetBase!.name}”移出所选 ${plan.length} 个视频？\n\n文字稿和其他知识库中的资料会保留。`
+      : `删除所选 ${plan.length} 个视频的全部入库资料？\n\n这会删除它们的文字稿和检索资料，并从所有知识库移除。收藏夹中的原视频不受影响。`);
+    if (!confirmed) return;
+    bulkDeletingRef.current = true;
+    setBulkDeleting(true);
+    setBulkFeedback('');
+    mutationBusyChangeRef.current?.(true);
+    const completed: string[] = [];
+    let failure = '';
+    try {
+      for (const id of plan) {
+        if (!aliveRef.current) break;
+        try {
+          const result = mode === 'library' ? await api.removeKnowledgeBaseVideo(targetBase!.id, id) : await api.deleteVideo(id);
+          if (!result.success) { failure = '有视频未能完成操作，已停止后续项。'; break; }
+          completed.push(id);
+        } catch { failure = '有请求的结果未确认，后续项尚未提交。请刷新核对后再操作。'; break; }
+      }
+      if (aliveRef.current) {
+        setSelectedMaterialIds(previous => new Set([...previous].filter(id => !completed.includes(id))));
+        setBulkFeedback(`${mode === 'library' ? '已移出' : '已删除入库资料'} ${completed.length} / ${plan.length} 个视频。${failure}`);
+        if (completed.length || failure) {
+          void fetchStats();
+          setBasesRefreshKey(key => key + 1);
+          setVideosRefreshKey(key => key + 1);
+          onBuildDone();
+        }
+      }
+    } finally {
+      bulkDeletingRef.current = false;
+      if (aliveRef.current) { setBulkDeleting(false); mutationBusyChangeRef.current?.(false); }
+    }
+  };
 
   // Restore progress for an active job after refreshing; only orphaned jobs are stuck.
   const activeTaskId = submittedTaskId || stats?.current_task_id;
@@ -397,7 +475,14 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
       <div className="flex-1 min-h-0 overflow-y-auto p-3 md:p-4">
         <KnowledgeBasesPanel selectedId={selectedKnowledgeBase?.id ?? null} refreshKey={statsRefreshKey + basesRefreshKey}
           disabled={chatBusy || chatOnly} disabledReason={chatBusy ? '请等待当前回答完成' : '体验模式尚未连接抖音；登录后可选择和管理知识库。'} onListLoaded={setKnowledgeBases} onSelect={onSelectKnowledgeBase}
-          onRefresh={onBuildDone} onCreated={base => { baseCreated(base); onSelectKnowledgeBase(base); }} />
+          onRefresh={onBuildDone} onCreated={base => { baseCreated(base); onSelectKnowledgeBase(base); }}
+          onBusyChange={onMutationBusyChange} onDeleted={id => {
+            setBasesRefreshKey(key => key + 1);
+            setVideosRefreshKey(key => key + 1);
+            if (onKnowledgeBaseDeleted) onKnowledgeBaseDeleted(id);
+            else if (selectedKnowledgeBase?.id === id) onSelectKnowledgeBase(null);
+            onBuildDone();
+          }} />
         <section className="history-section" aria-label="历史对话">
           <div className="flex items-center justify-between mb-3"><h2 className="section-title"><History size={16} />历史对话</h2><span className="text-xs text-[var(--color-ink-muted)]">自动保存</span></div>
           {historyError && <p role="alert" className="text-xs text-red-600">{historyError} <button onClick={fetchSessions} className="underline">重新加载</button></p>}
@@ -422,20 +507,28 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
 
       {contentContainer && view !== 'chat' && view !== 'assistant' && createPortal(<div className="source-workspace">
         {view === 'materials' && <>
-          <div className="materials-toolbar" aria-label="视频资料列表"><p>文字稿 · 时间定位 · 处理结果</p></div>
-          {baseVideosLoading ? <p role="status" className="empty-hint">正在加载视频资料…</p> : baseVideosError ? <p role="alert" className="empty-hint text-red-600">{baseVideosError} <button onClick={() => setBasesRefreshKey(key => key + 1)} className="underline">重新加载</button></p> : baseVideos.length === 0 ? <div className="empty-resource"><FileAudio size={30} /><h3>还没有可查看的视频</h3><p>从收藏夹选择视频，导入到知识库后就能查看文字稿。</p><button className="ui-button ui-button-primary" onClick={() => onChangeView('collections')}>从收藏夹导入</button></div> : <div className="resource-list">{baseVideos.map(video => <div key={video.platform_item_id} className="resource-row">
+          {!baseVideosLoading && !baseVideosError && baseVideos.length > 0 && <div className="materials-bulk-toolbar" aria-label="批量管理视频资料">
+            <label><input type="checkbox" checked={allMaterialsSelected} ref={element => { if (element) element.indeterminate = selectedMaterialIds.size > 0 && !allMaterialsSelected; }} onChange={toggleAllMaterials} disabled={mutationBlocked || !selectableMaterials.length} aria-label="全选可删除资料" />全选</label>
+            <span>已选 {selectedMaterialIds.size} 项</span>
+            <div>{selectedKnowledgeBase && <button type="button" className="ui-button" onClick={() => void bulkDeleteMaterials('library')} disabled={mutationBlocked || !bulkDeleteSupported || !selectedMaterialIds.size} title={!bulkDeleteSupported ? '后端更新加载后可批量操作' : undefined}>批量移出</button>}
+            <button type="button" className="ui-button danger-action" onClick={() => void bulkDeleteMaterials('global')} disabled={mutationBlocked || !bulkDeleteSupported || !selectedMaterialIds.size} title={!bulkDeleteSupported ? '后端更新加载后可批量操作' : undefined}><Trash2 size={15} />{bulkDeleting ? '正在处理…' : '批量删除'}</button></div>
+          </div>}
+          {bulkFeedback && <p role="status" className="materials-bulk-feedback">{bulkFeedback}</p>}
+          {baseVideosLoading ? <p role="status" className="empty-hint">正在加载视频资料…</p> : baseVideosError ? <p role="alert" className="empty-hint text-red-600">{baseVideosError} <button onClick={() => setBasesRefreshKey(key => key + 1)} className="underline">重新加载</button></p> : baseVideos.length === 0 ? <div className="empty-resource"><FileAudio size={30} /><h3>还没有可查看的视频</h3><p>从收藏夹选择视频，导入到知识库后就能查看文字稿。</p><button className="ui-button ui-button-primary" onClick={() => onChangeView('collections')}>从收藏夹导入</button></div> : <div className="resource-list" aria-label="视频资料列表">{baseVideos.map(video => <div key={video.platform_item_id} className={`resource-row ${selectedMaterialIds.has(video.platform_item_id) ? 'material-selected' : ''}`}>
+            <input type="checkbox" checked={selectedMaterialIds.has(video.platform_item_id)} onChange={() => toggleMaterial(video.platform_item_id)} disabled={mutationBlocked || video.status !== 'done'} aria-label={`选择资料：${video.title || '未命名视频'}`} />
             <span className="resource-icon"><FileAudio size={20} /></span><button className="resource-title" onClick={() => setViewingItemId(video.platform_item_id)}><strong>{video.title || '未命名视频'}</strong><small>{video.author ? `@${video.author} · ` : ''}{video.duration ? `${Math.floor(video.duration / 60)}:${String(video.duration % 60).padStart(2, '0')} · ` : ''}查看完整识别结果</small></button>
             <span className={`status-badge ${video.status === 'failed' ? 'status-failed' : ''}`}>{video.status === 'done' && <Check size={13} />}{statusLabel(video.status)}</span>{videoActions(video, true)}
           </div>)}</div>}
           <p className="mt-5 text-xs text-[var(--color-ink-muted)] leading-relaxed">“移出”仅调整当前知识库；“删除全部入库资料”会影响所有知识库。原始导出保留完整文字稿与时间，AI 整理导出会额外调用模型。</p>
         </>}
         {view === 'collections' && <>
-          <div className="page-section-heading"><div><h3>选择收藏的视频</h3><p>支持跨收藏夹选择，再统一指定目标知识库。</p></div><button className="ui-button" onClick={handleSync} disabled={syncing || building}><RefreshCw size={15} className={syncing ? 'animate-spin' : ''} />{syncing ? '同步中…' : '同步收藏夹'}</button></div>
+          <div className="page-section-heading"><div><h3>选择收藏的视频</h3><p>支持跨收藏夹选择，再统一指定目标知识库。</p></div><label className="collection-title-search"><span>搜索视频标题</span><input type="search" value={collectionSearch} onChange={event => setCollectionSearch(event.target.value)} placeholder="输入视频标题关键词" aria-label="搜索收藏视频标题" /></label><button className="ui-button" onClick={handleSync} disabled={syncing || building}><RefreshCw size={15} className={syncing ? 'animate-spin' : ''} />{syncing ? '同步中…' : '同步收藏夹'}</button></div>
           <div className="collection-workspace"><nav className="collection-navigation" aria-label="抖音收藏夹">{collections.map(col => <button key={col.collection_id} onClick={() => handleCollectionClick(col.collection_id)} disabled={chatBusy} aria-pressed={expandedId === col.collection_id} className={expandedId === col.collection_id ? 'active' : ''}><span>{col.title}</span><small>{col.video_count}</small></button>)}{collections.length === 0 && <p className="empty-hint">还没有收藏夹，点击同步后再查看。</p>}</nav>
           <div className="min-w-0">
             {loadingVideos ? <p role="status" className="empty-hint">正在加载视频…</p> : videoLoadError ? <p role="alert" className="empty-hint text-red-600">{videoLoadError} <button onClick={() => setVideosRefreshKey(key => key + 1)} className="underline">重新加载</button></p> : !expandedId ? <p className="empty-hint">选择一个收藏夹查看视频。</p> : expandedVideos.length === 0 ? <p className="empty-hint">这个收藏夹暂无视频。</p> : <>
-              <div className="collection-selection-heading"><label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={allVisibleSelected} onChange={toggleCollection} disabled={building || !selectableVideos.length} aria-label="全选本收藏夹" />全选本收藏夹</label><button className="text-button" onClick={() => openBuildConfirm(expandedVideos, sourceForCollection(expandedId, expandedVideos))} disabled={building || chatBusy}>整夹导入<ChevronRight size={14} /></button></div>
-              {expandedVideos.map(video => <div key={video.platform_item_id} className={`collection-video-row ${selectedVideos.has(video.platform_item_id) ? 'selected' : ''}`}>
+              <div className="collection-selection-heading"><label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={allVisibleSelected} onChange={toggleCollection} disabled={building || !selectableVideos.length} aria-label={searchTitle ? '全选搜索结果' : '全选本收藏夹'} />{searchTitle ? '全选搜索结果' : '全选本收藏夹'}</label><span className="collection-search-count">{visibleCollectionVideos.length} / {expandedVideos.length} 个视频</span><button className="text-button" title={`导入这个收藏夹的全部 ${expandedVideos.length} 个视频，不受搜索筛选影响`} onClick={() => openBuildConfirm(expandedVideos, sourceForCollection(expandedId, expandedVideos))} disabled={building || chatBusy}>整夹导入<ChevronRight size={14} /></button></div>
+              {searchTitle && visibleCollectionVideos.length === 0 && <p className="empty-hint" role="status">没有找到标题匹配的视频。</p>}
+              {visibleCollectionVideos.map(video => <div key={video.platform_item_id} className={`collection-video-row ${selectedVideos.has(video.platform_item_id) ? 'selected' : ''}`}>
                 <input type="checkbox" checked={selectedVideos.has(video.platform_item_id)} onChange={() => toggleVideo(video)} disabled={building || !['pending', 'failed', 'done'].includes(video.status)} aria-label={`选择视频：${video.title}`} />
                 <button className="resource-title" onClick={() => setViewingItemId(video.platform_item_id)}><strong>{video.title || '未命名视频'}</strong><small>{video.author ? `@${video.author}` : '作者未知'}{video.duration ? ` · ${Math.floor(video.duration / 60)}:${String(video.duration % 60).padStart(2, '0')}` : ''}</small></button>
                 <button onClick={() => setViewingItemId(video.platform_item_id)} className={`status-badge ${video.status === 'failed' ? 'status-failed' : ''}`} aria-label={video.status === 'failed' ? `查看入库失败原因：${video.title}` : `查看视频状态：${video.title}`}>{video.status === 'failed' ? '查看失败原因' : statusLabel(video.status)}</button>{videoActions(video)}
