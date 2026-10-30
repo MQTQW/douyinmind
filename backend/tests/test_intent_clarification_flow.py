@@ -326,3 +326,15 @@ def test_crash_after_agent_exact_B_view_projects_publication_without_new_send(fl
     assert c.coordinator.reconcile_existing()['publications_observed']==0
     assert c.platform.submits==1 and c.backend.posts==0 and len(c.planner.calls)==calls
     assert all(path.read_bytes()==raw for path,raw in snapshots.items())
+
+
+def test_hot_disable_at_response_write_is_a_local_denial_not_a_helper_exception(flow,monkeypatch):
+    c=flow;original=c.store.claim_response;before=c.store.for_root(c.root['id'])
+    def disable_then_claim(*args,**kwargs):
+        c.store.set_enabled(False)
+        return original(*args,**kwargs)
+    monkeypatch.setattr(c.store,'claim_response',disable_then_claim)
+    _,_,result,_=prepare(c)
+    assert result==([],None,None,'clarification_feature_disabled')
+    assert c.store.for_root(c.root['id'])==before
+    assert len(c.planner.calls)==1 and c.backend.posts==0 and c.platform.submits==1

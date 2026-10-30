@@ -23,6 +23,12 @@ class ClarificationContinuation:
         self.store, self.bridge, self.lane, self.interpreter = store, bridge, lane, interpreter
         self.clock = clock or time.time
 
+    def _admit_existing(self,session_id,source_id,task):
+        try:return self.store.admitted(session_id,source_id,task)
+        except ClarificationError as error:
+            if error.code=='clarification_feature_disabled':return None
+            raise
+
     def _source(self, source_id=None, task_id=None):
         with self.lane.source_store._connection() as db:
             if source_id is not None:
@@ -40,7 +46,7 @@ class ClarificationContinuation:
             proof = task['envelope'].get('evidence', {})
             if proof.get('source_kind') == SOURCE_KIND:
                 session = self.store.get(proof['clarification_session_id'])
-                self.store.admitted(session['session_id'], session['response_source_id'], task)
+                self._admit_existing(session['session_id'], session['response_source_id'], task)
                 continue
             if proof.get('source_kind') is not None or task.get('kind') != 'clarify': continue
             source = self._source(task_id=task['id'])
@@ -52,7 +58,7 @@ class ClarificationContinuation:
             try:
                 self.store.arm(task, source, reason_code=resolution.reason_code,semantic_plan_id=receipt.plan_id)
             except ClarificationError as error:
-                if error.code != 'clarification_root_not_new': raise
+                if error.code not in {'clarification_root_not_new','clarification_feature_disabled'}: raise
 
     def recover_links(self, tasks):
         """Repair only an already planned new-type handoff; never arm old roots."""
@@ -62,7 +68,7 @@ class ClarificationContinuation:
             if proof.get('source_kind')!=SOURCE_KIND:continue
             session=self.store.get(proof['clarification_session_id'])
             if session is not None:
-                self.store.admitted(session['session_id'],session['response_source_id'],task)
+                self._admit_existing(session['session_id'],session['response_source_id'],task)
 
     def after_publish(self, task):
         session = self.store.for_root(task['id'])
@@ -150,7 +156,10 @@ class ClarificationContinuation:
                 or not checkpoint() or not self._root_current(session)):
             return [], None, None, 'clarification_ui_unverified'
         if self.store.enabled is not True:return [],None,None,'clarification_feature_disabled'
-        session = self.store.claim_response(session['session_id'], claim['source_id'], envelope)
+        try:session = self.store.claim_response(session['session_id'], claim['source_id'], envelope)
+        except ClarificationError as error:
+            if error.code=='clarification_feature_disabled':return [],None,None,'clarification_feature_disabled'
+            raise
         def current():
             value = self.store.get(session['session_id'])
             return bool(checkpoint() and value and value['state'] == 'responding'
@@ -190,7 +199,10 @@ class ClarificationContinuation:
             'device_id': resolution.device_id, 'authorization': resolution.authorization}
         serial = {**row, 'binding': resolution.binding.to_dict()}
         if self.store.enabled is not True:return [],None,None,'clarification_feature_disabled'
-        self.store.plan(session['session_id'], claim['source_id'], envelope, metadata, serial)
+        try:self.store.plan(session['session_id'], claim['source_id'], envelope, metadata, serial)
+        except ClarificationError as error:
+            if error.code=='clarification_feature_disabled':return [],None,None,'clarification_feature_disabled'
+            raise
         thread = {'quality': 'verified_ancestor', 'root_reference_id': session['root']['envelope']['reference_id']}
         correlation = {'source_native_comment_id': candidate['native_comment_id'],
             'observed_native_comment_id': envelope['native_comment_id'],
@@ -305,6 +317,6 @@ class ClarificationContinuation:
             if metadata!=session['decision']:
                 result['needs_review']+=self._review(session,'clarification_recovery_meaning_changed');continue
             if self.store.enabled is True:
-                self.store.admitted(session['session_id'],session['response_source_id'],task)
-                result['links_repaired']+=1
+                if self._admit_existing(session['session_id'],session['response_source_id'],task) is not None:
+                    result['links_repaired']+=1
         return result
