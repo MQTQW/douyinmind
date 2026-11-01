@@ -83,10 +83,23 @@ def selection_value_from_public_text(value, receiver_reply_label=''):
     raise ValueError('choice_reply_label_not_in_original_body')
 
 
+_SOLE_LIBRARY_MARKERS = ('就一个', '只有一个', '唯一', '唯一的', '默认库', '默认知识库', '那个库', '这个库')
+_NEGATIVE_SELECTION = re.compile(r'不要|别|不存|不用|取消|不能|不想|先别')
+
+
+def _single_option_intent(text):
+    """A natural reply that names no library but points at the only option."""
+    if not isinstance(text, str) or _NEGATIVE_SELECTION.search(text):
+        return False
+    return any(marker in text for marker in _SOLE_LIBRARY_MARKERS)
+
+
 def parse_library_selection(value, options):
     key = normalized_choice(value)
     matches = selection_forms(options).get(key, set())
     if len(matches) != 1:
+        if len(options) == 1 and _single_option_intent(key):
+            return options[0]
         return None
     selected = next(iter(matches))
     return next(item for item in options if item['knowledge_base_id'] == selected)
@@ -130,44 +143,40 @@ def semantic_choice_owner(session,envelope):
         'root_reference_id':root['reference_id']}
 
 
-def choice_prompt(options, *, catalog_count, catalog_scope='authorized_libraries', max_chars=280):
-    """State the real count, and label any deliberately bounded name listing."""
+def choice_prompt(options, *, catalog_count, catalog_scope='authorized_libraries', max_chars=160):
+    """Ask for a library the way a person would in a comment thread."""
     if type(catalog_count) is not int or catalog_count < 0 or catalog_scope not in {'all_local', 'authorized_libraries'}:
         raise ValueError('invalid_library_catalog_scope')
     if not isinstance(options, list) or len(options) > 128:
         raise ValueError('invalid_library_catalog')
     available = [item for item in options if item.get('can_import', item.get('authorization') is not None)]
-    where = '你目前有' if catalog_scope == 'all_local' else '你当前获准查看'
-    header = f'{where}{catalog_count}个知识库，可保存{len(available)}个。'
     if not available:
-        return header + '目前没有获准保存的目标库，请先在本机设置中授权；这条视频尚未保存。'
-    tail = '请回复完整库名（也可说“存到＋库名”），选好后我再保存这个视频。'
+        return '现在还没有能保存的库，先去本机设置里授权一下吧，这个视频先不存。'
     names = []
-    for index, item in enumerate(options, 1):
+    for index, item in enumerate(available, 1):
         name = item.get('name')
         if not isinstance(name, str) or not 1 <= len(name.strip()) <= 128:
             raise ValueError('invalid_library_catalog_name')
-        # Library metadata is data, not a mention/link or an instruction.
         display = re.sub(r'[\r\n\t]+', ' ', name).strip()
         if '@' in display or re.search(r'https?://', display, re.I):
             display = '特殊名称库（完整名称见本机）'
         ordinal = item.get('ordinal', index)
         if type(ordinal) is not int or not 1 <= ordinal <= 128:
             raise ValueError('invalid_library_catalog_ordinal')
-        names.append(f'{ordinal}. ' + display + ('' if item in available else '（未授权保存）'))
-    full = header + '分别是：' + '；'.join(names) + '。' + tail
-    if len(full) <= max_chars:
-        return full
-    shown = []
-    for name in names:
-        candidate = header + f'先列前{len(shown)+1}个：' + '；'.join(shown + [name]) + '。完整列表见DouyinMind。' + tail
-        if len(candidate) > max_chars:
-            break
-        shown.append(name)
-    if not shown:
-        text = header + '完整库名列表请在DouyinMind查看。' + tail
-    else:
-        text = header + f'先列前{len(shown)}个：' + '；'.join(shown) + '。完整列表见DouyinMind。' + tail
-    if len(text) > max_chars:
+        names.append((ordinal, display))
+    shown = '、'.join(f'{ordinal}. {display}' for ordinal, display in names[:3])
+    if len(names) > 3:
+        shown += ' 等'
+    count = len(available)
+    variants = (
+        f'你有{count}个知识库能存：{shown}。想放这个的话，回我名字或序号就行',
+        f'要放哪个库？你有{count}个知识库能选：{shown}。说下库名或序号哈',
+        f'选个库吧，你有{count}个知识库能存：{shown}。直接回名字或序号就好',
+    )
+    value = variants[(sum(ordinal for ordinal, _ in names) + len(names)) % len(variants)]
+    if len(value) > max_chars:
+        first = names[0][1]
+        value = f'要存到哪个库？现在能选「{first}」' + ('等' if len(names) > 1 else '') + '，回名字或序号就行'
+    if len(value) > max_chars:
         raise ValueError('library_choice_prompt_budget_exceeded')
-    return text
+    return value

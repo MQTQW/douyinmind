@@ -414,3 +414,93 @@ def test_new_begin_during_ack_control_read_cannot_be_consumed():
     server._allowed=changed
     assert not server.acknowledge_finalization(old)
     assert server.owner_finalization_pending and server.finalization_epoch>old
+
+
+def fresh_page(server, headers):
+    """Simulate a refreshed tab: a new page load with a new nonce."""
+    code, _, html = server.request('GET', '/', headers)
+    assert code == 200
+    fresh = dict(headers)
+    fresh['x-douyinmind-manual'] = re.search(
+        rb'name="manual-nonce" content="([a-f0-9]{64})"', html)[1].decode()
+    assert fresh['x-douyinmind-manual'] != headers['x-douyinmind-manual']
+    return fresh
+
+
+def test_refreshed_page_cannot_read_owned_session_but_can_take_it_over():
+    server, headers, _, _, _ = make()
+    begin(server, headers)
+    fresh = fresh_page(server, headers)
+    assert server.request('GET', '/api/status', fresh)[0] == 409
+    code, _, body = request(server, fresh, '/api/takeover', {})
+    assert code == 200
+    value = json.loads(body)
+    assert value['taken_over'] is True
+    assert server.session_active is False
+    status = server.request('GET', '/api/status', fresh)
+    assert status[0] == 200 and json.loads(status[2])['state'] == 'cancelled'
+    # The fresh local page may now begin explicitly; takeover grants no input.
+    assert request(server, fresh, '/api/begin', {})[0] == 202
+
+
+def test_takeover_is_idempotent_without_a_session():
+    server, headers, _, _, _ = make()
+    code, _, body = request(server, headers, '/api/takeover', {})
+    assert code == 200 and json.loads(body)['taken_over'] is False
+
+
+def test_takeover_never_interrupts_a_queued_action():
+    server, headers, _, _, _ = make()
+    session = begin(server, headers)
+    assert action(server, headers, session, 'screenshot')[0] == 202
+    fresh = fresh_page(server, headers)
+    assert request(server, fresh, '/api/takeover', {})[0] == 409
+    assert server.session_active is True
+
+
+def test_takeover_requires_valid_nonce_origin_and_empty_body():
+    server, headers, _, _, _ = make()
+    begin(server, headers)
+    fresh = fresh_page(server, headers)
+    bad_nonce = dict(fresh); bad_nonce['x-douyinmind-manual'] = 'f' * 64
+    assert request(server, bad_nonce, '/api/takeover', {})[0] == 403
+    bad_origin = dict(fresh); bad_origin['origin'] = 'https://evil.example'
+    assert request(server, bad_origin, '/api/takeover', {})[0] == 403
+    assert request(server, fresh, '/api/takeover', {'extra': 1})[0] == 400
+    assert server.request('GET', '/api/status', fresh)[0] == 409
+
+
+def test_takeover_requires_post():
+    server, headers, _, _, _ = make()
+    begin(server, headers)
+    assert server.request('GET', '/api/takeover', headers)[0] == 405
+
+
+def test_unknown_region_hint_is_projected_and_sanitized():
+    server, headers, _, _, _ = make()
+    session = begin(server, headers)
+    assert action(server, headers, session, 'screenshot')[0] == 202
+    server.process_one(lambda *_: {'ok': True, 'frame': PNG, 'width': 1100, 'height': 800,
+        'input_enabled': False, 'auth_region_known': False,
+        'region_hint': 'iframe=1,dialog=0,captcha=1,verify=0'})
+    status = json.loads(server.request('GET', '/api/status', headers)[2])
+    assert status['input_enabled'] is False
+    assert status['region_hint'] == 'iframe=1,dialog=0,captcha=1,verify=0'
+
+    assert action(server, headers, session, 'screenshot')[0] == 202
+    server.process_one(lambda *_: {'ok': True, 'frame': PNG, 'width': 1100, 'height': 800,
+        'input_enabled': False, 'auth_region_known': False,
+        'region_hint': '用户评论 private page text'})
+    status = json.loads(server.request('GET', '/api/status', headers)[2])
+    assert status['region_hint'] is None
+
+
+def test_region_hint_absent_when_region_is_known():
+    server, headers, _, _, _ = make()
+    session = begin(server, headers)
+    assert action(server, headers, session, 'screenshot')[0] == 202
+    server.process_one(lambda *_: {'ok': True, 'frame': PNG, 'width': 1100, 'height': 800,
+        'input_enabled': True, 'auth_region_known': True, 'region_hint': None})
+    status = json.loads(server.request('GET', '/api/status', headers)[2])
+    assert status['auth_region_known'] is True
+    assert status['region_hint'] is None

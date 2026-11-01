@@ -603,9 +603,40 @@ class NormalPageReceiver:
             if not keep_open:
                 self.page.keyboard.press("Escape")
 
+    def _open_target_for_publish(self, target: dict) -> None:
+        """Locate the frozen original, bounded and safe to retry by category.
+
+        Native API events carry the platform's native comment ID; prefer it as
+        the discriminator and allow a larger bounded candidate window so
+        repeated identical texts on other videos do not block an otherwise
+        exactly identifiable target. DOM-lane targets without a native ID may
+        be retried once with the larger window only for the two bounded
+        "candidates" failures, where matching by the already-frozen video ID can
+        still resolve a unique card. Nothing is submitted here.
+        """
+        from app.mention_agent.publisher import ReplyPreflightError
+        native = target.get('native_comment_id') is not None
+        try:
+            if native:
+                self.open_original_from_notifications(target, max_candidates=8,
+                                                      native_candidate_correlation=True)
+            else:
+                self.open_original_from_notifications(target, max_candidates=3)
+        except ReceiverDetailError as error:
+            reason = error.diagnostics.get('reason_code', 'original_target_changed')
+            if not native and reason in {'original_notification_candidates_exceed_limit',
+                                         'original_notification_not_unique'}:
+                try:
+                    self.open_original_from_notifications(target, max_candidates=8)
+                except ReceiverDetailError as retry_error:
+                    raise ReplyPreflightError(retry_error.diagnostics.get('reason_code',
+                                                                          'original_target_changed')) from None
+                return
+            raise ReplyPreflightError(reason) from None
+
     def _reply_state(self, target, text):
         from app.mention_agent.publisher import ReplyPreflightError
-        if target.get('followup_evidence') is not None:
+        if (target.get('followup_evidence') is not None or target.get('clarification_evidence') is not None):
             from .followup_browser import followup_reply_state
             return followup_reply_state(self, target, text)
         if target.get('choice_evidence') is not None:
@@ -628,14 +659,18 @@ class NormalPageReceiver:
                                          native_candidate_correlation=False) -> dict:
         """Open one frozen original, without acquiring or filling a reply editor.
 
-        At most three distinct visible cards are inspected. A card's cover is
-        only a way to reopen that card, never evidence of a video ID. Every
-        candidate must be readable, and the sole full match is reopened and
-        checked again before its notification thread is left open.
+        A card's cover is only a way to reopen that card, never evidence of a
+        video ID. Every candidate must be readable, and the sole full match is
+        reopened and checked again before its notification thread is left open.
+
+        With a native correlation target the API's native comment id is the
+        discriminator; repeated identical texts on other videos are therefore
+        safe to inspect within a larger bounded limit. The caller must still
+        bound the work (at most twelve distinct cards).
         """
         if type(native_candidate_correlation) is not bool:
             raise ValueError('invalid_native_correlation_mode')
-        if type(max_candidates) is not int or not 1 <= max_candidates <= 3:
+        if type(max_candidates) is not int or not 1 <= max_candidates <= 12:
             raise ValueError('invalid_original_lookup_limit')
         counts = dict(candidate_limit=max_candidates, candidate_count=0, checked_count=0,
                       match_count=0, unreadable_count=0, final_rechecks=0, final_verified=0,
@@ -946,15 +981,12 @@ class NormalPageReceiver:
     def prepare_reply(self, target: dict, text: str) -> dict:
         """Fresh public identity, exact parent and inline draft; never submits."""
         from app.mention_agent.publisher import ReplyPreflightError
-        if target.get('followup_evidence') is not None:
+        if (target.get('followup_evidence') is not None or target.get('clarification_evidence') is not None):
             return self.prepare_followup_reply(target, text)
         if target.get('choice_evidence') is not None:
             from .choice_browser import prepare_choice_reply
             return prepare_choice_reply(self, target, text)
-        try:
-            self.open_original_from_notifications(target)
-        except ReceiverDetailError as error:
-            raise ReplyPreflightError(error.diagnostics.get('reason_code', 'original_target_changed')) from None
+        self._open_target_for_publish(target)
         # Keep notification targeting: a popular video's default first page
         # may not contain this new zero-like comment at all.
         original = self.page.get_by_text(target["comment_text"], exact=True).and_(self.page.locator(":visible"))
@@ -1018,7 +1050,7 @@ class NormalPageReceiver:
 
     def submit_reply(self, target: dict, text: str, *, before_submit) -> dict:
         """Exactly one click invocation after durable reservation and last gate."""
-        if target.get('followup_evidence') is not None:
+        if (target.get('followup_evidence') is not None or target.get('clarification_evidence') is not None):
             from .choice_browser import _readback_viewport
             with _readback_viewport(self):
                 return self._submit_reply(target, text, before_submit=before_submit)
@@ -1064,7 +1096,7 @@ class NormalPageReceiver:
         return {"outcome": "delivery_unknown", "exact_body_in_original_thread": False}
 
     def save_reply_evidence(self, target, text, path):
-        if target.get('followup_evidence') is not None:
+        if (target.get('followup_evidence') is not None or target.get('clarification_evidence') is not None):
             from .choice_browser import _readback_viewport
             with _readback_viewport(self):
                 return self._save_reply_evidence(target, text, path)
@@ -1074,7 +1106,7 @@ class NormalPageReceiver:
         self._check_challenge()
         value = self._reply_state(target, text)
         if value["matching_reply_count"] == 1:
-            index = value.get('evidence_root_index', value['root_index']) if target.get('followup_evidence') is not None else value['root_index']
+            index = value.get('evidence_root_index', value['root_index']) if (target.get('followup_evidence') is not None or target.get('clarification_evidence') is not None) else value['root_index']
             self.page.locator('[data-e2e="comment-item"]').nth(index).screenshot(
                 path=str(path), timeout=5000)
 

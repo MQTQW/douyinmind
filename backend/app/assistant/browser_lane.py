@@ -309,7 +309,14 @@ class BrowserLane:
         else:
             semantic_options={'preferred_binding_id':preferred,'source_checkpoint':semantic_checkpoint}
             if native_candidate is not None:semantic_options['native_candidate']=native_candidate
-            resolution=self.semantic_resolution_provider(envelope,**semantic_options)
+            try:
+                resolution=self.semantic_resolution_provider(envelope,**semantic_options)
+            except Exception:
+                # Budget exhaustion, provider failure or an invalid receipt must
+                # not stop ordinary @ intake: fall back to the deterministic
+                # resolver, which never grants anything the model could not.
+                self.last_semantic_fallback_code='semantic_resolution_fallback'
+                resolution=CommandResolver(self.registry).resolve(envelope,preferred_binding_id=preferred)
             if resolution is None or self.should_stop():return []
         if resolution.binding is None or resolution.authorization is None:
             self.last_native_issue_code = resolution.reason_code or 'verified_local_binding_required'

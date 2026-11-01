@@ -28,15 +28,15 @@ def import_status_proposal(job, library_name):
     """Render only a reconciled receipt; this helper cannot submit or publish."""
     state = job["state"]
     if state == "succeeded":
-        text = f"这个视频已加入“{library_name}”知识库，文字稿和检索资料已就绪，现在可以根据它提问。"
+        text = f"存好啦，在「{library_name}」里，想问啥直接问我就行。"
     elif state == "queued":
-        text = "还没有确认提交这个视频的入库任务；请明确指定当前绑定知识库后再发送保存指令。"
+        text = "还没定存到哪个库，跟我说下库名就行。"
     elif state in {"accepted", "processing"}:
-        text = "这个视频的入库任务仍在处理中，尚未确认完成。可以在本视频下再问我入库进度。"
+        text = "还在入库，好了我再回你。"
     elif state in {"failed", "failed_no_submit"}:
-        text = "这次视频入库没有完成，失败记录已保留，请先核对本机处理状态。"
+        text = "这次没存成，记录我先留着了。"
     else:
-        text = "这次入库提交结果暂未确认，记录已保留，暂不重复提交，请先核对本机处理状态。"
+        text = "刚才没确认成功，我先不重复提交。"
     return {"kind": "import_status", "text": text, "source_ids": [], "sources": [],
             "import_job_id": job["job_id"], "import_state": state}
 

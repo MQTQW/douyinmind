@@ -114,8 +114,8 @@ class NativeLane:
     recover() should run before starting the tools worker. It only links exact
     already-existing Queue tasks, never recreates them from old UI evidence.
     """
-    def __init__(self, browser_lane, native_receiver, source_store, *, max_candidates=3, session_lifecycle=None):
-        if type(max_candidates) is not int or max_candidates != 3:
+    def __init__(self, browser_lane, native_receiver, source_store, *, max_candidates=8, session_lifecycle=None):
+        if type(max_candidates) is not int or not 3 <= max_candidates <= 12:
             raise NativeLaneError('invalid_native_candidate_limit')
         self.browser_lane, self.native_receiver, self.source_store = browser_lane, native_receiver, source_store
         self.session_lifecycle = session_lifecycle
@@ -129,6 +129,7 @@ class NativeLane:
         self.last_native_read_diagnostic = {}
         self.visibility_hint_store = None  # Explicit local factory opt-in only.
         self.semantic_intake_ready = None
+        self.clarification_coordinator = None
         self.semantic_candidate_action = None
         self.semantic_ui_source_ready = None
         self.followup_coordinator = None
@@ -514,7 +515,7 @@ class NativeLane:
                 stage='inspect_original_lookup'
                 self.adapter.last_original_lookup={}
                 lookup_started=True
-                detail=self.adapter.open_original_from_notifications(target,max_candidates=3,
+                detail=self.adapter.open_original_from_notifications(target,max_candidates=8,
                     native_candidate_correlation=True)
                 # Do not return or persist detail, native UI references, text,
                 # screenshots or a new envelope from this read-only operation.
@@ -721,7 +722,7 @@ class NativeLane:
                 review_stage='original_lookup';lookup_started=True
                 self.adapter.last_original_lookup={}
                 result=self.adapter.open_original_from_notifications(target,
-                    max_candidates=3,native_candidate_correlation=True)
+                    max_candidates=8,native_candidate_correlation=True)
                 review_stage='after_ui'
                 return result
             rows, thread, correlation, failure = self._prepare_mention_ui(candidate,
@@ -1597,7 +1598,7 @@ class NativeLane:
             self._hold(claim, 'native_legacy_alias_ambiguous'); return []
         rows,thread,correlation,failure = self._prepare_mention_ui(candidate,
             read_original=lambda target:self._read_with_interruption_receipt(claim,'original_ui_lookup',lambda:
-                self.adapter.open_original_from_notifications(target,max_candidates=3,native_candidate_correlation=True)),
+                self.adapter.open_original_from_notifications(target,max_candidates=8,native_candidate_correlation=True)),
             source_checkpoint=lambda:self._check(claim,reverify_identity=True))
         if not rows:
             if failure is not None:self._hold(claim,failure)
@@ -1667,6 +1668,12 @@ class NativeLane:
         for session in scoped:
             env = session['root_envelope']
             original_row = self.source_store.lookup_source_for_task(session['root_task_id'])
+            if getattr(self,'clarification_coordinator',None) is not None:
+                menu_task=self.queue.get_task(session['root_task_id'])
+                if menu_task and menu_task.get('envelope',{}).get('evidence',{}).get('source_kind')=='intent_clarification_reply':
+                    origin=self.clarification_coordinator.origin_for_task(menu_task)
+                    if origin is None:continue
+                    original_row=self.source_store.lookup_source_for_task(origin['id'])
             if original_row is not None:
                 if (original_row.get('state') != 'admitted' or original_row.get('historical') is not False
                         or self.source_store.admission_current(original_row['source_id']) is not True):
@@ -1710,6 +1717,18 @@ class NativeLane:
 
     def _reply(self, claim, session=None):
         candidate = claim['candidate']
+        if getattr(self,'clarification_coordinator',None) is not None and session is None:
+            prepared = self.clarification_coordinator.prepare(claim,
+                checkpoint=lambda:self._check(claim,reverify_identity=True),
+                read=lambda anchor,observed:self._read_with_interruption_receipt(claim,'original_ui_lookup',
+                    lambda:self.adapter.read_followup_reply(anchor,observed,keep_open=True)))
+            if prepared is not None:
+                rows,thread,correlation,failure=prepared
+                if not rows:
+                    self._hold(claim,failure or 'clarification_no_resolution')
+                    return []
+                self._plan(claim,rows[0],thread,correlation)
+                return rows
         session = session or self._reply_session(candidate)
         if session is None:
             if self.followup_coordinator is not None:
@@ -1730,14 +1749,23 @@ class NativeLane:
         if not self._checkpoint(): return []
         if not rows:
             status=getattr(self.choice_controller,'last_semantic_choice_status',None)
-            if (semantic and candidate['source_kind']=='native_notice_candidate' and isinstance(status,dict)
-                    and status.get('choice_id')==session['choice_id'] and status.get('fallback_allowed') is True
-                    and all(status.get(key) is False for key in ('parent_proved','model_started','selection_reserved'))
-                    and self._check(claim,reverify_identity=True)):
-                # No model or Choice reservation happened. The ordinary real-@
-                # opener/builder still has to prove the new independent Root.
-                return self._mention(claim)
-            self._hold(claim, 'native_reply_not_matched'); return []
+            fallback=(isinstance(status,dict) and status.get('choice_id')==session['choice_id']
+                and status.get('fallback_allowed') is True and not status.get('selection_reserved')
+                and self._check(claim,reverify_identity=True))
+            if semantic and fallback and status.get('semantic_failed') is True:
+                # One deterministic retry on the same fresh public reply. This
+                # path never calls the paid model and never guesses a library.
+                rows = self.choice_controller.collect_pending(_InterruptionReadAdapter(self,claim),
+                    self.run_id or 'native-owner', choice_id=session['choice_id'],
+                    source_checkpoint=lambda envelope:self._choice_source_checkpoint(claim,session,envelope))
+            if not rows:
+                if (fallback and status.get('semantic_failed') is not True
+                        and all(status.get(key) is False for key in ('parent_proved','model_started'))
+                        and candidate['source_kind']=='native_notice_candidate'):
+                    # No model or Choice reservation happened: the ordinary
+                    # real-@ opener/builder still has to prove a new Root.
+                    return self._mention(claim)
+                self._hold(claim, 'native_reply_not_matched'); return []
         if len(rows) != 1: raise ValueError('native_plan_conflict')
         row = rows[0]; env = row['envelope']; proof = env.get('evidence', {})
         observed = env.get('native_comment_id')
@@ -1870,10 +1898,14 @@ class NativeLane:
             claim = pending['claim']
             self.source_store.finish_ui_admission(claim['source_id'], claim['claim_token'], task['id'], reference)
             self._pending.pop(reference, None)
+        if getattr(self,'clarification_coordinator',None) is not None:
+            self.clarification_coordinator.admitted(tasks)
 
     def recover(self):
         """Only observe existing immutable Queue rows; never re-enqueue a plan."""
         self._owner()
+        if getattr(self,'clarification_coordinator',None) is not None:
+            self.clarification_coordinator.reconcile_existing()
         recovered = 0
         plans = self.source_store.recoverable_ui_plans()
         if not isinstance(plans, list) or len(plans) > 100:
@@ -1909,6 +1941,8 @@ class NativeLane:
             elif env.get('evidence', {}).get('source_kind') == 'library_choice_reply':
                 self._hold(claim, 'native_plan_conflict'); continue
             self.source_store.finish_ui_admission(claim['source_id'], claim['claim_token'], task['id'], env['reference_id'])
+            if getattr(self,'clarification_coordinator',None) is not None:
+                self.clarification_coordinator.recover_links([task])
             recovered += 1
         return recovered
 
@@ -1964,6 +1998,10 @@ class NativeLane:
             env = task.get('envelope')
             if not isinstance(env, dict) or not isinstance(env.get('reference_id'), str): return False
             proof = env.get('evidence', {})
+            if (proof.get('source_kind') == 'intent_clarification_reply'
+                    and (getattr(self,'clarification_coordinator',None) is None
+                         or not self.clarification_coordinator.authority_current(task))):
+                return False
             if (proof.get('source_kind') == 'conversation_followup'
                     and (self.followup_coordinator is None
                          or not self.followup_coordinator.authority_current(task))):
@@ -1976,6 +2014,26 @@ class NativeLane:
                         or choice.get('child_task_id') not in (None, task['id'])):
                     return False
                 root = self.queue.get_task(choice.get('root_task_id'))
+                if root and root.get('envelope',{}).get('evidence',{}).get('source_kind')=='intent_clarification_reply':
+                    coordinator=getattr(self,'clarification_coordinator',None)
+                    if coordinator is None or coordinator.authority_current(root) is not True:
+                        return False
+                    # The menu task is a new ordinary reply. Its current scope
+                    # and native admission stay mandatory, while only the
+                    # verified origin is used as the physical @ locator.
+                    menu=root
+                    current=self.registry.authorize_snapshot(menu.get('authorization'))
+                    if (current!=Binding.from_dict(menu['binding']) or not current.public_reply_allowed
+                            or any(menu.get(key)!=task.get(key) for key in ('user_id','device_id'))
+                            or not self._authority_current(menu,allow_choice_root=False)):
+                        return False
+                    origin=coordinator.origin_for_task(menu)
+                    root=self.queue.get_task(origin['id']) if isinstance(origin,dict) else None
+                    if (root is None or root['id']==menu['id']
+                            or any(root.get(key)!=origin.get(key) for key in
+                                ('binding','envelope','authorization','user_id','device_id'))
+                            or _identity(choice.get('root_envelope',{}))!=_identity(root['envelope'])):
+                        return False
                 if (not root or root['id'] == task['id']
                         or root.get('envelope', {}).get('evidence', {}).get('source_kind') is not None
                         or root['envelope'].get('reference_id') != proof.get('root_reference_id')

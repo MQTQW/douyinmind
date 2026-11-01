@@ -50,7 +50,7 @@ class ReplyPreflightError(RuntimeError):
 
 class ReplyPublisher:
     def __init__(self, store, binding: Binding, adapter, evidence_root: Path, *, should_stop=None,
-                 scope_authorizer=None, publication_allowed=None):
+                 scope_authorizer=None, publication_allowed=None, content_gate=None):
         self.store, self.binding, self.adapter = store, binding, adapter
         self.evidence_root = Path(evidence_root).absolute()
         self.should_stop = should_stop or (lambda: False)
@@ -59,7 +59,10 @@ class ReplyPublisher:
         self.scope_authorizer = scope_authorizer
         if publication_allowed is not None and not callable(publication_allowed):
             raise ValueError("invalid_publication_gate")
+        if content_gate is not None and not callable(content_gate):
+            raise ValueError("invalid_content_gate")
         self.publication_allowed = (lambda: True) if publication_allowed is None else publication_allowed
+        self.content_gate = content_gate
 
     def _authorized(self):
         current = self.store.get_binding(self.binding.binding_id)
@@ -105,6 +108,22 @@ class ReplyPublisher:
                 or task["state"] != "answer_ready" or reply["state"] != "ready"):
             return {"state": "not_sendable", "task_id": task_id, "attempted": False}
         target, text = reply["target"], reply["text"]
+        if self.content_gate is not None:
+            try:
+                decision = self.content_gate(text, reply.get("kind"))
+            except Exception:
+                decision = {"allowed": False, "reason": "reply_content_invalid"}
+            if not isinstance(decision, dict) or decision.get("allowed") is not True:
+                reason = decision.get("reason") if isinstance(decision, dict) else None
+                reason = reason if isinstance(reason, str) and reason.startswith("reply_content_") else "reply_content_blocked"
+                self._hold(task_id, reason)
+                return {"state": "preflight_blocked", "task_id": task_id,
+                        "attempted": False, "reason_code": reason}
+            text = decision.get("text")
+            if not isinstance(text, str) or not text.strip():
+                self._hold(task_id, "reply_content_invalid")
+                return {"state": "preflight_blocked", "task_id": task_id,
+                        "attempted": False, "reason_code": "reply_content_invalid"}
         if target["source_mode"] != "live_ui" or not self._authorized():
             self._hold(task_id, "public_send_not_authorized")
             return {"state": "preflight_blocked", "task_id": task_id, "attempted": False,

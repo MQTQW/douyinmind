@@ -34,6 +34,19 @@ def semantic_source_key(envelope):
         'receiver_profile_url','video_id','source_mode','reference_id')})
 
 
+def explicit_save_override(envelope, grants):
+    """A clear save command must not be lost to model variance."""
+    from .commands import parse_intent
+    try:
+        deterministic = parse_intent(envelope.get('comment_text', ''), grants, None)
+    except Exception:
+        return None
+    if (deterministic.action == 'save'
+            or (deterministic.action == 'clarify' and deterministic.reason_code == 'save_library_required')):
+        return deterministic
+    return None
+
+
 def parsed_intent_from_receipt(envelope,user,device,grants,receipt):
     from .commands import ParsedIntent
     from .semantic_plan_store import verify_semantic_decision,ui_semantic_digest
@@ -44,6 +57,12 @@ def parsed_intent_from_receipt(envelope,user,device,grants,receipt):
     from .semantic_intent_model import FOLLOWUP_CONTEXT
     query_followup=value.get('followup_context')==FOLLOWUP_CONTEXT
     action,target,grant=value['action'],value['target_state'],value['grant_id']
+    # Model variance must never turn an explicit save command into an open
+    # clarification. The deterministic parser only wins when it is certain.
+    if action in {'clarify', 'query'} and not envelope.get('evidence',{}).get('source_kind'):
+        deterministic = explicit_save_override(envelope, grants)
+        if deterministic is not None:
+            return deterministic
     if envelope.get('evidence',{}).get('source_kind')=='conversation_followup' and action=='save':
         return ParsedIntent('clarify',reason_code='followup_save_requires_mention',
             clarification='这里可以继续根据资料提问；如果要保存视频，请重新 @ 助手并说明要保存的内容。')

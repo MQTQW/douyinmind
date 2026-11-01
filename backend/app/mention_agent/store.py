@@ -222,6 +222,15 @@ def _envelope(value):
         raise AgentStoreError("invalid_video_id")
     result["comment_text"] = _text(result["comment_text"], 8000, preserve=True)
     proof = result["evidence"]
+    if isinstance(proof, dict) and proof.get('source_kind') == 'intent_clarification_reply':
+        from .clarification_evidence import validate_clarification_envelope
+        try:
+            result = validate_clarification_envelope(result)
+        except ValueError:
+            raise AgentStoreError('invalid_clarification_evidence') from None
+        _utc(proof.get('observed_at_utc'))
+        _public_json(proof, 32768)
+        return result
     if isinstance(proof, dict) and proof.get('source_kind') == 'conversation_followup':
         from .followup_evidence import validate_followup_envelope
         try:
@@ -287,6 +296,8 @@ def _canonical_reference(envelope):
         value["reference_id"] = _text(value["reference_id"], 512)
         value["comment_text"] = re.sub(r"\s+", "", value["comment_text"])
         proof = envelope.get("evidence")
+        if isinstance(proof, dict) and proof.get('source_kind') == 'intent_clarification_reply':
+            value['clarification_parent'] = {key: item for key, item in proof.items() if key != 'observed_at_utc'}
         if isinstance(proof, dict) and proof.get('source_kind') == 'conversation_followup':
             from .followup_evidence import PROOF_REQUIRED
             value['followup_parent'] = {key: proof[key] for key in PROOF_REQUIRED - {'observed_at_utc'}}
@@ -329,6 +340,18 @@ def _checked_followup(envelope, binding):
     return True
 
 
+def _checked_clarification(envelope, binding):
+    if envelope.get('evidence', {}).get('source_kind') != 'intent_clarification_reply':
+        return False
+    from .clarification_evidence import validate_clarification_envelope
+    from .contracts import Binding
+    try:
+        validate_clarification_envelope(envelope, Binding.from_dict(binding))
+    except ValueError:
+        raise AgentStoreError('invalid_clarification_binding') from None
+    return True
+
+
 def _verified_target(target, verification, binding):
     """Fresh publication proof; ordinary mentions retain the original contract."""
     if not isinstance(verification, dict):
@@ -343,6 +366,18 @@ def _verified_target(target, verification, binding):
     if (type(verification.get("unique_count")) is not int or verification["unique_count"] != 1
             or verification.get("current_receiver_verified") is not True):
         return False
+    if 'clarification_evidence' in target:
+        if 'followup_evidence' in target or 'choice_evidence' in target:
+            return False
+        proof = target['clarification_evidence']
+        envelope = {key: target[key] for key in _ENVELOPE_KEYS - {'evidence'}}
+        envelope['evidence'] = proof
+        try:
+            if not _checked_clarification(envelope, binding): return False
+            return all(verification.get(key) == item and type(verification.get(key)) is type(item)
+                for key, item in proof.items() if key != 'observed_at_utc')
+        except (ValueError, KeyError, TypeError):
+            return False
     if 'followup_evidence' in target:
         if 'choice_evidence' in target:
             return False
@@ -1238,12 +1273,15 @@ class AgentStore:
                 binding = self._binding_row(db, task["binding_id"])
                 is_choice = _checked_choice(envelope, binding)
                 is_followup = _checked_followup(envelope, binding)
+                is_clarification = _checked_clarification(envelope, binding)
                 if is_choice:
                     target["choice_evidence"] = envelope["evidence"]
                 if is_followup:
                     if proposal['kind'] == 'import_status':
                         raise AgentStoreError('followup_query_only')
                     target['followup_evidence'] = envelope['evidence']
+                if is_clarification:
+                    target['clarification_evidence'] = envelope['evidence']
                 if proposal["kind"] == "import_status":
                     self._checked_import_proposal(db, task_id, proposal)
                 target.update({"binding_id": task["binding_id"], "instance_id": binding["instance_id"],
@@ -1252,7 +1290,7 @@ class AgentStore:
                     target["query_scope"] = "all_local"
                 now = time.time()
                 db.execute("""INSERT INTO agent_replies(reply_id,task_id,proposal,target,state,created_at)
-                  VALUES(?,?,?,?,'ready',?)""", (secrets.token_hex(16), task_id, _public_json(proposal, 65536), _public_json(target, 32768 if is_choice or is_followup else 16384), now))
+                  VALUES(?,?,?,?,'ready',?)""", (secrets.token_hex(16), task_id, _public_json(proposal, 65536), _public_json(target, 32768 if is_choice or is_followup or is_clarification else 16384), now))
                 db.execute("UPDATE agent_tasks SET state='answer_ready',updated_at=? WHERE task_id=?", (now, task_id))
                 result = self._reply(db.execute("SELECT * FROM agent_replies WHERE task_id=?", (task_id,)).fetchone())
         if error:
@@ -1679,7 +1717,7 @@ class AgentStore:
                 _public_json({"release_id": release_id, "reason_code": reason, "released_at_utc": _iso(now),
                               **({"verification": verification} if verification is not None else {})},
                              32768 if any(json.loads(reply['target']).get(key) for key in
-                                 ('choice_evidence','followup_evidence')) else 8192), task_id))
+                                 ('choice_evidence','followup_evidence','clarification_evidence')) else 8192), task_id))
             db.execute("UPDATE agent_tasks SET state='answer_ready',reason_code=?,updated_at=? WHERE task_id=?", (
                 reason, now, task_id))
             return self._reply(db.execute("SELECT * FROM agent_replies WHERE task_id=?", (task_id,)).fetchone())
@@ -1793,11 +1831,57 @@ class AgentStore:
                     "reply": old, "proposal": old["proposal"], "target": old["target"]})
             return result
 
+    def reopen_after_readback(self, task_id, proof):
+        """Explicit one-time reopen of a verification-held unsent reply.
+
+        Requires a fresh read-only B-view readback proving the reply is not
+        visible in the original thread. The publisher must prepare and verify
+        the original again; this never submits anything itself.
+        """
+        if not isinstance(proof, dict) or proof.get('outcome') != 'not_visible':
+            raise AgentStoreError('invalid_readback_proof')
+        counts = proof.get('counts') if isinstance(proof.get('counts'), dict) else {}
+        if (set(counts) - {'matching_reply_count', 'existing_matching_reply_count'}
+                or any(type(value) is not int or value < 0 for value in counts.values())):
+            raise AgentStoreError('invalid_readback_proof')
+        observed = proof.get('observed_at')
+        if type(observed) not in (int, float) or not math.isfinite(observed):
+            raise AgentStoreError('invalid_readback_proof')
+        now = time.time()
+        if not -5 <= now - observed <= 900:
+            raise AgentStoreError('stale_readback_proof')
+        with self._tx() as db:
+            task = db.execute("SELECT * FROM agent_tasks WHERE task_id=?", (task_id,)).fetchone()
+            reply = db.execute("SELECT * FROM agent_replies WHERE task_id=?", (task_id,)).fetchone()
+            if (not task or not reply
+                    or task['state'] not in {'verification_required', 'needs_review'}
+                    or reply['state'] not in {'verification_required', 'needs_review'}):
+                raise AgentStoreError('reply_not_readback_reopenable')
+            binding = self._binding_row(db, task['binding_id'])
+            if binding is None or not binding['active']:
+                raise AgentStoreError('binding_inactive')
+            db.execute("""CREATE TABLE IF NOT EXISTS agent_reply_readback_reopens(
+              reopen_id TEXT PRIMARY KEY,task_id TEXT UNIQUE NOT NULL,observed_at REAL NOT NULL,
+              previous_task_state TEXT NOT NULL,previous_reply_state TEXT NOT NULL,
+              reply_snapshot TEXT NOT NULL,reopened_at REAL NOT NULL)""")
+            if db.execute("SELECT 1 FROM agent_reply_readback_reopens WHERE task_id=?", (task_id,)).fetchone():
+                raise AgentStoreError('readback_reopen_limit_reached')
+            db.execute("INSERT INTO agent_reply_readback_reopens VALUES(?,?,?,?,?,?,?)",
+                       (secrets.token_hex(16), task_id, observed, task['state'], reply['state'],
+                        _public_json(dict(reply), 262144), now))
+            db.execute("UPDATE agent_replies SET state='ready',send_token=NULL,evidence=? WHERE task_id=?",
+                       (_public_json({"reason_code": "readback_confirmed_unsent",
+                                      "readback_observed_at_utc": _iso(observed),
+                                      "reopened_at_utc": _iso(now)}), task_id))
+            db.execute("UPDATE agent_tasks SET state='answer_ready',reason_code=NULL,updated_at=? WHERE task_id=?",
+                       (now, task_id))
+            return self._reply(db.execute("SELECT * FROM agent_replies WHERE task_id=?", (task_id,)).fetchone())
+
     def reserve_send(self, task_id, verification):
         if not isinstance(verification, dict):
             return None
         payload = _public_json(verification, 32768 if verification.get("source_kind") in
-            {"library_choice_reply", "conversation_followup"} else 8192)
+            {"library_choice_reply", "conversation_followup", "intent_clarification_reply"} else 8192)
         with self._tx() as db:
             reply = db.execute("SELECT * FROM agent_replies WHERE task_id=?", (task_id,)).fetchone()
             task = db.execute("SELECT * FROM agent_tasks WHERE task_id=?", (task_id,)).fetchone()

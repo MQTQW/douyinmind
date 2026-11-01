@@ -85,6 +85,132 @@
   font-weight: 500;
 }
 
+.assistant-native-intake-status {
+  margin-top: 17px;
+  color: var(--color-ink-muted);
+  font-size: 12px;
+  line-height: 1.8;
+}
+
+.assistant-native-intake span {
+  overflow-wrap: anywhere;
+}
+
+.assistant-panel .assistant-setup-banner {
+  border: 1px solid var(--color-accent);
+  background: var(--color-accent-light);
+}
+
+.assistant-panel .assistant-setup-banner strong {
+  color: var(--color-accent);
+}
+
+.assistant-setup-card {
+  margin: 0 0 18px;
+  padding: 18px 20px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: var(--color-accent-light);
+}
+
+.assistant-setup-card > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.assistant-setup-card h4 {
+  margin: 0 0 4px;
+  color: var(--color-ink);
+  font-size: 15px;
+}
+
+.assistant-setup-card p {
+  margin: 0;
+  color: var(--color-ink-muted);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.assistant-setup-progress {
+  flex-shrink: 0;
+  padding: 2px 9px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--color-accent);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.assistant-setup-steps {
+  display: grid;
+  gap: 10px;
+  margin: 0 0 14px;
+  padding: 0;
+  list-style: none;
+}
+
+.assistant-setup-steps li {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.assistant-setup-marker {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--color-border);
+  border-radius: 50%;
+  background: #fff;
+  color: var(--color-accent);
+}
+
+.assistant-setup-steps li.is-blocked .assistant-setup-marker {
+  border-color: #e3b5b5;
+  color: #a23;
+}
+
+.assistant-setup-steps strong {
+  display: block;
+  color: var(--color-ink);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.assistant-setup-steps small {
+  display: block;
+  margin-top: 2px;
+  color: var(--color-ink-muted);
+  font-size: 12px;
+}
+
+.assistant-setup-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--color-border);
+}
+
+.assistant-setup-step-action {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 7px;
+}
+
+@media (max-width: 767px) {
+  .assistant-setup-card {
+    padding: 15px 14px;
+  }
+}
+
 @media (max-width: 767px) {
   .assistant-panel .assistant-ui-compact-binding {
     grid-template-columns: repeat(2, minmax(0, 1fr));

@@ -353,3 +353,11 @@ def test_marker_like_text_inside_quoted_library_name_remains_literal():
     grant = {"grant_id": "literal-name", "name": "编程。DM-LIBRARY-01", "aliases": [], "can_import": True}
     result = parse_intent("存到“编程。DM-LIBRARY-01”", [grant])
     assert result.action == "save" and result.grant_id == "literal-name"
+
+@pytest.mark.parametrize("text", [
+    "加入到知识库中", "把当前视频加入到知识库里", "保存当前视频到知识库内",
+])
+def test_unspecified_save_particles_ask_for_a_library(text):
+    result = parse_intent(text, GRANTS, "programming")
+    assert result.action == "clarify"
+    assert result.reason_code == "save_library_required"

@@ -30,6 +30,13 @@ STATES = frozenset({"queued", "waiting_desktop", "executing", "waiting_ingestion
     "verification_required", "failed_no_submit", "failed", "cancelled", "completed_private"})
 TERMINAL = frozenset({"b_view_visible", "delivery_unknown", "verification_required", "failed_no_submit", "failed", "cancelled", "completed_private"})
 SEND_TERMINAL = frozenset({"b_view_visible", "delivery_unknown", "verification_required", "failed_no_submit"})
+# Failures where no public reply/preflight send was produced. The operator may
+# retry these once explicitly; delivery_unknown and visible states stay locked.
+UNSENT_RETRY_REASONS = frozenset({
+    "original_notification_candidates_exceed_limit", "original_notification_changed",
+    "original_notification_not_unique", "original_notification_not_found",
+    "preflight_failed", "preflight_verification_required",
+})
 LABELS = {"queued": "等待处理", "waiting_desktop": "对应电脑尚未连接，任务尚未执行", "executing": "正在处理", "waiting_ingestion": "正在入库，完成后回复",
     "ready_to_publish": "等待回复", "publishing": "正在核对并回复", "waiting_external": "等待后台状态",
     "waiting_library": "已询问，等待你选择知识库",
@@ -466,6 +473,9 @@ class AssistantQueue:
         immutable_envelope = {name: value for name, value in envelope.items() if name not in {"command_id", "evidence"}}
         immutable_envelope["comment_text"] = re.sub(r"\s+", "", immutable_envelope["comment_text"])
         proof = envelope['evidence']
+        if proof.get('source_kind') == 'intent_clarification_reply':
+            immutable_envelope['clarification_parent'] = {name:value for name,value in proof.items()
+                if name!='observed_at_utc'}
         if proof.get('source_kind') == 'conversation_followup':
             # Re-observation can refresh time, never exchange the published
             # anchor, parent quality, account identity or exact prior receipt.
@@ -567,6 +577,10 @@ class AssistantQueue:
             "created_at": utc(task["created_at"]), "updated_at": utc(task["updated_at"]),
             "actions": {"can_reconcile": task["state"] in {"needs_reconcile", "needs_review", "waiting_external", "waiting_ingestion", "waiting_library"},
                         "can_resume": self._resume_phase(task, time.time()) is not None,
+                        "can_retry_unsent": self.can_retry_unsent(task),
+                        "can_readback_unsent": self.can_readback_unsent(task),
+                        "can_retry_after_readback": self.can_retry_after_readback(task),
+                        "can_dismiss_unsent": self.can_dismiss_unsent(task),
                         "can_retry_query": self._query_retry_allowed(task, time.time()) and self.get_query_retry(task['id']) is None},
             "stages": {"intake": "received", "processing": processing_stage,
                        "reply": task["state"] if task["state"] in SEND_TERMINAL else task.get("reply_state") or "not_confirmed"},
@@ -584,6 +598,12 @@ class AssistantQueue:
             if choice.get('state') in {'selected', 'handoff_claimed'}:
                 value['status_label'] = '已选择，准备保存'
                 value['execution_note'] = '已记录你的选择，正在接续保存任务；不会重新发送问库评论。'
+        if task.get('reason_code') == 'operator_confirmed_unsent':
+            value['execution_note'] = '已确认这条回复没有发出；已保留记录。如需结果，请重新在评论区 @ 助手发送一次指令。'
+        if task.get('reason_code') == 'readback_confirmed_unsent':
+            value['execution_note'] = '只读核对未在原评论线程看到这条回复；已保留记录。可重新处理一次，或标记为未提交后重新发送指令。'
+        if task.get('reason_code') == 'readback_unavailable':
+            value['execution_note'] = '只读核对暂时无法完成；任务记录保留。可稍后重试，或标记为未提交后重新发送指令。'
         if detail:
             value["timeline"] = self.list_events(task["id"])
             value["details"] = task.get("details", {})
@@ -891,6 +911,150 @@ class AssistantQueue:
             self._event(db, task_id, "reconciled", {key: value for key, value in result.items() if key != "details"})
             return self._raw(db.execute("SELECT * FROM assistant_tasks WHERE id=?", (task_id,)).fetchone())
 
+    def can_readback_unsent(self, task):
+        """A read-only B-view check is allowed for a never-sent reply."""
+        if task.get("state") == "verification_required":
+            return task.get("reply_state") == "verification_required"
+        if task.get("state") == "needs_review":
+            return (task.get("reason_code") in (UNSENT_RETRY_REASONS | {"readback_confirmed_unsent",
+                                                                         "readback_unavailable"})
+                    and task.get("reply_state") in {"needs_review", "verification_required"})
+        return False
+
+    def apply_unsent_readback(self, task_id, result):
+        """Persist the fixed outcome of a read-only B-view check."""
+        outcome = result.get("outcome") if isinstance(result, dict) else None
+        if outcome not in {"visible", "not_visible", "unavailable"}:
+            raise QueueError("readback_result_invalid")
+        with self._tx() as db:
+            row = db.execute("SELECT * FROM assistant_tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise QueueError("task_not_found")
+            task = self._raw(row)
+            if not self.can_readback_unsent(task):
+                raise QueueError("readback_unsent_not_safe")
+            now = time.time()
+            if outcome == "visible":
+                db.execute("""UPDATE assistant_tasks SET state='b_view_visible',
+                    reason_code='operator_readback_visible',reply_state='b_view_visible',
+                    publication_token=NULL,execution_token=NULL,lease_until=NULL,updated_at=? WHERE id=?""",
+                    (now, task_id))
+            elif outcome == "not_visible":
+                db.execute("UPDATE assistant_tasks SET reason_code='readback_confirmed_unsent',updated_at=? WHERE id=?",
+                           (now, task_id))
+            else:
+                db.execute("UPDATE assistant_tasks SET reason_code='readback_unavailable',updated_at=? WHERE id=?",
+                           (now, task_id))
+            counts = result.get("counts") if isinstance(result.get("counts"), dict) else {}
+            self._event(db, task_id, "readback_unsent", {"outcome": outcome, "counts": counts})
+            return self._raw(db.execute("SELECT * FROM assistant_tasks WHERE id=?", (task_id,)).fetchone())
+
+    def latest_readback_unsent(self, task_id, *, max_age=900):
+        """Fresh read-only proof that the original thread did not show the reply."""
+        with self._connection() as db:
+            row = db.execute("SELECT metadata,created_at FROM assistant_events WHERE task_id=? AND kind='readback_unsent' ORDER BY created_at DESC LIMIT 1", (task_id,)).fetchone()
+        if row is None:
+            return None
+        observed = row['created_at']
+        if type(observed) not in (int, float) or observed < time.time() - max_age:
+            return None
+        try:
+            value = json.loads(row['metadata']) if row['metadata'] else None
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(value, dict) or value.get('outcome') != 'not_visible':
+            return None
+        counts = value.get('counts') if isinstance(value.get('counts'), dict) else {}
+        return {'outcome': 'not_visible', 'counts': counts, 'observed_at': observed}
+
+    def _retry_after_readback_used(self, task_id):
+        with self._connection() as db:
+            return db.execute("SELECT 1 FROM assistant_events WHERE task_id=? AND kind='retry_after_readback' LIMIT 1",
+                              (task_id,)).fetchone() is not None
+
+    def can_retry_after_readback(self, task):
+        return (task.get('state') in {'verification_required', 'needs_review'}
+                and task.get('reason_code') == 'readback_confirmed_unsent'
+                and not self._retry_after_readback_used(task['id']))
+
+    def retry_after_readback(self, task_id):
+        """Reopen the same never-sent draft for one publish attempt after readback."""
+        with self._tx() as db:
+            row = db.execute("SELECT * FROM assistant_tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise QueueError("task_not_found")
+            task = self._raw(row)
+            if not self.can_retry_after_readback(task):
+                if (task.get('reason_code') == 'readback_confirmed_unsent'
+                        and self._retry_after_readback_used(task_id)):
+                    raise QueueError("retry_after_readback_exhausted")
+                raise QueueError("retry_after_readback_not_safe")
+            now = time.time()
+            db.execute("""UPDATE assistant_tasks SET state='ready_to_publish',reason_code=NULL,reply_state='ready',
+                publication_token=NULL,execution_token=NULL,lease_until=NULL,reconciliation=NULL,reconciled_at=NULL,
+                updated_at=? WHERE id=?""", (now, task_id))
+            self._event(db, task_id, "retry_after_readback", {"previous_state": task["state"]})
+            return self._raw(db.execute("SELECT * FROM assistant_tasks WHERE id=?", (task_id,)).fetchone())
+
+    def can_retry_unsent(self, task):
+        """True only when the previous attempt never produced a public send.
+
+        One explicit retry only: a never-sent task already executed once, so a
+        second repair pass would re-run the answer model for no new evidence.
+        """
+        if task.get("state") == "verification_required":
+            return (task.get("reply_state") == "verification_required"
+                    and task.get("execution_attempts", 0) <= 1)
+        if task.get("state") == "needs_review":
+            return (task.get("reason_code") in UNSENT_RETRY_REASONS
+                    and task.get("reply_state") == "needs_review"
+                    and task.get("execution_attempts", 0) <= 1)
+        return False
+
+    def can_dismiss_unsent(self, task):
+        """Bookkeeping close for a reply that provably never left the machine."""
+        if task.get("state") == "verification_required":
+            return task.get("reply_state") == "verification_required"
+        if task.get("state") == "needs_review":
+            return (task.get("reason_code") in (UNSENT_RETRY_REASONS | {"readback_confirmed_unsent",
+                                                                         "readback_unavailable"})
+                    and task.get("reply_state") in {"needs_review", "verification_required"})
+        return False
+
+    def dismiss_unsent(self, task_id):
+        """Close a never-sent task as not submitted, with no resend attempt."""
+        with self._tx() as db:
+            row = db.execute("SELECT * FROM assistant_tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise QueueError("task_not_found")
+            task = self._raw(row)
+            if not self.can_dismiss_unsent(task):
+                raise QueueError("dismiss_unsent_not_safe")
+            now = time.time()
+            db.execute("""UPDATE assistant_tasks SET state='failed_no_submit',reason_code='operator_confirmed_unsent',
+                reply_state='failed_no_submit',publication_token=NULL,execution_token=NULL,lease_until=NULL,
+                reconciliation=NULL,reconciled_at=NULL,updated_at=? WHERE id=?""", (now, task_id))
+            self._event(db, task_id, "dismiss_unsent",
+                        {"previous_state": task["state"], "previous_reason_code": task.get("reason_code")})
+            return self._raw(db.execute("SELECT * FROM assistant_tasks WHERE id=?", (task_id,)).fetchone())
+
+    def retry_unsent(self, task_id):
+        """Requeue a never-sent reply for one explicit new processing pass."""
+        with self._tx() as db:
+            row = db.execute("SELECT * FROM assistant_tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise QueueError("task_not_found")
+            task = self._raw(row)
+            if not self.can_retry_unsent(task):
+                raise QueueError("retry_unsent_not_safe")
+            now = time.time()
+            db.execute("""UPDATE assistant_tasks SET state='queued',reason_code=NULL,reply_state=NULL,
+                publication_token=NULL,execution_token=NULL,agent_task_id=NULL,lease_until=NULL,
+                reconciliation=NULL,reconciled_at=NULL,updated_at=? WHERE id=?""", (now, task_id))
+            self._event(db, task_id, "retry_unsent",
+                        {"previous_state": task["state"], "previous_reason_code": task.get("reason_code")})
+            return self._raw(db.execute("SELECT * FROM assistant_tasks WHERE id=?", (task_id,)).fetchone())
+
     def resume(self, task_id):
         with self._tx() as db:
             row = db.execute("SELECT * FROM assistant_tasks WHERE id=?", (task_id,)).fetchone()
@@ -939,6 +1103,44 @@ class AssistantQueue:
                     raise QueueError("notice_task_mismatch")
             self._remember(db, binding_id, fingerprint, reason, task_id)
 
+    def set_semantic_triage(self, task_id, body):
+        """Cache a display-only failure explanation; never changes state."""
+        from .semantic_triage import TRIAGE_MAX_CHARS
+        task_id = text(task_id, 128)
+        if (type(body) is not str or not 1 <= len(body) <= TRIAGE_MAX_CHARS
+                or any(ord(char) < 32 and char not in '\t' for char in body)):
+            raise QueueError("invalid_semantic_triage")
+        with self._tx() as db:
+            row = db.execute("SELECT * FROM assistant_tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise QueueError("task_not_found")
+            task = self._raw(row)
+            details = task.get("details") if isinstance(task.get("details"), dict) else {}
+            details = {**details, "semantic_triage": body}
+            db.execute("UPDATE assistant_tasks SET details=?,updated_at=? WHERE id=?",
+                       (encoded(details), time.time(), task_id))
+            self._event(db, task_id, "semantic_triage", {"length": len(body)})
+            return self._raw(db.execute("SELECT * FROM assistant_tasks WHERE id=?", (task_id,)).fetchone())
+
+    def set_semantic_plan_proposal(self, task_id, proposal):
+        """Cache a display-only multi-step plan proposal; never executes it."""
+        task_id = text(task_id, 128)
+        if (type(proposal) is not dict
+                or type(proposal.get('summary')) is not str or not 1 <= len(proposal['summary']) <= 800
+                or type(proposal.get('steps')) is not list or len(proposal['steps']) > 8):
+            raise QueueError('invalid_semantic_plan_proposal')
+        with self._tx() as db:
+            row = db.execute('SELECT * FROM assistant_tasks WHERE id=?', (task_id,)).fetchone()
+            if row is None:
+                raise QueueError('task_not_found')
+            task = self._raw(row)
+            details = task.get('details') if isinstance(task.get('details'), dict) else {}
+            details = {**details, 'semantic_plan_proposal': proposal}
+            db.execute('UPDATE assistant_tasks SET details=?,updated_at=? WHERE id=?',
+                       (encoded(details), time.time(), task_id))
+            self._event(db, task_id, 'semantic_plan_proposal', {'goal': proposal.get('goal')})
+            return self._raw(db.execute('SELECT * FROM assistant_tasks WHERE id=?', (task_id,)).fetchone())
+
     def record_intake_issue(self, fingerprint, sender_profile_url, receiver_profile_url, comment_text,
                             video_id=None, reason_code="remote_device_not_connected", *, evidence):
         """Remember a verified @ without inventing a library or executable task."""
@@ -981,6 +1183,24 @@ class AssistantQueue:
             count = db.execute("SELECT COUNT(*) FROM assistant_intake_issues WHERE state='not_executed'").fetchone()[0]
             rows = db.execute("SELECT * FROM assistant_intake_issues WHERE state='not_executed' ORDER BY created_at DESC,id LIMIT ?", (limit,)).fetchall()
             return {"unresolved_count": count, "recent": [self._public_issue(row) for row in rows]}
+
+    def dismiss_intake_issue(self, issue_id):
+        """Operator acknowledgement of a historical, never-executed intake notice.
+
+        The row is kept (state='dismissed_by_operator'); it is never converted
+        into a task and never counted as a resolved occurrence.
+        """
+        issue_id = text(issue_id, 64)
+        if not re.fullmatch(r"[a-f0-9]{32}", issue_id):
+            raise QueueError("invalid_intake_issue_id")
+        with self._tx() as db:
+            row = db.execute("SELECT * FROM assistant_intake_issues WHERE id=?", (issue_id,)).fetchone()
+            if row is None:
+                raise QueueError("intake_issue_or_task_missing")
+            now = time.time()
+            db.execute("UPDATE assistant_intake_issues SET state='dismissed_by_operator',updated_at=? WHERE id=? AND state='not_executed'",
+                       (now, issue_id))
+            return self._public_issue(db.execute("SELECT * FROM assistant_intake_issues WHERE id=?", (issue_id,)).fetchone())
 
     def resolve_intake_issue(self, issue_id, task_id):
         """Preserve the issue; resolve only against a newly verified real intake."""
@@ -1069,7 +1289,7 @@ class AssistantQueue:
             return result
 
     def request_action(self, task_id, action):
-        if action not in {"reconcile", "resume", "retry_query"}:
+        if action not in {"reconcile", "resume", "retry_query", "retry_unsent", "dismiss_unsent", "readback_unsent", "retry_after_readback"}:
             raise QueueError("invalid_task_action")
         with self._tx() as db:
             task = db.execute("SELECT * FROM assistant_tasks WHERE id=?", (task_id,)).fetchone()
@@ -1083,6 +1303,14 @@ class AssistantQueue:
                     raise QueueError('query_retry_not_safe')
             if action == "resume" and self._resume_phase(self._raw(task), time.time()) is None:
                 raise QueueError("resume_not_safe")
+            if action == "retry_unsent" and not self.can_retry_unsent(self._raw(task)):
+                raise QueueError("retry_unsent_not_safe")
+            if action == "dismiss_unsent" and not self.can_dismiss_unsent(self._raw(task)):
+                raise QueueError("dismiss_unsent_not_safe")
+            if action == "readback_unsent" and not self.can_readback_unsent(self._raw(task)):
+                raise QueueError("readback_unsent_not_safe")
+            if action == "retry_after_readback" and not self.can_retry_after_readback(self._raw(task)):
+                raise QueueError("retry_after_readback_not_safe")
             old = db.execute("SELECT * FROM assistant_actions WHERE task_id=? AND action=? AND state='queued'", (task_id, action)).fetchone()
             if old:
                 return dict(old)

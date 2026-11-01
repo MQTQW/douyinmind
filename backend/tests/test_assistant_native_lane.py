@@ -145,7 +145,7 @@ class NativeCapture(CaptureAdapter):
         self.change_detail = lambda detail: detail
 
     def open_original_from_notifications(self, target, *, max_candidates, native_candidate_correlation):
-        assert max_candidates == 3 and native_candidate_correlation is True
+        assert max_candidates == 8 and native_candidate_correlation is True
         self.native_calls.append(deepcopy(target))
         notice = {'source_profile_url': target['sender_profile_url'], 'exact_text': target['comment_text'],
                   'semantic_fingerprint': 'actually-read-visible-card'}

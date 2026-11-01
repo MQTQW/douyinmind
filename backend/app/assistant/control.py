@@ -191,6 +191,19 @@ class AssistantControl:
             return current
         return self.queue.update_control(change)
 
+    def set_native_intake(self, run_id, summary):
+        from .native_intake_visibility import project_native_intake
+        try:
+            observation = project_native_intake(summary)
+        except Exception:
+            raise QueueError('invalid_native_intake_snapshot') from None
+        def change(current):
+            if current.get('run_id') != run_id:
+                raise QueueError('runtime_owner_changed')
+            current['native_intake'] = observation
+            return current
+        return self.queue.update_control(change)
+
     def heartbeat(self, run_id, *, native_session_status=None):
         observation = None
         if native_session_status is not None:
