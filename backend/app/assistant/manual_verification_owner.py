@@ -22,8 +22,13 @@ _AUTH_REGION_FIND = r"""
       if(s.display==='none'||s.visibility==='hidden'||s.visibility==='collapse'||parseFloat(s.opacity||'1')<=0)return false;}
     return true;
   };
-  const authText=/请完成下列验证|拖动滑块|请依次点击|身份验证|短信验证|安全验证|请输入验证码|发送验证码|扫码登录|验证码登录|手机号登录|账号密码登录|登录抖音/;
-  const candidates=[...document.querySelectorAll('[role="dialog"],[aria-modal="true"],[id*="captcha"],[class*="captcha"],[class*="login-panel"],[class*="loginModal"],[id*="verify"]')].filter(e=>{
+  const diag=()=>'iframe='+[...document.querySelectorAll('iframe')].filter(visible).length
+    +',dialog='+document.querySelectorAll('[role="dialog"],[aria-modal="true"]').length
+    +',captcha='+document.querySelectorAll('[id*="captcha"],[class*="captcha"]').length
+    +',verify='+document.querySelectorAll('[id*="verify"],[class*="verify"]').length;
+  const authText=/请完成下列验证|拖动滑块|请依次点击|身份验证|短信验证|安全验证|请输入验证码|发送验证码|接收短信验证码|发送短信验证|扫码登录|验证码登录|手机号登录|账号密码登录|登录抖音/;
+  const strongAuth=/身份验证|安全验证|短信验证|接收短信验证码|发送短信验证|请完成下列验证/;
+  const candidates=[...document.querySelectorAll('[role="dialog"],[aria-modal="true"],[id*="captcha"],[class*="captcha"],[class*="login-panel"],[class*="loginModal"],[id*="verify"],[class*="verify"]')].filter(e=>{
     if(['HTML','BODY','MAIN'].includes(e.tagName)||!visible(e)||!authText.test(e.innerText||''))return false;
     const r=e.getBoundingClientRect(),s=getComputedStyle(e);
     if(r.x<0||r.y<0||r.right>innerWidth||r.bottom>innerHeight||(r.width>=innerWidth*.95&&r.height>=innerHeight*.95))return false;
@@ -31,22 +36,41 @@ _AUTH_REGION_FIND = r"""
     if([...e.querySelectorAll('main,[role="main"]')].some(visible))return false;
     if([...e.querySelectorAll('h1,[role="heading"][aria-level="1"]')].some(h=>visible(h)&&!authText.test(h.innerText||'')))return false;
     if([...e.querySelectorAll('.comment-input-inner-container,[data-e2e="comment-input"],textarea[placeholder*="评论"],textarea[placeholder*="私信"],[contenteditable="true"][class*="comment"]')].some(visible))return false;
-    if(!e.querySelector('input,iframe,canvas')&&!/拖动滑块|请依次点击/.test(e.innerText||''))return false;
+    // Identity-verification choice panels ("receive code" / "send SMS") have
+    // only buttons; interactive frames and slider/point captchas cover theirs.
+    const text=e.innerText||'';
+    if(!e.querySelector('input,iframe,canvas,button,[role="button"]')
+        &&!/拖动滑块|请依次点击/.test(text)&&!strongAuth.test(text))return false;
     const hit=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);
     return !!hit&&(hit===e||e.contains(hit));
   });
-  const roots=candidates.filter(e=>!candidates.some(o=>o!==e&&o.contains(e)));
+  let roots=candidates.filter(e=>!candidates.some(o=>o!==e&&o.contains(e)));
+  if(roots.length===0){
+    // Some verification modals are a single centered cross-origin frame whose
+    // parent carries no text; bind to that lone large centered frame only.
+    const frames=[...document.querySelectorAll('iframe')].filter(visible).filter(e=>{
+      const r=e.getBoundingClientRect();
+      return r.width>=200&&r.height>=150&&r.x>=0&&r.y>=0&&r.right<=innerWidth&&r.bottom<=innerHeight;
+    });
+    if(frames.length===1){
+      const e=frames[0],r=e.getBoundingClientRect(),cx=r.x+r.width/2,cy=r.y+r.height/2;
+      const centered=Math.abs(cx-innerWidth/2)<=innerWidth*.25&&Math.abs(cy-innerHeight/2)<=innerHeight*.25;
+      const large=r.width*r.height>=innerWidth*innerHeight*.05;
+      const hit=document.elementFromPoint(cx,cy);
+      if(centered&&large&&hit===e)roots=[e];
+    }
+  }
 """
 
 AUTH_REGION_SCRIPT = "() => {" + _AUTH_REGION_FIND + r"""
-  if(roots.length!==1)return {known:false};
+  if(roots.length!==1)return {known:false,hint:diag()};
   const region=roots[0],r=region.getBoundingClientRect(),a=document.activeElement;
   let focused=false;
   if(a&&region.contains(a)&&visible(a)){
     const f=a.getBoundingClientRect(),hit=document.elementFromPoint(f.x+f.width/2,f.y+f.height/2);
     focused=!!hit&&(hit===a||a.contains(hit));
   }
-  return {known:true,x:r.x,y:r.y,width:r.width,height:r.height,focused,active_tag:a&&a.tagName,
+  return {known:true,hint:null,x:r.x,y:r.y,width:r.width,height:r.height,focused,active_tag:a&&a.tagName,
     viewport_width:innerWidth,viewport_height:innerHeight};
 }"""
 
@@ -121,8 +145,7 @@ class ManualVerificationOwner:
                 'publication_busy':bool(counts.get('publishing')),
                 'queue_worker_busy':bool(counts.get('executing') or self._worker_inflight() is True)}
 
-    def _region(self, *, focused=False):
-        proof=self.page.evaluate(AUTH_REGION_SCRIPT)
+    def _validate_region(self, proof, *, focused=False):
         if (type(proof) is not dict or proof.get('known') is not True
                 or any(type(proof.get(k)) not in (int,float) or not math.isfinite(proof[k])
                        for k in ('x','y','width','height','viewport_width','viewport_height'))
@@ -130,6 +153,9 @@ class ManualVerificationOwner:
                 or (focused and proof.get('focused') is not True)):
             raise ValueError('verification_region_unknown')
         return proof
+
+    def _region(self, *, focused=False):
+        return self._validate_region(self.page.evaluate(AUTH_REGION_SCRIPT), focused=focused)
 
     def _point(self, payload):
         if type(payload) is not dict or set(payload)!={'x','y'}:
@@ -151,13 +177,21 @@ class ManualVerificationOwner:
             size=self.page.viewport_size
             if type(size) is not dict or not 1<=size.get('width',0)<=1920 or not 1<=size.get('height',0)<=1200:
                 raise ValueError('verification_frame_unavailable')
-            try:
-                self._region();known=True
-            except ValueError:
-                known=False
+            proof=self.page.evaluate(AUTH_REGION_SCRIPT)
+            known=False
+            hint=None
+            if type(proof) is dict:
+                raw=proof.get('hint')
+                hint=raw if type(raw) is str and re.fullmatch(r'[a-z0-9=,]{0,120}',raw) else None
+                if proof.get('known') is True:
+                    try:
+                        self._validate_region(proof);known=True
+                    except ValueError:
+                        known=False
             return {'ok':True,'frame':self.page.screenshot(type='png',scale='css',timeout=5000),
                     'width':size['width'],'height':size['height'],
-                    'input_enabled':known,'auth_region_known':known}
+                    'input_enabled':known,'auth_region_known':known,
+                    'region_hint':None if known else hint}
         if action in {'begin','cancel'}:
             return {'ok':True}
         if action=='finish':

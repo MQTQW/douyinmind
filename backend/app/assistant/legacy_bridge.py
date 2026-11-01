@@ -25,6 +25,7 @@ from app.mention_agent.store import AgentStoreError
 from .backend_knowledge import BackendKnowledgeTools
 from .commands import CommandResolver
 from .conversation import ConversationStore
+from .reply_humanize import humanize_reply
 
 
 _FOLLOWUP_ANCHOR_COUNT_KEYS = frozenset({'user_count', 'device_count', 'root_task_count', 'origin_count'})
@@ -995,6 +996,81 @@ class LegacyBridge:
         if not result.get('safe_to_execute') and not result.get('safe_to_publish'):
             raise ValueError('resume_not_safe')
 
+    def reopen_after_readback(self, task, proof):
+        """Owner-thread reopen of a never-sent verification-held reply."""
+        if self.adapter is None or threading.get_ident() != self.browser_owner_thread_id:
+            raise ValueError('browser_owner_required')
+        if self.should_stop():
+            raise ValueError('run_stopped')
+        self.adapter.check_intervention()
+        agent_id = task.get('agent_task_id')
+        if not isinstance(agent_id, str):
+            raise ValueError('missing_agent_task')
+        self.agent.reopen_after_readback(agent_id, proof)
+        return {'reopened': True}
+
+    def verify_unsent_reply(self, task):
+        """Owner-only read-only B-view check for a reply that was never sent.
+
+        It never edits a draft, reserves a send token or submits. A positive
+        visible answer is evidence of an existing reply; 'not_visible' only
+        means the currently loaded original thread did not show it, so it is
+        not proof of absence.
+        """
+        if self.adapter is None or threading.get_ident() != self.browser_owner_thread_id:
+            return {'outcome': 'unavailable'}
+        try:
+            snapshot = self.control.snapshot()
+        except Exception:
+            return {'outcome': 'unavailable'}
+        if snapshot.get('desired_state') != 'running' or self.should_stop():
+            return {'outcome': 'unavailable'}
+        try:
+            self.adapter.check_intervention()
+        except Exception as error:
+            from app.mention_receiver.browser import ReceiverInterventionRequired
+            if isinstance(error, ReceiverInterventionRequired):
+                raise
+            return {'outcome': 'unavailable'}
+        text = None
+        target = None
+        agent_id = task.get('agent_task_id')
+        if isinstance(agent_id, str):
+            try:
+                reply = self.agent.get_reply(agent_id)
+            except Exception:
+                reply = None
+            if isinstance(reply, dict):
+                candidate = reply.get('text')
+                if isinstance(candidate, str) and candidate.strip():
+                    text = candidate.strip()
+                if isinstance(reply.get('target'), dict):
+                    target = reply['target']
+        if not text:
+            details = task.get('details') if isinstance(task.get('details'), dict) else {}
+            candidate = details.get('reply_text')
+            if isinstance(candidate, str) and candidate.strip():
+                text = candidate.strip()
+        if not text:
+            return {'outcome': 'unavailable'}
+        if not isinstance(target, dict):
+            envelope = task.get('envelope') or {}
+            target = {key: envelope.get(key) for key in (
+                'sender_profile_url', 'receiver_profile_url', 'video_id', 'comment_text',
+                'reference_id', 'native_comment_id')}
+        try:
+            self.adapter._open_target_for_publish(target)
+        except Exception:
+            return {'outcome': 'unavailable'}
+        try:
+            value = self.adapter._reply_state(target, text)
+        except Exception:
+            return {'outcome': 'unavailable'}
+        counts = {key: value.get(key) for key in ('matching_reply_count', 'existing_matching_reply_count')
+                  if type(value.get(key)) is int}
+        existing = counts.get('existing_matching_reply_count', 0)
+        return {'outcome': 'visible' if existing > 0 else 'not_visible', 'counts': counts}
+
     def inspect_existing_reply(self,task_id):
         """Explicit owner-only B-view inspection; never changes delivery state.
 
@@ -1074,7 +1150,10 @@ class LegacyBridge:
                         and observation.get('exact_body_in_original_thread') is True)
                     counts=observation.get('counts',{}) if type(observation) is dict else {}
                 else:
-                    self.adapter.open_original_from_notifications(target,max_candidates=3)
+                    if target.get('native_comment_id') is not None:
+                        self.adapter.open_original_from_notifications(target,max_candidates=8,native_candidate_correlation=True)
+                    else:
+                        self.adapter.open_original_from_notifications(target,max_candidates=3)
                     if not paused() or not self._authorized(task):raise ValueError()
                     diagnostic['stage']='reply_inspect_current_dom'
                     value=self.adapter._reply_state(target,text)
@@ -1217,7 +1296,8 @@ class LegacyBridge:
         binding = self._binding(task)
         outcome = ReplyPublisher(self.agent,binding,self.adapter,self.agent_path.parent/'reply-evidence',
             should_stop=self.should_stop,scope_authorizer=lambda current:current==binding and self._authorized(task),
-            publication_allowed=lambda:self.control.snapshot().get('desired_state')=='running'
+            publication_allowed=lambda:self.control.snapshot().get('desired_state')=='running',
+            content_gate=lambda text,kind:humanize_reply(text,kind)
             ).publish(result['agent_task_id'])
         if self.choices is not None:
             self.choices.after_publish(task, outcome)

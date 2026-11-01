@@ -414,6 +414,8 @@ def run_registered(queue, control, *, poll_seconds=45, publish_gap_seconds=30, e
                     retry_adapter=bridge.operator_retry_query,intake=lane.collect,run_id=run_id,
                     delivery_readback_adapter=bridge.observe_existing_delivery,
                     operator_readback_adapter=bridge.observe_existing_delivery,
+  unsent_readback_adapter=bridge.verify_unsent_reply,
+  readback_retry_adapter=bridge.reopen_after_readback,
                     recorded_readback_adapter=bridge.get_recorded_delivery)
                 runtime.recover()
                 recover_native=getattr(lane,'recover',None)

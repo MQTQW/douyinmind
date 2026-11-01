@@ -114,8 +114,8 @@ class NativeLane:
     recover() should run before starting the tools worker. It only links exact
     already-existing Queue tasks, never recreates them from old UI evidence.
     """
-    def __init__(self, browser_lane, native_receiver, source_store, *, max_candidates=3, session_lifecycle=None):
-        if type(max_candidates) is not int or max_candidates != 3:
+    def __init__(self, browser_lane, native_receiver, source_store, *, max_candidates=8, session_lifecycle=None):
+        if type(max_candidates) is not int or not 3 <= max_candidates <= 12:
             raise NativeLaneError('invalid_native_candidate_limit')
         self.browser_lane, self.native_receiver, self.source_store = browser_lane, native_receiver, source_store
         self.session_lifecycle = session_lifecycle
@@ -515,7 +515,7 @@ class NativeLane:
                 stage='inspect_original_lookup'
                 self.adapter.last_original_lookup={}
                 lookup_started=True
-                detail=self.adapter.open_original_from_notifications(target,max_candidates=3,
+                detail=self.adapter.open_original_from_notifications(target,max_candidates=8,
                     native_candidate_correlation=True)
                 # Do not return or persist detail, native UI references, text,
                 # screenshots or a new envelope from this read-only operation.
@@ -722,7 +722,7 @@ class NativeLane:
                 review_stage='original_lookup';lookup_started=True
                 self.adapter.last_original_lookup={}
                 result=self.adapter.open_original_from_notifications(target,
-                    max_candidates=3,native_candidate_correlation=True)
+                    max_candidates=8,native_candidate_correlation=True)
                 review_stage='after_ui'
                 return result
             rows, thread, correlation, failure = self._prepare_mention_ui(candidate,
@@ -1598,7 +1598,7 @@ class NativeLane:
             self._hold(claim, 'native_legacy_alias_ambiguous'); return []
         rows,thread,correlation,failure = self._prepare_mention_ui(candidate,
             read_original=lambda target:self._read_with_interruption_receipt(claim,'original_ui_lookup',lambda:
-                self.adapter.open_original_from_notifications(target,max_candidates=3,native_candidate_correlation=True)),
+                self.adapter.open_original_from_notifications(target,max_candidates=8,native_candidate_correlation=True)),
             source_checkpoint=lambda:self._check(claim,reverify_identity=True))
         if not rows:
             if failure is not None:self._hold(claim,failure)
@@ -1749,14 +1749,23 @@ class NativeLane:
         if not self._checkpoint(): return []
         if not rows:
             status=getattr(self.choice_controller,'last_semantic_choice_status',None)
-            if (semantic and candidate['source_kind']=='native_notice_candidate' and isinstance(status,dict)
-                    and status.get('choice_id')==session['choice_id'] and status.get('fallback_allowed') is True
-                    and all(status.get(key) is False for key in ('parent_proved','model_started','selection_reserved'))
-                    and self._check(claim,reverify_identity=True)):
-                # No model or Choice reservation happened. The ordinary real-@
-                # opener/builder still has to prove the new independent Root.
-                return self._mention(claim)
-            self._hold(claim, 'native_reply_not_matched'); return []
+            fallback=(isinstance(status,dict) and status.get('choice_id')==session['choice_id']
+                and status.get('fallback_allowed') is True and not status.get('selection_reserved')
+                and self._check(claim,reverify_identity=True))
+            if semantic and fallback and status.get('semantic_failed') is True:
+                # One deterministic retry on the same fresh public reply. This
+                # path never calls the paid model and never guesses a library.
+                rows = self.choice_controller.collect_pending(_InterruptionReadAdapter(self,claim),
+                    self.run_id or 'native-owner', choice_id=session['choice_id'],
+                    source_checkpoint=lambda envelope:self._choice_source_checkpoint(claim,session,envelope))
+            if not rows:
+                if (fallback and status.get('semantic_failed') is not True
+                        and all(status.get(key) is False for key in ('parent_proved','model_started'))
+                        and candidate['source_kind']=='native_notice_candidate'):
+                    # No model or Choice reservation happened: the ordinary
+                    # real-@ opener/builder still has to prove a new Root.
+                    return self._mention(claim)
+                self._hold(claim, 'native_reply_not_matched'); return []
         if len(rows) != 1: raise ValueError('native_plan_conflict')
         row = rows[0]; env = row['envelope']; proof = env.get('evidence', {})
         observed = env.get('native_comment_id')

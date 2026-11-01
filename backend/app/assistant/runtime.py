@@ -14,7 +14,7 @@ class AssistantRuntime:
     def __init__(self, queue: AssistantQueue, control, *, execute=None, publish=None, reconcile=None, intake=None,
                  run_id=None, owner_thread_id=None, resume_adapter=None, retry_adapter=None,
                  delivery_readback_adapter=None, recorded_readback_adapter=None,
-                 operator_readback_adapter=None):
+                 operator_readback_adapter=None, unsent_readback_adapter=None, readback_retry_adapter=None):
         self.queue, self.control = queue, control
         self.execute_adapter, self.publish_adapter, self.reconcile_adapter = execute, publish, reconcile
         self.intake_adapter = intake
@@ -23,6 +23,8 @@ class AssistantRuntime:
         self.delivery_readback_adapter = delivery_readback_adapter
         self.recorded_readback_adapter = recorded_readback_adapter
         self.operator_readback_adapter = operator_readback_adapter
+        self.unsent_readback_adapter = unsent_readback_adapter
+        self.readback_retry_adapter = readback_retry_adapter
         self._delivery_readback_cursor = None
         self.run_id = run_id or control.snapshot().get("run_id") or "local"
         self.owner_thread_id = threading.get_ident() if owner_thread_id is None else owner_thread_id
@@ -195,6 +197,61 @@ class AssistantRuntime:
         self.reconcile_task(task_id)
         return self.queue.resume(task_id)
 
+    def retry_unsent_task(self, task_id):
+        """One explicit retry for a reply that was never sent."""
+        if not self._running():
+            raise QueueError("retry_unsent_requires_running")
+        return self.queue.retry_unsent(task_id)
+
+    def dismiss_unsent_task(self, task_id):
+        """Close a never-sent task as not submitted; never sends anything."""
+        if not self._running():
+            raise QueueError("dismiss_unsent_requires_running")
+        return self.queue.dismiss_unsent(task_id)
+
+    def retry_after_readback_task(self, task_id):
+        """Reopen a never-sent draft for one publish attempt after readback proof."""
+        if not self._running():
+            raise QueueError("retry_after_readback_requires_running")
+        task = self.queue.get_task(task_id)
+        if task is None:
+            raise QueueError("task_not_found")
+        proof = self.queue.latest_readback_unsent(task_id)
+        if proof is None:
+            raise QueueError("retry_after_readback_requires_readback")
+        adapter = getattr(self, "readback_retry_adapter", None)
+        if adapter is None:
+            raise QueueError("retry_after_readback_unavailable")
+        self._owner()
+        try:
+            adapter(task, proof)
+        except Exception as error:
+            from app.mention_receiver.browser import ReceiverInterventionRequired
+            if isinstance(error, ReceiverInterventionRequired):
+                raise
+            raise QueueError("retry_after_readback_unavailable") from None
+        return self.queue.retry_after_readback(task_id)
+
+    def readback_unsent_task(self, task_id):
+        """Owner-thread read-only B-view check of a reply that was never sent."""
+        if not self._running():
+            raise QueueError("readback_requires_running")
+        task = self.queue.get_task(task_id)
+        if task is None:
+            raise QueueError("task_not_found")
+        adapter = getattr(self, "unsent_readback_adapter", None)
+        if adapter is None:
+            raise QueueError("readback_unavailable")
+        self._owner()
+        try:
+            result = adapter(task)
+        except Exception as error:
+            from app.mention_receiver.browser import ReceiverInterventionRequired
+            if isinstance(error, ReceiverInterventionRequired):
+                raise
+            raise QueueError("readback_unavailable") from None
+        return self.queue.apply_unsent_readback(task_id, result)
+
     def retry_query_task(self, task_id, *, _action=None):
         """Arm one explicit query-only attempt; the worker runs the model later.
 
@@ -256,6 +313,14 @@ class AssistantRuntime:
         try:
             if action['action']=='retry_query':
                 task=self.retry_query_task(action['task_id'],_action=action)
+            elif action['action']=='retry_unsent':
+                task=self.retry_unsent_task(action['task_id'])
+            elif action['action']=='dismiss_unsent':
+                task=self.dismiss_unsent_task(action['task_id'])
+            elif action['action']=='readback_unsent':
+                task=self.readback_unsent_task(action['task_id'])
+            elif action['action']=='retry_after_readback':
+                task=self.retry_after_readback_task(action['task_id'])
             else:
                 task = self.reconcile_task(action["task_id"],operator_readback=True) if action["action"] == "reconcile" else self.resume_task(action["task_id"])
         except QueueError as error:

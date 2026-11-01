@@ -99,3 +99,13 @@ def test_cancel_intent_cannot_create_a_save(case):
     case.model.decision={'action':'cancel','target_state':'unspecified','grant_id':None}
     result=case.router(case.env,source_checkpoint=lambda:True)
     assert result.action=='clarify' and result.reason_code=='semantic_cancelled'
+
+
+def test_explicit_save_override_survives_unstable_model_clarify():
+    from app.assistant.semantic_resolution import explicit_save_override
+    grants = [{"grant_id": "g1", "name": "测试", "aliases": [], "can_import": True,
+               "version": 1, "auth_revision": 1, "binding_id": "b1", "knowledge_base_id": 1,
+               "active": True, "library_exists": True, "public_reply_allowed": True, "is_default": True}]
+    result = explicit_save_override({"comment_text": "@6 加入知识库"}, grants)
+    assert result is not None and result.reason_code == "save_library_required"
+    assert explicit_save_override({"comment_text": "@6 今天天气怎么样"}, grants) is None

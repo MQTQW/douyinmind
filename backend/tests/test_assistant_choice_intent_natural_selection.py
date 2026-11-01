@@ -91,3 +91,11 @@ def test_browser_and_store_share_the_same_exact_forms_not_model_target_parameter
     assert forms['收藏到测试长视频吧'] == {5}
     assert '收藏到未知测试长视频吧' not in forms
     assert '收藏到测试长视频吧？' not in forms
+
+def test_single_option_natural_reply_selects_the_only_library():
+    options = [{'knowledge_base_id': 7, 'name': '测试', 'ordinal': 1}]
+    assert parse_library_selection('我记得就一个知识库吧，加入到那个唯一的知识库就好', options) is options[0]
+    assert parse_library_selection('就一个库，默认那个', options) is options[0]
+    assert parse_library_selection('不要加入到那个唯一的知识库', options) is None
+    # 多个库时同样的模糊说法不猜。
+    assert parse_library_selection('就一个库，默认那个', OPTIONS) is None

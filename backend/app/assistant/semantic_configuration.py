@@ -8,9 +8,11 @@ def semantic_intent_enabled(state_dir):
     path=_owned(Path(state_dir)/'semantic-intent.json')
     ledger=Path(state_dir)/'semantic-plans.sqlite3'
     if not path.exists():
-        if ledger.exists() or ledger.with_suffix(ledger.suffix+'.owner.json').exists():
-            raise NativeConfigurationError('semantic_configuration_required')
-        return False
+        # Default-on: the semantic decision layer is part of the product, even
+        # when a ledger from an earlier default-on run exists. An owned
+        # semantic-intent.json with {"enabled": false} is the explicit rollback
+        # switch; invalid values still raise.
+        return True
     try:
         if path.stat().st_size>256:raise ValueError()
         def pairs(items):

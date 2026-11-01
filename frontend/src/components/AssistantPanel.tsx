@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowDownToLine, ArrowLeft, ArrowRight, BookOpen, Check, ChevronRight, CircleHelp, Clock3, ExternalLink, Inbox, LoaderCircle, Pause, Play, RefreshCw, Search, Settings2, ShieldCheck, Square, Users, X } from 'lucide-react';
 import * as api from '../api';
-import { actionFeedback, assistantCounts, assistantDuration, assistantHeartbeat, assistantNoticeCoveredByAction, assistantScopeLabel, assistantSourceTime, assistantTime, assistantTimingRows, assistantTokenUsage, canResumeTask, canRetryQueryTask, captureSummary, controlLabel, hasActiveAction, hasSendBarrier, intakeStage, isAssistantStartRedundant, isNativeSessionCooldown, libraryChoiceStage, processingStage, replyStage, safeAssistantLink, taskStepLabel, taskIssueExplanation } from '../assistantView';
+import { actionFeedback, assistantCounts, assistantDuration, assistantHeartbeat, assistantNoticeCoveredByAction, assistantScopeLabel, assistantSetupProgress, assistantSourceTime, assistantTime, assistantTimingRows, assistantTokenUsage, canDismissUnsentTask, canReadbackUnsentTask, canResumeTask, canRetryAfterReadbackTask, canRetryUnsentTask, canRetryQueryTask, captureSummary, controlLabel, hasActiveAction, hasSendBarrier, intakeStage, isAssistantStartRedundant, isNativeSessionCooldown, libraryChoiceStage, processingStage, replyStage, safeAssistantLink, taskStepLabel, taskIssueExplanation, taskGuidance } from '../assistantView';
 import type { AssistantNoticeSource, AssistantStage } from '../assistantView';
 import { demoOverview, demoTaskDetail, demoTasks } from '../assistantDemo';
 import AssistantSettings from './AssistantSettings';
@@ -33,6 +33,8 @@ export default function AssistantPanel() {
   const [detailError, setDetailError] = useState('');
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
   const [healthNow, setHealthNow] = useState(() => Date.now());
+  const startRequested = useRef(false);
+  const loginWindowRequested = useRef(false);
   const pageSize = 10;
   const refresh = useCallback(() => setRevision(value => value + 1), []);
   const announce = (message: string, error = false) => setNotice({ message, error, source: { kind: 'local' } });
@@ -109,8 +111,29 @@ export default function AssistantPanel() {
     });
   }, [detail?.id, detail?.latest_action?.id, detail?.latest_action?.state, detail?.latest_action?.reason_code]);
 
+  // Auto-open only for a plain login pause with no task in flight. A mid-task
+  // verification pause keeps the assistant paused and shows a manual button.
+  useEffect(() => {
+    const receiverState = overview?.control.receiver_state;
+    const tasksBusy = Boolean(overview?.counts?.executing || overview?.counts?.publishing
+      || overview?.counts?.waiting_ingestion);
+    const needsLogin = !demo && overview?.control.process_alive === true
+      && receiverState === 'login_required' && !tasksBusy;
+    if (!needsLogin) { loginWindowRequested.current = false; return; }
+    if (!startRequested.current || loginWindowRequested.current) return;
+    loginWindowRequested.current = true;
+    void api.openAssistantLoginWindow()
+      .then(result => { announce(result.message || '正在打开登录窗口；登录完成后助手会自动开启。'); refresh(); })
+      .catch(reason => {
+        loginWindowRequested.current = false;
+        announce(reason instanceof Error ? reason.message : '登录窗口未能打开，请重试。', true);
+      });
+  }, [demo, overview?.control.receiver_state, overview?.control.process_alive]);
+
   const control = async (action: 'start' | 'pause' | 'stop') => {
     if (pending) return;
+    if (action === 'start') startRequested.current = true;
+    if (action === 'stop') { startRequested.current = false; loginWindowRequested.current = false; }
     setPending(action); setNotice(null);
     try {
       if (demo) {
@@ -127,8 +150,33 @@ export default function AssistantPanel() {
     finally { setPending(''); }
   };
 
-  const taskAction = async (task: api.AssistantTask, action: api.AssistantTaskAction) => {
-    if (pending || hasActiveAction(task) || (action === 'resume' && !canResumeTask(task)) || (action === 'retry_query' && !canRetryQueryTask(task))) return;
+  const openLoginWindow = async () => {
+    if (pending) return;
+    setPending('login-window');
+    setNotice(null);
+    try {
+      const result = await api.openAssistantLoginWindow();
+      announce(result.message || '正在打开登录窗口；登录完成后助手会自动开启。');
+      refresh();
+    } catch (reason) {
+      announce(reason instanceof Error ? reason.message : '登录窗口未能打开，请重试。', true);
+    } finally { setPending(''); }
+  };
+
+  const dismissIntakeIssue = async (id: string) => {
+    if (pending) return;
+    setPending(`intake-issue:${id}`);
+    try {
+      await api.dismissAssistantIntakeIssue(id);
+      announce('已忽略这条历史提醒；原记录仍保留。');
+      refresh();
+    } catch (reason) {
+      announce(reason instanceof Error ? reason.message : '这条历史提醒暂时无法忽略。', true);
+    } finally {
+      setPending('');
+    }
+  };
+  const taskAction = async (task: api.AssistantTask, action: api.AssistantTaskAction) => {    if (pending || hasActiveAction(task) || (action === 'resume' && !canResumeTask(task)) || (action === 'retry_query' && !canRetryQueryTask(task)) || (action === 'retry_unsent' && !canRetryUnsentTask(task)) || (action === 'dismiss_unsent' && !canDismissUnsentTask(task)) || (action === 'readback_unsent' && !canReadbackUnsentTask(task)) || (action === 'retry_after_readback' && !canRetryAfterReadbackTask(task))) return;
     setPending(`${action}:${task.id}`); setNotice(null);
     try {
       if (demo) { announce(action === 'retry_query' ? '演示：登记一次只读问答重试，保留原失败与用量，不会重新入库。' : action === 'reconcile' ? '演示：记录一次核查，结果不明的回复仍不会重发。' : '演示：仅继续尚未开始的示例任务。'); }
@@ -142,6 +190,15 @@ export default function AssistantPanel() {
   const capture = captureSummary(overview?.control);
   const configurationError = overview?.configuration?.state === 'unavailable'
     ? api.assistantErrorMessage(overview.configuration.reason_code, '助手设置暂时无法读取，已保留原记录。请核对原有授权和助手设置。') : '';
+  const setupNeeded = overview?.configuration?.state === 'setup_required' || (overview?.setup ? !overview.setup.ready : false);
+  const setupReceiver = overview?.setup?.receiver;
+  const setupAccountsReady = overview?.setup?.steps?.find(step => step.key === 'accounts')?.state === 'ready';
+  const loginNeeded = !demo && overview?.control.process_alive === true
+    && ['login_required', 'verification_required'].includes(overview?.control.receiver_state || '');
+  const loginWindowBusy = overview?.login_window?.active === true;
+  const setupProgress = assistantSetupProgress(overview?.setup);
+  const firstSetupMessage = api.assistantErrorMessage(overview?.configuration?.reason_code,
+    '首次使用还需完成助手设置：填写助手 B 的公开抖音号与主页，并在账号与设备中确认设备与资料范围。');
   const receiverState = overview?.control.receiver_state;
   const receiverCoolingDown = isNativeSessionCooldown(overview, healthNow, !demo);
   const workerError = overview?.control.worker_state === 'error';
@@ -169,17 +226,19 @@ export default function AssistantPanel() {
 
   return <div className="assistant-panel">
     {demo && <div className="assistant-demo-banner"><div><strong>演示数据</strong><span>这些账号和任务是示例；操作只改变本页，不会启动账号、调用模型或发送评论。</span></div><button className="text-button" onClick={() => switchDemo(false)}>返回本机状态<ArrowRight size={14} /></button></div>}
+    {setupNeeded && <div className="assistant-feedback assistant-setup-banner" role="status"><Settings2 size={18} /><div><strong>首次使用，先完成助手设置</strong><p>{firstSetupMessage}{setupProgress.nextTitle && ` 下一步：${setupProgress.nextTitle}。`}</p><button className="text-button" onClick={() => setTab('settings')}>开始设置（已完成 {setupProgress.done}/{setupProgress.total}）</button></div></div>}
+    {(loginNeeded || loginWindowBusy) && <div className="assistant-feedback attention assistant-login-window-banner" role="status"><ShieldCheck size={18} /><div><strong>{loginWindowBusy ? '登录窗口已打开' : '助手需要登录助手 B'}</strong><p>{loginWindowBusy ? (overview?.login_window?.message || '请在打开的 Chrome 窗口里完成登录；关闭窗口后助手会自动重新开启。') : '点「打开登录窗口」后会先暂停助手并打开可见浏览器窗口，扫码、短信验证码和滑块都能直接操作；登录完成并关闭窗口后，助手会自动重新开启。'}</p>{!loginWindowBusy && <button className="ui-button" disabled={Boolean(pending)} onClick={() => void openLoginWindow()}>{pending === 'login-window' ? <LoaderCircle size={15} className="spin" /> : <ShieldCheck size={15} />}打开登录窗口</button>}</div></div>}
     {configurationError && <div className="assistant-feedback attention assistant-configuration-error" role="alert"><ShieldCheck size={18} /><div><strong>原有助手设置暂不可读</strong><p>{configurationError}</p><button className="text-button" onClick={() => setTab('settings')}>核对原有设置</button></div></div>}
     <section className="assistant-control-card" aria-label="助手运行状态">
-      <div className="assistant-control-copy"><Stage value={receiver} /><h4 title={receiverHealthy ? undefined : receiverHelp}>{workerError ? '工具处理出现问题，任务记录已保留' : configurationError ? '先核对原有设置，任务记录会保留' : receiver.label === '最近报告已过期' || receiver.label === '等待助手报告' ? '助手运行状态需要核对' : receiver.label === '已停止' ? '助手已停止，开启后再接收新指令' : receiver.label === '正在停止' ? '助手正在停止，任务记录会保留' : receiver.label === '正在暂停' ? '正在暂停处理，任务记录会保留' : receiver.label === '已暂停' ? '处理已暂停，新指令继续排队' : receiverCoolingDown ? '稍后继续读取通知' : overview?.control.reason_code === 'native_notice_format_unavailable' ? '通知数据格式需要核对，收件已暂停' : receiverState === 'ready' && overview?.control.state === 'running' ? '助手正在留意新指令' : ['login_required', 'verification_required'].includes(receiverState || '') || overview?.control.reason_code === 'verification_required' ? '先完成本人登录或核验，再接收新指令' : receiverState === 'page_unavailable' ? '收件暂时受阻，请核对通知状态' : binding ? '开启后接收新的 @ 指令' : '先确认账号与知识库，再开启收件'}</h4><p className="assistant-muted assistant-capture-observation">最近核对抖音通知：{capture.time}</p></div>
+      <div className="assistant-control-copy"><Stage value={receiver} /><h4 title={receiverHealthy ? undefined : receiverHelp}>{workerError ? '工具处理出现问题，任务记录已保留' : setupNeeded ? '完成首次设置后即可开启助手' : configurationError ? '先核对原有设置，任务记录会保留' : receiver.label === '最近报告已过期' || receiver.label === '等待助手报告' ? '助手运行状态需要核对' : receiver.label === '已停止' ? '助手已停止，开启后再接收新指令' : receiver.label === '正在停止' ? '助手正在停止，任务记录会保留' : receiver.label === '正在暂停' ? '正在暂停处理，任务记录会保留' : receiver.label === '已暂停' ? '处理已暂停，新指令继续排队' : receiverCoolingDown ? '稍后继续读取通知' : overview?.control.reason_code === 'native_notice_format_unavailable' ? '通知数据格式需要核对，收件已暂停' : receiverState === 'ready' && overview?.control.state === 'running' ? '助手正在留意新指令' : ['login_required', 'verification_required'].includes(receiverState || '') || overview?.control.reason_code === 'verification_required' ? '先完成本人登录或核验，再接收新指令' : receiverState === 'page_unavailable' ? '收件暂时受阻，请核对通知状态' : binding ? '开启后接收新的 @ 指令' : '先确认账号与知识库，再开启收件'}</h4><p className="assistant-muted assistant-capture-observation">最近核对抖音通知：{capture.time}</p></div>
       <div className="assistant-control-buttons">{manualAvailable && manualNeeded && <a className="ui-button ui-button-primary" href="http://127.0.0.1:8767/" target="_blank" rel="noreferrer"><ShieldCheck size={15} />本人登录/核验</a>}<button className="ui-button ui-button-primary" onClick={() => void control('start')} disabled={Boolean(pending) || !overview?.capabilities.start || isAssistantStartRedundant(overview) || Boolean(configurationError) || (manualAvailable && manual?.active === true)}>{pending === 'start' ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />}开启助手</button><button className="ui-button" onClick={() => void control('pause')} disabled={Boolean(pending) || !overview?.capabilities.pause}><Pause size={15} />暂停处理</button><button className="ui-button" onClick={() => void control('stop')} disabled={Boolean(pending) || !overview?.capabilities.stop}><Square size={13} />停止</button></div>
     </section>
     <AssistantOperations diagnostics={demo ? undefined : overview?.diagnostics} demo={demo} heartbeatAt={overview?.control.heartbeat_at} captureCycles={capture.cycles} />
-    <div className="assistant-binding-strip assistant-ui-compact-binding"><div><Users size={16} /><span>提问账号<strong>{configurationError ? '设置暂不可读' : binding?.sender_display_name || binding?.sender_public_number || (binding ? '已设置账号 A' : '尚未设置')}</strong></span></div><div><ShieldCheck size={16} /><span>助手账号<strong>{configurationError ? '设置暂不可读' : binding?.receiver_display_name || binding?.receiver_public_number || (binding ? '已设置助手 B' : '尚未设置')}</strong></span></div><div><BookOpen size={16} /><span>查询资料范围<strong>{configurationError ? '设置暂不可读' : binding ? assistantScopeLabel({ ...binding, details: { library_name: binding.knowledge_base_name } }) : '等待选择'}</strong></span></div></div>
+    <div className="assistant-binding-strip assistant-ui-compact-binding"><div><Users size={16} /><span>提问账号<strong>{configurationError ? '设置暂不可读' : binding?.sender_display_name || binding?.sender_public_number || (binding ? '已设置账号 A' : setupAccountsReady ? '已登记，等待设备确认' : '尚未设置')}</strong></span></div><div><ShieldCheck size={16} /><span>助手账号<strong>{configurationError ? '设置暂不可读' : binding?.receiver_display_name || binding?.receiver_public_number || (binding ? '已设置助手 B' : setupReceiver?.state === 'ready' ? `已固定 B（公开抖音号 ${setupReceiver.receiver_public_number ?? ''}）` : '尚未设置')}</strong></span></div><div><BookOpen size={16} /><span>查询资料范围<strong>{configurationError ? '设置暂不可读' : binding ? assistantScopeLabel({ ...binding, details: { library_name: binding.knowledge_base_name } }) : setupNeeded ? '完成设备与授权后可选' : '等待选择'}</strong></span></div></div>
     <nav className="assistant-tabs" aria-label="助手工作区"><button className={tab === 'tasks' ? 'active' : ''} onClick={() => setTab('tasks')}><Inbox size={16} />任务队列</button><button className={tab === 'settings' ? 'active' : ''} onClick={() => setTab('settings')}><Settings2 size={16} />账号与设备</button><button className="text-button assistant-refresh" onClick={refresh} disabled={loading}><RefreshCw size={14} className={loading ? 'spin' : ''} />刷新</button></nav>
     {error && <div className="assistant-feedback attention" role="alert"><CircleHelp size={18} /><div><strong>{error}</strong><p>{items.length ? '以下保留上次读取的记录，当前状态尚未更新。' : '连接后会显示本机任务，不会用示例替代真实记录。'}</p><div className="assistant-inline-actions"><button className="text-button" onClick={refresh}>重新连接</button>{!demo && <button className="text-button" onClick={() => switchDemo(true)}>查看演示数据</button>}</div></div></div>}
     {notice && !selected && <p className={`assistant-notice${notice.error ? ' is-error' : ''}`} role={notice.error ? 'alert' : 'status'}>{notice.error ? <CircleHelp size={15} /> : <Check size={15} />}{notice.message}</p>}
-    {Boolean(overview?.intake_issues?.unresolved_count) && <details className="assistant-intake-issues"><summary>{overview?.intake_issues?.unresolved_count} 条指令待配置，尚未执行<ChevronRight size={14} /></summary><p>这些指令未调用模型或处理资料，不计作已完成任务。请核对账号、设备和知识库授权。</p>{overview?.intake_issues?.recent.map(issue => <div key={issue.id}><strong>{issue.message || '当前账号或设备还没有可用的知识库范围。'}</strong><span>{issue.comment_excerpt}</span><small>{assistantTime(issue.created_at)} · 未执行</small></div>)}</details>}
+    {Boolean(overview?.intake_issues?.unresolved_count) && <details className="assistant-intake-issues"><summary>{overview?.intake_issues?.unresolved_count} 条历史提醒未执行<ChevronRight size={14} /></summary><p>这些是过去没有执行的提醒，不代表新任务；可以核对或忽略。它们不会调用模型、不会修改资料。</p>{overview?.intake_issues?.recent.map(issue => <div key={issue.id}><strong>{issue.message || "当时的账号或设备没有可用范围。"}</strong><span>{issue.comment_excerpt}</span><small>{assistantTime(issue.created_at)} · 未执行<button type="button" className="text-button assistant-issue-dismiss" disabled={Boolean(pending)} onClick={() => void dismissIntakeIssue(issue.id)}>忽略</button></small></div>)}</details>}
     <NativeIntakeNotice summary={overview?.native_intake} />
     {tab === 'tasks' ? <>
       <dl className="assistant-ui-compact-counts" aria-label="任务统计">{[['已接收', counters.received], ['排队中', counters.queued], ['处理中', counters.processing], ['需要核对', counters.attention]].map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{typeof value === 'number' ? value : '—'}</dd></div>)}</dl>
@@ -189,13 +248,35 @@ export default function AssistantPanel() {
         {loading && !items.length && <div className="assistant-empty" role="status"><LoaderCircle className="spin" size={25} /><p>正在读取任务记录…</p></div>}
       </div><div className="assistant-pagination"><span>共 {recordsUnread ? '—' : total} 项{lastUpdated && <small>最近读取 {new Date(lastUpdated).toLocaleTimeString('zh-CN', { hour12: false })}</small>}</span><div><button className="icon-button" aria-label="上一页" disabled={recordsUnread || page <= 1 || loading} onClick={() => setPage(value => value - 1)}><ArrowLeft size={16} /></button><span>{recordsUnread ? '— / —' : `${page} / ${pages}`}</span><button className="icon-button" aria-label="下一页" disabled={recordsUnread || page >= pages || loading} onClick={() => setPage(value => value + 1)}><ArrowRight size={16} /></button></div></div>
       <p className="assistant-boundary-note"><ShieldCheck size={14} />收到指令、资料完成与回复可见分别记录。回复结果不明时只核查，不自动重发。</p>
-    </> : <AssistantSettings demo={demo} binding={overview?.binding} onChanged={refresh} />}
+    </> : <AssistantSettings demo={demo} binding={overview?.binding} setup={overview?.setup} nativeChannel={overview?.native_channel} nativeProvision={overview?.native_provision} onChanged={refresh} />}
     {selected && <TaskDetails task={detail} error={detailError} pending={pending} demo={demo} notice={notice?.message ?? ''} noticeError={notice?.error ?? false} noticeSource={notice?.source} onClose={() => setSelected(null)} onRefresh={refresh} onAction={taskAction} onOpenTask={id => { setNotice(null); setSelected(id); }} />}
   </div>;
 }
 
 function TaskDetails({ task, error, pending, demo, notice, noticeError, noticeSource, onClose, onRefresh, onAction, onOpenTask }: { task: api.AssistantTask | null; error: string; pending: string; demo: boolean; notice: string; noticeError: boolean; noticeSource?: AssistantNoticeSource; onClose: () => void; onRefresh: () => void; onAction: (task: api.AssistantTask, action: api.AssistantTaskAction) => Promise<void>; onOpenTask?: (id: string) => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
+  const [planProposal, setPlanProposal] = useState<{ summary: string } | null>(task?.details?.semantic_plan_proposal?.summary ? { summary: task.details.semantic_plan_proposal.summary } : null);
+  const [planBusy, setPlanBusy] = useState(false);
+  const [planError, setPlanError] = useState('');
+  useEffect(() => { setPlanProposal(task?.details?.semantic_plan_proposal?.summary ? { summary: task.details.semantic_plan_proposal.summary } : null); setPlanError(''); }, [task?.id, task?.details?.semantic_plan_proposal?.summary]);
+  const proposePlan = async () => {
+    if (!task || planBusy) return;
+    setPlanBusy(true); setPlanError('');
+    try { const result = await api.proposeAssistantTaskPlan(task.id); if (result.proposal.summary) setPlanProposal({ summary: result.proposal.summary }); }
+    catch (reason) { setPlanError(reason instanceof Error ? reason.message : '计划建议暂时不可用；原任务记录已保留。'); }
+    finally { setPlanBusy(false); }
+  };
+  const [triageText, setTriageText] = useState<string>(task?.details?.semantic_triage ?? '');
+  const [triageBusy, setTriageBusy] = useState(false);
+  const [triageError, setTriageError] = useState('');
+  useEffect(() => { setTriageText(task?.details?.semantic_triage ?? ''); setTriageError(''); }, [task?.id, task?.details?.semantic_triage]);
+  const explainTriage = async () => {
+    if (!task || triageBusy) return;
+    setTriageBusy(true); setTriageError('');
+    try { const result = await api.explainAssistantTask(task.id); setTriageText(result.text); }
+    catch (reason) { setTriageError(reason instanceof Error ? reason.message : '解释暂时不可用；原任务记录已保留。'); }
+    finally { setTriageBusy(false); }
+  };
   useEffect(() => { const node = dialog.current; node?.showModal(); return () => { if (node?.open) node.close(); }; }, []);
   const replyText = task?.reply?.text ?? task?.details?.reply_text;
   const sources = task?.sources ?? task?.details?.sources;
@@ -203,6 +284,7 @@ function TaskDetails({ task, error, pending, demo, notice, noticeError, noticeSo
   const actionStatus = latestAction ? actionFeedback(latestAction) : null;
   const timingRows = task ? assistantTimingRows(task) : [];
   const issue = task ? taskIssueExplanation(task) : null;
+  const guidance = task ? taskGuidance(task) : null;
   const choice = task?.details?.library_choice;
   const choiceStage = task ? libraryChoiceStage(task) : null;
   const stages = task ? [intakeStage(task), processingStage(task), replyStage(task)].filter((stage, index, values) =>
@@ -219,19 +301,33 @@ function TaskDetails({ task, error, pending, demo, notice, noticeError, noticeSo
   return <dialog ref={dialog} className="assistant-detail-dialog" onCancel={onClose} aria-labelledby="assistant-detail-title" onClick={event => { if (event.target === dialog.current) onClose(); }}><div className="assistant-detail-inner"><header><div><p className="eyebrow">{demo ? '演示任务 · 仅本地示例' : '任务记录'}</p><h3 id="assistant-detail-title">{task?.video_title || '指令详情'}</h3></div><button className="icon-button" onClick={onClose} aria-label="关闭任务详情" autoFocus><X size={19} /></button></header>
     {!task ? <div className="assistant-empty">{error ? <><CircleHelp size={25} /><p role="alert">{error}</p><button className="ui-button" onClick={onRefresh}>重新读取</button></> : <><LoaderCircle className="spin" /><p>正在读取处理记录…</p></>}</div> : <>
       <div className="assistant-detail-stages">{stages.map(stage => <Stage key={`${stage.tone}:${stage.label}`} value={stage} />)}</div>
-      {issue && <div className="assistant-feedback attention"><CircleHelp size={18} /><p><code>{issue.code}</code>（{issue.message}）</p></div>}
+      {guidance && <section className={`assistant-guidance is-${guidance.tone}`} aria-label="任务状态与下一步">{guidance.tone === "success" ? <Check size={18} /> : guidance.tone === "danger" ? <CircleHelp size={18} /> : guidance.tone === "active" ? <LoaderCircle size={18} className="spin" /> : <ShieldCheck size={18} />}<div><strong>{guidance.title}</strong><p>{guidance.message}</p>{issue && issue.message !== guidance.message && <small>{issue.message}</small>}</div></section>}
       {!completedActionHistory && actionRecord}
-      {task.state === 'waiting_desktop' && <div className="assistant-feedback attention"><CircleHelp size={18} /><p>对应电脑尚未连接；任务正在等待，尚未调用模型或读取该电脑的资料。</p></div>}
-      {task.state === 'needs_review' && task.reason_code === 'preflight_verification_required' && !hasSendBarrier(task) && <div className="assistant-feedback attention"><ShieldCheck size={18} /><p>发布前需要本人核验，这条回复尚未提交。完成核验后，先开启助手，再核查原任务；后台允许时才可显式继续，不会自动重发。</p></div>}
-      {canRetryQueryTask(task) && <div className="assistant-feedback attention"><RefreshCw size={18} /><p>这次查找资料失败，尚未准备或发送回答。可重试本条问答一次，会重新调用模型并记录用量；原失败记录保留，不会重新导入视频。</p></div>}
+      {triageText && <section className="assistant-detail-section" aria-label="助手解释"><h4>助手解释</h4><p>{triageText}</p></section>}
+      {planProposal && <section className="assistant-detail-section" aria-label="处理计划建议"><h4>处理计划建议（仅建议，未执行）</h4><p>{planProposal.summary}</p></section>}
+      {planError && <p className="assistant-notice is-error" role="alert">{planError}</p>}
+      {triageError && <p className="assistant-notice is-error" role="alert">{triageError}</p>}
       {error && <div className="assistant-feedback attention" role="alert"><p>{error} 以下保留上次读取的详情。</p></div>}
-      {hasSendBarrier(task) && task.state !== 'b_view_visible' && task.reply_state !== 'b_view_visible' && <div className="assistant-feedback attention"><ShieldCheck size={18} /><p>这项回复已经进入发送核对。保留原记录，只能核查，不能重新发送。</p></div>}
       <section className="assistant-detail-section"><h4>原评论指令</h4><blockquote>{task.comment_text || '未记录评论正文'}</blockquote><dl><div><dt>收到时间</dt><dd>{assistantTime(task.created_at)}</dd></div><div><dt>最近更新</dt><dd>{assistantTime(task.updated_at)}</dd></div><div><dt>资料范围</dt><dd>{assistantScopeLabel(task)}</dd></div></dl></section>
       {choiceStage && <section className="assistant-detail-section" aria-label="本轮选库状态"><h4>本轮保存位置</h4>{!stages.some(stage => stage.label === choiceStage.label && stage.tone === choiceStage.tone) && <Stage value={choiceStage} />}<p>{choiceTargetLabel}</p>{typeof choice?.option_count === 'number' && Number.isSafeInteger(choice.option_count) && choice.option_count >= 0 && <p>本轮可选知识库：{choice.option_count} 个</p>}<p className="assistant-muted">请在抖音原评论线程回答库名或序号。选定后另建保存任务；已询问和已选择都不等于视频已经入库。</p>{child && <button className="text-button" disabled={!onOpenTask || Boolean(pending)} onClick={() => onOpenTask?.(child)}>查看对应保存任务<ChevronRight size={14} /></button>}</section>}
       {replyText && <section className="assistant-detail-section"><h4>{task.state === 'completed_private' ? '本机处理结果' : '回复内容'}</h4><p className="assistant-reply-text">{replyText}</p><small>{task.state === 'completed_private' ? '结果仅保存在本机，没有提交到抖音。之后更改公开许可也不会自动发表这条旧记录。' : task.reply_state === 'b_view_visible' || task.state === 'b_view_visible' ? '已确认助手账号回读可见；提问账号和其他人视角需另核对。' : '准备好回复不代表已经发表，请以上方回复状态为准。'}</small></section>}
-      {notice && !assistantNoticeCoveredByAction(task, noticeSource) && <p className={`assistant-notice${noticeError ? ' is-error' : ''}`} role={noticeError ? 'alert' : 'status'}>{notice}</p>}<footer className="assistant-detail-actions">{task.actions?.can_reconcile && <button className="ui-button" disabled={Boolean(pending) || hasActiveAction(task)} onClick={() => void onAction(task, 'reconcile')}><ShieldCheck size={15} />核查任务状态</button>}{canResumeTask(task) && <button className="ui-button ui-button-primary" disabled={Boolean(pending)} onClick={() => void onAction(task, 'resume')}><Play size={15} />继续未开始任务</button>}{canRetryQueryTask(task) && <button className="ui-button ui-button-primary" disabled={Boolean(pending)} onClick={() => void onAction(task, 'retry_query')}><RefreshCw size={15} />重试本次问答（仅一次）</button>}<button className="text-button" onClick={onRefresh} disabled={Boolean(pending)}>刷新记录</button></footer>
+      {notice && !assistantNoticeCoveredByAction(task, noticeSource) && <p className={`assistant-notice${noticeError ? ' is-error' : ''}`} role={noticeError ? 'alert' : 'status'}>{notice}</p>}
+      <footer className="assistant-detail-actions">
+        {guidance?.actions.includes('retry_after_readback') && canRetryAfterReadbackTask(task) && <button className="ui-button ui-button-primary" disabled={Boolean(pending)} onClick={() => void onAction(task, 'retry_after_readback')}><RefreshCw size={15} />已核对未发出，重新发表</button>}
+        {guidance?.actions.includes('retry_unsent') && canRetryUnsentTask(task) && <button className="ui-button ui-button-primary" disabled={Boolean(pending)} onClick={() => void onAction(task, 'retry_unsent')}><RefreshCw size={15} />重新处理这条回复</button>}
+        {guidance?.actions.includes('retry_query') && canRetryQueryTask(task) && <button className="ui-button ui-button-primary" disabled={Boolean(pending)} onClick={() => void onAction(task, 'retry_query')}><RefreshCw size={15} />重试本次问答（仅一次）</button>}
+        {guidance?.actions.includes('readback_unsent') && canReadbackUnsentTask(task) && <button className="ui-button" disabled={Boolean(pending)} onClick={() => void onAction(task, 'readback_unsent')}><ShieldCheck size={15} />只读核对是否已发出</button>}
+        {guidance?.actions.includes('reconcile') && task.actions?.can_reconcile && <button className="ui-button" disabled={Boolean(pending) || hasActiveAction(task)} onClick={() => void onAction(task, 'reconcile')}><ShieldCheck size={15} />核查任务状态</button>}
+        {guidance?.actions.includes('dismiss_unsent') && canDismissUnsentTask(task) && <button className="ui-button" disabled={Boolean(pending)} onClick={() => void onAction(task, 'dismiss_unsent')}><X size={15} />标记为未提交并结束</button>}
+        {guidance?.actions.includes('resume') && canResumeTask(task) && <button className="ui-button ui-button-primary" disabled={Boolean(pending)} onClick={() => void onAction(task, 'resume')}><Play size={15} />继续未开始任务</button>}
+        {task.state === 'waiting_library' && <span className="assistant-muted assistant-guidance-hint">请在抖音原评论线程回复库名，助手会继续处理。</span>}
+        <button className="text-button" onClick={onRefresh} disabled={Boolean(pending)}>刷新记录</button>
+        {task?.comment_text && !planProposal && <button className="ui-button" disabled={planBusy || Boolean(pending)} onClick={() => void proposePlan()}>{planBusy ? <LoaderCircle size={15} className="spin" /> : <CircleHelp size={15} />}生成处理计划</button>}
+        {task && !triageText && ['needs_review', 'needs_reconcile', 'verification_required', 'delivery_unknown', 'failed', 'failed_no_submit', 'waiting_library'].includes(task.state) && <button className="ui-button" disabled={triageBusy || Boolean(pending)} onClick={() => void explainTriage()}>{triageBusy ? <LoaderCircle size={15} className="spin" /> : <CircleHelp size={15} />}让助手解释下一步</button>}
+      </footer>
       <details className="assistant-ui-records"><summary>处理记录<span>来源、步骤、耗时与用量</span></summary>
         {completedActionHistory && actionRecord}
+        {issue && <section className="assistant-detail-section"><h4>状态说明</h4><p className="assistant-muted"><code>{issue.code}</code>（{issue.message}）</p></section>}
         <section className="assistant-detail-section"><h4>处理过程</h4>{task.timeline?.length ? timeline(task.timeline) : <p className="assistant-muted">此任务没有可展示的详细步骤。</p>}{Boolean(task.details?.steps?.length) && <div className="assistant-ui-record-substeps"><h5>模型与工具步骤</h5>{timeline(task.details!.steps!)}</div>}</section>
         <section className="assistant-detail-section"><h4>资料来源</h4>{sources?.length ? sources.map((source, index) => { const link = safeAssistantLink(source.url); return <div className="assistant-source" key={source.source_id ?? source.chunk_id ?? index}><BookOpen size={16} /><div><strong>{source.source_id || `资料 ${index + 1}`} · {source.title || '视频原文'}</strong><small>{assistantSourceTime(source.time_range)}</small><small>{source.chunk_id ? `原文片段 ${source.chunk_id}` : '未记录片段编号'}</small></div>{link && <a className="icon-button" href={link} target="_blank" rel="noreferrer" aria-label="打开来源视频"><ExternalLink size={15} /></a>}</div>; }) : <p className="assistant-muted">入库回执不伪造原文来源；问答来源将在实际检索后显示。</p>}</section>
         <section className="assistant-detail-section"><h4>分阶段耗时</h4><div className="assistant-usage">{timingRows.slice(0, 3).map(stage => <div key={stage.label}><Clock3 size={16} /><span>{stage.label}<strong>{stage.value}</strong></span></div>)}</div><p className="assistant-muted">本机处理不含等待入库和发表；模型耗时包含指令理解与回答。</p><p className="assistant-muted">关联视频处理记录（复用时不算本次耗时）</p><div className="assistant-usage">{timingRows.slice(3).map(stage => <div key={stage.label}><Clock3 size={16} /><span>{stage.label}<strong>{stage.value}</strong></span></div>)}</div><p className="assistant-muted">视频阶段来自关联记录；未测量的项目显示“未记录”。</p></section>

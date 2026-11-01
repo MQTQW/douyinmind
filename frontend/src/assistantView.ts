@@ -1,4 +1,4 @@
-import type { AssistantTask, AssistantOverview, AssistantActionStatus, AssistantLibraryGrant } from './api';
+import type { AssistantTask, AssistantOverview, AssistantActionStatus, AssistantLibraryGrant, AssistantRegistryUser, AssistantDevice } from './api';
 
 export type AssistantTone = 'neutral' | 'active' | 'success' | 'attention' | 'danger';
 export interface AssistantStage { label: string; tone: AssistantTone; }
@@ -93,6 +93,45 @@ export function canResumeTask(task: AssistantTask): boolean {
   return task.actions?.can_resume === true && !hasSendBarrier(task) && !['completed_private', 'waiting_library'].includes(task.state) && !hasActiveAction(task);
 }
 
+export function nativeChannelStage(channel?: { configured: boolean; enabled: boolean; uid_present: boolean } | null,
+  provision?: { active: boolean; stage: string; message?: string | null; last_result?: { ok?: boolean; code?: string } | null } | null): AssistantStage {
+  if (provision?.active) return { label: '切换中', tone: 'active' };
+  if (provision && !provision.active && provision.stage && ['provision_failed', 'provision_timeout', 'failed', 'stop_timeout', 'start_failed'].includes(provision.stage)) {
+    return { label: '切换未完成', tone: 'danger' };
+  }
+  if (channel?.enabled === true) return { label: '接口收件已启用', tone: 'success' };
+  if (channel?.configured === true) return { label: '接口收件未启用', tone: 'neutral' };
+  return { label: '接口收件未配置', tone: 'neutral' };
+}
+
+export function canRetryUnsentTask(task: AssistantTask): boolean {
+  // The backend only exposes this for replies it can prove were never sent;
+  // that explicit proof also lifts the generic send barrier for this action.
+  return task.actions?.can_retry_unsent === true
+    && ['verification_required', 'needs_review'].includes(task.state)
+    && !hasActiveAction(task);
+}
+
+export function canDismissUnsentTask(task: AssistantTask): boolean {
+  // Bookkeeping only: the backend proves this reply never left the machine.
+  return task.actions?.can_dismiss_unsent === true
+    && ['verification_required', 'needs_review'].includes(task.state)
+    && !hasActiveAction(task);
+}
+
+export function canReadbackUnsentTask(task: AssistantTask): boolean {
+  return task.actions?.can_readback_unsent === true
+    && ['verification_required', 'needs_review'].includes(task.state)
+    && !hasActiveAction(task);
+}
+
+export function canRetryAfterReadbackTask(task: AssistantTask): boolean {
+  return task.actions?.can_retry_after_readback === true
+    && task.reason_code === 'readback_confirmed_unsent'
+    && ['verification_required', 'needs_review'].includes(task.state)
+    && !hasActiveAction(task);
+}
+
 export function canRetryQueryTask(task: AssistantTask): boolean {
   return task.actions?.can_retry_query === true && task.kind === 'query'
     && task.state === 'needs_review' && task.reason_code === 'knowledge_query_failed'
@@ -103,6 +142,63 @@ export function canRetryQueryTask(task: AssistantTask): boolean {
 
 export function hasActiveAction(task: AssistantTask): boolean {
   return task.latest_action?.state === 'queued' || task.latest_action?.state === 'processing';
+}
+
+export type TaskGuidanceAction = 'retry_after_readback' | 'retry_unsent' | 'readback_unsent' | 'dismiss_unsent' | 'retry_query' | 'reconcile' | 'resume';
+export interface TaskGuidance {
+  tone: 'success' | 'attention' | 'danger' | 'neutral' | 'active';
+  title: string;
+  message: string;
+  actions: TaskGuidanceAction[];
+}
+
+export function taskGuidance(task: AssistantTask): TaskGuidance {
+  if (['queued', 'executing', 'waiting_ingestion', 'waiting_external', 'ready_to_publish', 'publishing'].includes(task.state)) {
+    return { tone: 'active', title: '正在处理这条指令', message: '助手正在核对或执行；完成后会更新处理结果和回复状态。', actions: [] };
+  }
+  if (task.state === 'waiting_desktop') {
+    return { tone: 'neutral', title: '等待对应电脑上线', message: '任务尚未调用模型或读取那台电脑的资料；电脑上线后会自动继续。', actions: [] };
+  }
+  if (task.state === 'waiting_library') {
+    return { tone: 'success', title: '已在原评论询问知识库', message: '请在抖音原评论线程回复完整库名或序号；选定后助手会另建保存任务并在原线程回复结果。', actions: [] };
+  }
+  if (task.state === 'b_view_visible' || task.reply_state === 'b_view_visible') {
+    return { tone: 'success', title: '回复已发出并在原评论线程可见', message: '助手账号已回读确认可见；提问账号或其他人的视角需另行核对。已发出的内容不会重复发送。', actions: [] };
+  }
+  if (task.reply_state === 'delivery_unknown' || task.state === 'delivery_unknown') {
+    return { tone: 'danger', title: '发送结果未知，禁止自动重发', message: '系统无法确认这条回复是否已经发出；只能做只读核查，不会重新发送。', actions: ['reconcile'] };
+  }
+  if (task.reason_code === 'readback_confirmed_unsent' && task.actions?.can_retry_after_readback !== true) {
+    return { tone: 'attention', title: '已尝试重新发表，仍被平台验证拦截', message: '这条任务已使用过一次重新发表。如果平台仍要求本人核验，建议标记为未提交并结束，然后重新在评论区 @ 助手发一条新指令（新指令会按新任务处理）。', actions: ['dismiss_unsent'] };
+  }
+  if (canRetryAfterReadbackTask(task)) {
+    return { tone: 'attention', title: '已核对未发出，可重新发表一次', message: '只读核对确认原评论线程没有这条回复。可以重新发表同一条草稿（仅一次）；不会重复发送已发出的内容。', actions: ['retry_after_readback', 'dismiss_unsent'] };
+  }
+  if (canRetryUnsentTask(task)) {
+    return { tone: 'attention', title: '这条回复尚未发出', message: '可以重新处理一次：系统会重新核对原评论并发表；已发出的内容不会重复发送。', actions: ['retry_unsent', 'readback_unsent', 'dismiss_unsent'] };
+  }
+  if (canReadbackUnsentTask(task)) {
+    return { tone: 'attention', title: '等待本人核验，回复尚未发出', message: '抖音要求在发表前由本人完成安全验证。可先做只读核对，或把这条标记为未提交后重新发送指令。', actions: ['readback_unsent', 'dismiss_unsent'] };
+  }
+  if (canRetryQueryTask(task)) {
+    return { tone: 'attention', title: '这次查找资料失败，回答尚未发出', message: '可以重试本条问答一次：会重新调用模型并记录用量；原失败记录保留，不会重新导入视频。', actions: ['retry_query', 'reconcile'] };
+  }
+  if (task.state === 'needs_review' || task.state === 'needs_reconcile') {
+    return { tone: 'attention', title: '需要核对这项任务', message: '系统保留原记录，不会自动重发；请先核对原任务状态，再按允许的操作处理。', actions: ['reconcile'] };
+  }
+  if (task.state === 'failed_no_submit') {
+    return { tone: 'neutral', title: '本次未提交', message: '这条回复没有发出。如需结果，请重新在评论区 @ 助手发送一次指令。', actions: [] };
+  }
+  if (task.state === 'failed') {
+    return { tone: 'danger', title: '处理未完成', message: '任务记录已保留；请核对处理记录后再决定是否重新发送。', actions: [] };
+  }
+  if (task.state === 'completed_private') {
+    return { tone: 'neutral', title: '已处理，未公开回复', message: '结果仅保存在本机，没有提交到抖音。', actions: [] };
+  }
+  if (task.state === 'cancelled') {
+    return { tone: 'neutral', title: '任务已停止', message: '原记录保留；如需结果请重新发送指令。', actions: [] };
+  }
+  return { tone: 'neutral', title: '已接收', message: '任务已登记，助手会按当前运行状态处理。', actions: [] };
 }
 
 export function taskIssueExplanation(task: AssistantTask): { code: string; message: string } | null {
@@ -136,7 +232,7 @@ export function taskIssueExplanation(task: AssistantTask): { code: string; messa
 }
 
 export function actionFeedback(action: AssistantActionStatus): AssistantStage & { message: string } {
-  const name = action.action === 'retry_query' ? '问答重试请求' : action.action === 'resume' ? '继续请求' : '核查请求';
+  const name = action.action === 'retry_query' ? '问答重试请求' : action.action === 'retry_unsent' ? '重新处理请求' : action.action === 'dismiss_unsent' ? '关闭未提交记录' : action.action === 'readback_unsent' ? '只读核对请求' : action.action === 'retry_after_readback' ? '重新发表请求' : action.action === 'resume' ? '继续请求' : '核查请求';
   if (action.state === 'queued') return { label: `${name}排队中`, tone: 'neutral', message: '请求已登记，等待助手处理；任务是否完成请看任务状态。' };
   if (action.state === 'processing') return { label: `${name}处理中`, tone: 'active', message: '正在核对这项请求，原任务记录保留。' };
   if (action.state === 'done') return { label: `${name}已处理`, tone: 'neutral', message: '这项请求已处理，请以任务状态为准；不代表资料或评论已经完成。' };
@@ -286,4 +382,44 @@ export function assistantCounts(counts: Record<string, number>): { received: num
   return { received: counts.received ?? counts.total ?? sum(states), queued: counts.queued == null ? undefined : sum(['queued', 'waiting_desktop']),
     processing: counts.processing ?? sum(['executing', 'waiting_ingestion', 'ready_to_publish', 'publishing', 'waiting_external']),
     attention: counts.needs_review == null ? undefined : sum(['needs_review', 'needs_reconcile', 'delivery_unknown', 'verification_required', 'failed', 'failed_no_submit']) };
+}
+
+// First-run setup is a normal product state, not an unreadable legacy record.
+export function assistantSetupStepTone(state?: string): 'success' | 'attention' | 'neutral' {
+  return state === 'ready' ? 'success' : state === 'blocked' ? 'attention' : 'neutral';
+}
+
+export function assistantSetupProgress(setup?: AssistantOverview['setup'] | null): { done: number; total: number; ready: boolean; nextTitle: string | null } {
+  const steps = setup?.steps ?? [];
+  const done = steps.filter(step => step.state === 'ready').length;
+  const next = steps.find(step => step.state !== 'ready');
+  return { done, total: steps.length, ready: Boolean(setup?.ready), nextTitle: next?.title ?? null };
+}
+
+export interface AssistantSetupContext {
+  receiverReady: boolean;
+  matchedUser?: AssistantRegistryUser;
+  localDevice?: AssistantDevice;
+  verifiedDevice?: AssistantDevice;
+  hasScope: boolean;
+}
+
+// First-run actions target the same account/device the backend already paired.
+export function assistantSetupContext(
+  setup: AssistantOverview['setup'] | null | undefined,
+  users: AssistantRegistryUser[] | undefined,
+  localInstanceId?: string,
+): AssistantSetupContext {
+  const receiver = setup?.receiver;
+  const receiverReady = receiver?.state === 'ready';
+  const verified = (users ?? []).filter(user => user.active && user.verification_status === 'verified');
+  const matchedUser = receiverReady && receiver?.receiver_profile_url
+    ? verified.find(user => user.receiver_profile_url === receiver.receiver_profile_url) : undefined;
+  const devices = matchedUser?.devices ?? [];
+  const localDevice = devices.find(device => (device.is_local === true || device.instance_id === localInstanceId)
+    && device.enabled && !device.revoked);
+  const verifiedDevice = localDevice && localDevice.verification_status === 'verified' ? localDevice : undefined;
+  const hasScope = Boolean(verifiedDevice && (verifiedDevice.libraries.some(grant => grant.can_query || grant.can_import)
+    || verifiedDevice.local_owner_access?.active));
+  return { receiverReady, matchedUser, localDevice, verifiedDevice, hasScope };
 }

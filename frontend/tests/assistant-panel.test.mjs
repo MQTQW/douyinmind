@@ -88,7 +88,7 @@ test('a durable readback projection removes pending banner without claiming reci
   assert.doesNotMatch(waitingSelection,/这项回复已经进入发送核对|继续未开始任务/);
   assert.match(waitingSelection,/已询问，等待选择知识库/);
   const stillUnknown=renderDetails({...task,state:'delivery_unknown',reply_state:'delivery_unknown'});
-  assert.match(stillUnknown,/结果待核对/); assert.match(stillUnknown,/这项回复已经进入发送核对/);
+  assert.match(stillUnknown,/结果待核对/); assert.match(stillUnknown,/发送结果未知，禁止自动重发/);
   assert.equal(view.taskStepLabel('decision',undefined,'SYNTHETIC_PRIVATE'),'准备结果');
 });
 

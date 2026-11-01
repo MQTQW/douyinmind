@@ -127,6 +127,7 @@ class ManualVerificationServer:
         self._frame_at = 0.0
         self._width = self._height = 0
         self._input_enabled = self._auth_region_known = False
+        self._region_hint = None
         self._frame_generation = 0
         self._server = self._thread = None
         self._closed = False
@@ -143,6 +144,7 @@ class ManualVerificationServer:
         self._width = self._height = 0
         self._frame_at = 0.0
         self._input_enabled = self._auth_region_known = False
+        self._region_hint = None
 
     def _end(self, state, reason=None, *, failure_facts=None):
         self._pending.clear()  # Includes any unconsumed text; never persisted.
@@ -204,7 +206,8 @@ class ManualVerificationServer:
                     'frame_available': self._frame is not None,
                     'frame_generation': self._frame_generation,
                     'input_enabled': self._input_enabled,
-                    'auth_region_known': self._auth_region_known}
+                    'auth_region_known': self._auth_region_known,
+                    'region_hint': self._region_hint}
             if self._state=='verification_failed' and self._reason=='native_api_error' and self._failure_facts:
                 result['transport_facts']=dict(self._failure_facts)
             return result
@@ -304,6 +307,9 @@ class ManualVerificationServer:
                     self._frame, self._width, self._height = frame, width, height
                     self._input_enabled = result.get('input_enabled', False)
                     self._auth_region_known = result.get('auth_region_known', False)
+                    hint = result.get('region_hint')
+                    self._region_hint = (hint if type(hint) is str
+                                         and re.fullmatch(r'[a-z0-9=,]{0,120}', hint) else None)
                     self._frame_at = self._clock()
                     self._frame_generation += 1
                 elif action == 'finish':
@@ -371,7 +377,8 @@ class ManualVerificationServer:
             nonce = headers.get('x-douyinmind-manual')
             if not self._nonce_valid(nonce):
                 return answer(403, {'code': 'manual_nonce_required'})
-            if self._session and nonce != self._session_nonce:
+            takeover = method == 'POST' and path == '/api/takeover'
+            if self._session and nonce != self._session_nonce and not takeover:
                 return answer(409, {'code': 'manual_session_owned'})
             if method == 'GET' and path == '/api/status':
                 return answer(200, {**self.safe_status(), 'session_id': self._session})
@@ -380,7 +387,7 @@ class ManualVerificationServer:
                     return answer(404, {'code': 'manual_frame_unavailable'})
                 return 200, {**fixed, 'Content-Type': 'image/png',
                              'X-DouyinMind-Frame-Generation': str(self._frame_generation)}, self._frame
-            if method != 'POST' or path not in {'/api/begin', '/api/action'}:
+            if method != 'POST' or path not in {'/api/begin', '/api/action', '/api/takeover'}:
                 return answer(405, {'code': 'manual_method_not_allowed'})
             if origin != self.origin:
                 return answer(403, {'code': 'manual_origin_required'})
@@ -400,6 +407,20 @@ class ManualVerificationServer:
                     self._finalization_epoch += 1
                     self._owner_finalization_pending = True
                     action, payload, command_generation = 'begin', {}, None
+                elif path == '/api/takeover':
+                    # A fresh local page may release a session whose page was
+                    # refreshed/closed. This never grants input authority: the
+                    # page still needs an explicit begin on the owner thread.
+                    if data:
+                        raise ValueError()
+                    if self._session is None:
+                        return answer(200, {'accepted': True, 'taken_over': False,
+                                            'status': self.safe_status()})
+                    if self._state == 'processing' or self._pending:
+                        return answer(409, {'code': 'manual_action_pending'})
+                    self._end('cancelled')
+                    return answer(200, {'accepted': True, 'taken_over': True,
+                                        'status': self.safe_status()})
                 else:
                     base_keys = {'session_id', 'action', 'payload'}
                     if set(data) not in (base_keys, base_keys | {'frame_generation'}) or data['session_id'] != self._session or not self._session:

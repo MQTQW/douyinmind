@@ -645,6 +645,12 @@ class ChoiceController:
             self.last_issue_code='choice_original_not_verified';return []
         except ReceiverPageError:raise
         except (SemanticPlanError,ValueError,TypeError,KeyError):
+            # A paid interpretation that fails (budget, provider, invalid receipt)
+            # falls back to the deterministic frozen-menu selector. The caller
+            # re-reads the same fresh public reply, so nothing is guessed.
+            if not status.get('selection_reserved'):
+                status['fallback_allowed']=True
+                status['semantic_failed']=True
             self.last_issue_code='choice_semantic_unconfirmed';return []
         finally:
             if cleanup_allowed and not self.should_stop():

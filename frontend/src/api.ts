@@ -20,10 +20,31 @@ export interface AssistantOverview {
   counts: Record<string, number>;
   capabilities: { start: boolean; pause: boolean; stop: boolean; multi_user?: boolean; public_visibility?: string };
   binding?: AssistantBindingSummary | null;
-  configuration?: { state: 'ready' | 'not_configured' | 'unavailable'; reason_code?: string | null; message?: string | null };
+  configuration?: { state: 'ready' | 'not_configured' | 'unavailable' | 'setup_required'; reason_code?: string | null; message?: string | null };
+  setup?: AssistantSetup | null;
+  login_window?: { active: boolean; stage: string; message?: string | null } | null;
+  native_provision?: AssistantNativeProvision | null;
+  native_channel?: AssistantNativeChannel | null;
   intake_issues?: { unresolved_count: number; recent: { id: string; comment_excerpt?: string; message?: string; state: string; created_at?: string; }[] };
   native_intake?: { available: false; observed_at?: string; message?: string } | { available: true; observed_at: string; unresolved_count: number; pending_count: number; recent: { id: string; state: string; reason_code?: string; message?: string; comment_excerpt?: string; created_at?: string; }[] } | null;
   diagnostics?: AssistantDiagnostics;
+}
+export interface AssistantSetupStep {
+  key: string; title: string; state: 'ready' | 'missing' | 'blocked'; message?: string;
+}
+export interface AssistantNativeChannel {
+  configured: boolean; enabled: boolean; uid_present: boolean;
+}
+export interface AssistantNativeProvision {
+  active: boolean; stage: string; message?: string | null;
+  last_result?: { ok?: boolean; code?: string; enabled?: boolean } | null;
+}
+export interface AssistantSetup {
+  ready: boolean; state: 'ready' | 'setup_required' | 'unknown'; next_step?: string | null;
+  steps: AssistantSetupStep[];
+  receiver?: { state: string; reason_code?: string; message?: string; receiver_public_number?: string; receiver_profile_url?: string };
+  login?: { state: string; message?: string };
+  message?: string;
 }
 export interface AssistantDiagnostics {
   disk_source_version: string | null;
@@ -41,7 +62,7 @@ export interface AssistantTimelineStep {
   metadata?: { tool_name?: string; elapsed_ms?: number; source_count?: number; status?: string; usage?: AssistantUsage; code?: string; kind?: string };
 }
 export interface AssistantUsage { total_tokens?: number | null; prompt_tokens?: number | null; completion_tokens?: number | null; input_tokens?: number | null; output_tokens?: number | null; model_calls?: number; model_responses?: number; elapsed_ms?: number; }
-export type AssistantTaskAction = 'reconcile' | 'resume' | 'retry_query';
+export type AssistantTaskAction = 'reconcile' | 'resume' | 'retry_query' | 'retry_unsent' | 'dismiss_unsent' | 'readback_unsent' | 'retry_after_readback';
 export interface AssistantActionStatus { id: string; action: AssistantTaskAction; state: 'queued' | 'processing' | 'done' | 'failed'; reason_code?: string | null; message?: string; created_at?: string | number | null; updated_at?: string | number | null; }
 export interface AssistantTimings {
   execution_ms?: number; model_ms?: number; retrieval_ms?: number;
@@ -52,13 +73,13 @@ export interface AssistantTask {
   id: string; kind: string; state: string; status_label?: string; binding_id?: string; user_id?: string; device_id?: string; knowledge_base_id?: number | null; query_scope?: 'library' | 'all_local'; scope_label?: string; execution_note?: string;
   video_id?: string; video_title?: string; comment_text?: string; created_at?: string | number; updated_at?: string | number;
   agent_task_id?: string; reason_code?: string | null; import_state?: string | null; reply_state?: string | null;
-  actions?: { can_reconcile: boolean; can_resume: boolean; can_retry_query?: boolean };
+  actions?: { can_reconcile: boolean; can_resume: boolean; can_retry_query?: boolean; can_retry_unsent?: boolean; can_dismiss_unsent?: boolean; can_readback_unsent?: boolean; can_retry_after_readback?: boolean };
   stages?: Record<string, string | { state?: string; label?: string }>;
   usage?: AssistantUsage | null; timeline?: AssistantTimelineStep[];
   sources?: { source_id?: string; chunk_id?: string; title?: string; url?: string; platform_item_id?: string; time_range?: string }[];
   reply?: { text?: string; state?: string; kind?: string } | null;
   details?: { reply_text?: string; library_name?: string; sources?: AssistantTask['sources']; steps?: AssistantTimelineStep[]; timings?: AssistantTimings;
-    library_choice?: { choice_id?: string; state?: string; option_count?: number; selected_knowledge_base_id?: number | null; selected_library_name?: string | null; child_task_id?: string | null } };
+    library_choice?: { choice_id?: string; state?: string; option_count?: number; selected_knowledge_base_id?: number | null; selected_library_name?: string | null; child_task_id?: string | null }; semantic_triage?: string; semantic_plan_proposal?: { goal?: string; summary?: string; steps?: { tool: string; args: Record<string, unknown> }[] } };
   latest_action?: AssistantActionStatus | null;
 }
 export interface AssistantTaskPage { items: AssistantTask[]; total: number; page: number; page_size: number; }
@@ -95,6 +116,18 @@ const ASSISTANT_ERRORS: Record<string, string> = {
   assistant_configuration_unavailable: '助手设置暂时无法读取，已保留原记录。请核对原有授权和助手设置。',
   assistant_receiver_not_configured: '助手收件配置尚不可用，请核对原有助手设置。',
   assistant_setup_required: '请先完成助手账号与知识库设置，再开启助手。',
+  assistant_receiver_configuration_required: '本机已有助手记录但接收器配置缺失，请核对原有设置；不会自动覆盖。',
+  assistant_receiver_configuration_invalid: '接收器配置无效，请核对原有设置。',
+  login_window_busy: '登录窗口正在处理中，请稍候；完成后助手会自动开启。',
+  native_intake_unavailable: '接口收件功能暂不可用；原网页收件不受影响。',
+  intake_issue_or_task_missing: '这条历史提醒不存在，可能已经处理。',
+  triage_not_applicable: '这条任务还在处理中或不需要失败解释。',
+  plan_proposal_not_applicable: '这条任务没有可规划的原评论内容。',
+  invalid_intake_issue_id: '这条历史提醒编号无效，已保留原记录。',
+  native_intake_busy: '接口收件正在切换中，请稍候；完成后助手会自动开启。',
+  receiver_configuration_locked: '已有助手 B 接收配置，当前不会覆盖；如需更换请先核对原有记录。',
+  invalid_receiver_public_number: '请输入 5–30 位数字的助手 B 公开抖音号。',
+  invalid_receiver_profile_url: '请填写固定的抖音公开主页链接（https://www.douyin.com/user/…），不能使用“我”的动态主页。',
   verified_local_binding_required: '尚无可用的本机授权，请在账号与设备中确认账号、设备和知识库范围。',
   task_not_found: '这个任务已不存在，请刷新任务记录。',
   task_busy: '任务仍在处理中，请稍后核对。',
@@ -143,6 +176,25 @@ async function assistantRequest<T>(path: string, options: RequestInit = {}): Pro
 export function getAssistantOverview(signal?: AbortSignal): Promise<AssistantOverview> {
   return assistantRequest('/overview', { signal });
 }
+export function getAssistantSetup(signal?: AbortSignal): Promise<AssistantSetup> {
+  return assistantRequest('/setup', { signal });
+}
+export function saveAssistantReceiver(body: { receiver_public_number: string; receiver_profile_url: string }): Promise<{ success: boolean; setup: AssistantSetup }> {
+  return assistantRequest('/setup/receiver', { method: 'POST', body: JSON.stringify(body) });
+}
+export function dismissAssistantIntakeIssue(id: string): Promise<{ success: boolean; issue?: { id: string; state: string } }> {
+  return assistantRequest(`/intake-issues/${encodeURIComponent(id)}/dismiss`, { method: 'POST', body: JSON.stringify({}) });
+}
+
+export function openAssistantLoginWindow(): Promise<{ success: boolean; login_window?: AssistantOverview['login_window']; message?: string }> {
+  return assistantRequest('/login-window', { method: 'POST', body: JSON.stringify({}) });
+}
+export function enableAssistantNativeIntake(): Promise<{ success: boolean; native_provision?: AssistantNativeProvision; message?: string }> {
+  return assistantRequest('/native-intake/enable', { method: 'POST', body: JSON.stringify({}) });
+}
+export function disableAssistantNativeIntake(): Promise<{ success: boolean; native_provision?: AssistantNativeProvision; message?: string }> {
+  return assistantRequest('/native-intake/disable', { method: 'POST', body: JSON.stringify({}) });
+}
 export interface AssistantBudgetTotals {
   request_count: number; actual_tokens: number; held_estimated_tokens: number;
   unknown_unbounded_requests: number; unsettled_requests: number; overrun_requests: number;
@@ -170,8 +222,16 @@ export function getAssistantTask(id: string, signal?: AbortSignal): Promise<Assi
 export function controlAssistant(action: 'start' | 'pause' | 'stop'): Promise<{ success: boolean; overview: AssistantOverview }> {
   return assistantRequest(`/${action}`, { method: 'POST', body: '{}' });
 }
+export function proposeAssistantTaskPlan(id: string): Promise<{ success: boolean; proposal: { goal?: string; summary: string; steps?: { tool: string; args: Record<string, unknown> }[]; fallback?: boolean }; cached?: boolean }> {
+  return assistantRequest(`/tasks/${encodeURIComponent(id)}/plan-proposal`, { method: 'POST', body: JSON.stringify({}) });
+}
+
+export function explainAssistantTask(id: string): Promise<{ success: boolean; text: string; cached?: boolean; fallback?: boolean }> {
+  return assistantRequest(`/tasks/${encodeURIComponent(id)}/triage`, { method: 'POST', body: JSON.stringify({}) });
+}
+
 export function actOnAssistantTask(id: string, action: AssistantTaskAction): Promise<{ success: boolean; accepted?: boolean; task?: AssistantTask; message?: string }> {
-  const operation = action === 'retry_query' ? 'retry-query' : action;
+  const operation = action === 'retry_query' ? 'retry-query' : action === 'retry_unsent' ? 'retry-unsent' : action === 'dismiss_unsent' ? 'dismiss-unsent' : action === 'readback_unsent' ? 'readback-unsent' : action === 'retry_after_readback' ? 'retry-after-readback' : action;
   return assistantRequest(`/tasks/${encodeURIComponent(id)}/${operation}`, { method: 'POST', body: '{}' });
 }
 

@@ -274,7 +274,14 @@ def _parse_intent(text, grants, default_grant_id=None):
                             clarification="保存仅限这条评论所在的视频和你获准使用的库。")
     normalized = _target_name(target) if target else None
     literal_named = bool(target[:1] in _QUOTE_PAIRS and any(normalized in _forms(grant) for grant in grants))
-    if not target or (normalized in _UNSPECIFIED_SAVE_NAMES and not literal_named):
+    unspecified = normalized in _UNSPECIFIED_SAVE_NAMES if normalized else False
+    if normalized and not unspecified and not literal_named:
+        # "加入到知识库中/里" is still an unspecified target, not a library name.
+        collapsed = re.sub(r"^(?:到|至|进|入)", "", normalized)
+        collapsed = re.sub(r"(?:中|里|内|吧|了)+$", "", collapsed)
+        if collapsed in _UNSPECIFIED_SAVE_NAMES:
+            normalized, unspecified = collapsed, True
+    if not target or (unspecified and not literal_named):
         return ParsedIntent("clarify",reason_code="save_library_required",
             clarification="请先选择要保存到哪个知识库，选择前不会保存。")
     if normalized in _DEFAULT_NAMES:

@@ -9,6 +9,7 @@ from app.storage_guard import assert_no_orphan_sqlite_files, StorageGuardError
 from .control import AssistantControl
 from .queue import AssistantQueue, QueueError
 from .registry import Registry
+from .setup import receiver_setup_state, setup_status, write_receiver_config
 
 
 BACKEND = Path(__file__).resolve().parents[2]
@@ -67,10 +68,13 @@ def active_local_bindings(registry, receiver_profile_url=None):
     return results
 
 
-def binding_summary(state_dir=STATE, database=None):
+def binding_summary(state_dir=STATE, database=None, receiver_dir=RECEIVER_STATE):
     registry=registry_if_configured(state_dir,database)
     if registry is None:
         return None
+    setup=receiver_setup_state(receiver_dir)
+    if setup['state']!='ready':
+        raise QueueError(setup['reason_code'])
     receiver=receiver_configuration()
     choices=active_local_bindings(registry,receiver['receiver_profile_url'])
     if not choices:
@@ -88,10 +92,13 @@ def binding_summary(state_dir=STATE, database=None):
         **({'import_requires_library_choice': True} if binding.is_all_local else {})}
 
 
-def start_guard(state_dir=STATE, database=None):
+def start_guard(state_dir=STATE, database=None, receiver_dir=RECEIVER_STATE):
     registry=registry_if_configured(state_dir,database)
     if registry is None:
         raise QueueError('assistant_setup_required')
+    setup=receiver_setup_state(receiver_dir)
+    if setup['state']!='ready':
+        raise QueueError(setup['reason_code'])
     try:
         receiver=receiver_configuration()
     except Exception:
@@ -101,9 +108,26 @@ def start_guard(state_dir=STATE, database=None):
     return True
 
 
+def setup_summary(state_dir=STATE, database=None, receiver_dir=RECEIVER_STATE):
+    """Public first-run steps. Reading this never enables the assistant."""
+    registry=registry_if_configured(state_dir,database)
+    snapshot=registry.snapshot(allow_unavailable_catalog=True) if registry is not None else None
+    return setup_status(snapshot,receiver_dir)
+
+
+def save_receiver_setup(public_number, profile_url, receiver_dir=RECEIVER_STATE):
+    """Write the public receiver identity for a fresh installation only."""
+    state=write_receiver_config(receiver_dir,public_number,profile_url)
+    return {'receiver':state}
+
+
 def build_web_service():
     from .routes import AssistantAPI
+    from .login_flow import LoginFlow
+    from .native_flow import NativeIntakeFlow
     queue=AssistantQueue(STATE/'queue.sqlite3',protected_paths=(configured_database(),STORAGE/'mention_agent',
         RECEIVER_STATE,STORAGE/'chroma',STATE/'registry.sqlite3',STATE/'conversation.sqlite3'))
     control=AssistantControl(queue,STATE)
-    return AssistantAPI(queue,control,binding_provider=binding_summary,start_guard=start_guard)
+    return AssistantAPI(queue,control,binding_provider=binding_summary,start_guard=start_guard,
+        setup_provider=setup_summary,receiver_writer=save_receiver_setup,
+        login_flow=LoginFlow(control),native_flow=NativeIntakeFlow(control))

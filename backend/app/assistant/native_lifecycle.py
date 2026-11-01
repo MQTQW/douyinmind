@@ -176,8 +176,13 @@ def _cookie_snapshot(rows, ua, expected_uid, *, now, ttl_cap):
             _fail("session_cookie_shape_unknown")
         if expiry != -1:
             if expiry <= now:
+                if name in _EPHEMERAL_COOKIE_NAMES:
+                    continue  # stale page telemetry is not a credential
                 _fail("session_cookie_expired")
-            expires.append(float(expiry))
+            # Known page telemetry must not cap the credential lifetime; its
+            # short TTL would force the sealed capsule to expire within minutes.
+            if name not in _EPHEMERAL_COOKIE_NAMES:
+                expires.append(float(expiry))
         if name in values and values[name] != value:
             _fail("session_cookie_ambiguous")
         values[name] = value
@@ -189,6 +194,36 @@ def _cookie_snapshot(rows, ua, expected_uid, *, now, ttl_cap):
                              ua, expected_uid, deadline)
     except Exception:
         _fail("session_candidate_invalid")
+
+
+# Real pages continuously mint short-lived telemetry cookies (for example
+# sdk_source_info/bit_env, ~30s TTL) for every route. They are not session
+# credentials and would make an otherwise valid session look "expiring before
+# use"; they are dropped before the sealed snapshot is built. A real credential
+# cookie close to expiry still fails closed.
+_EPHEMERAL_SECONDS = 120
+_EPHEMERAL_COOKIE_NAMES = frozenset({"sdk_source_info", "bit_env", "gulu_source_res",
+                                     "__ac_nonce", "sdk_source_info_v2", "is_dbsc", "x_tt_token"})
+_CREDENTIAL_COOKIES = frozenset({"sessionid", "sessionid_ss", "sid_tt", "sid_guard",
+                                 "uid_tt", "uid_tt_ss", "ttwid", "passport_csrf_token",
+                                 "passport_csrf_token_default"})
+
+
+def _stable_cookie_rows(rows, *, now):
+    stable = []
+    for row in rows:
+        if type(row) is not dict:
+            _fail("session_cookie_shape_unknown")
+        expiry, name = row.get("expires"), row.get("name")
+        if (type(name) is str and name in _EPHEMERAL_COOKIE_NAMES
+                and type(expiry) in (int, float) and math.isfinite(expiry) and expiry != -1
+                and expiry <= now + _EPHEMERAL_SECONDS):
+            # Known page telemetry cookie, never a session credential.
+            continue
+        stable.append(row)
+    if not stable:
+        _fail("session_cookie_shape_unknown")
+    return stable
 
 
 class SameContextCapture:
@@ -250,8 +285,11 @@ class SameContextCapture:
             if (type(ua) is not str or not 1 <= len(ua) <= 4096
                     or any(ord(c) < 32 or ord(c) == 127 for c in ua)):
                 _fail("session_metadata_unavailable")
-            # Only these fixed HTTPS API paths, not all browser cookies.
-            rows = self._context.cookies(list(_URLS))
+            # Only these fixed HTTPS API paths, not all browser cookies. Live
+            # page telemetry cookies with a ~30s TTL are not credentials and
+            # must not make the snapshot look expiring; credentials still fail
+            # closed when close to expiry.
+            rows = _stable_cookie_rows(self._context.cookies(list(_URLS)), now=self._clock())
             snapshot = _cookie_snapshot(rows, ua, self.expected_uid,
                                         now=self._clock(), ttl_cap=self._ttl_cap)
             self.guard()

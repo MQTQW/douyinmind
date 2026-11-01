@@ -366,3 +366,17 @@ input[type=checkbox] { width: 16px; height: 16px; flex-shrink: 0; accent-color: 
 .assistant-owner-settings { margin-top: 14px; padding: 14px; border: 1px solid #DCE6D2; border-radius: 10px; background: #F6F8F1; }
 .assistant-owner-heading { display: flex; gap: 8px; align-items: center; color: var(--color-accent); }.assistant-owner-heading h5 { margin: 0; font-size: 13px; }.assistant-owner-heading small { font-size: 10px; color: var(--color-ink-muted); }
 .assistant-owner-settings p,.assistant-owner-settings .assistant-checkbox small { display: block; color: var(--color-ink-muted); font-size: 11px; line-height: 1.8; margin: 7px 0; }.assistant-owner-settings form { display: grid; gap: 11px; }.assistant-owner-settings .assistant-checkbox { align-items: flex-start; font-size: 12px; }.assistant-owner-settings .assistant-checkbox input { flex-shrink: 0; margin-top: 3px; }.assistant-owner-settings .assistant-checkbox small { margin: 3px 0 0; }.assistant-owner-once { padding-top: 12px; border-top: 1px solid var(--color-border); }.assistant-owner-settings .assistant-owner-error { color: #97503E; }
+
+/* Task detail: one coherent guidance card instead of stacked banners. */
+.assistant-guidance { display: flex; gap: 10px; margin: 15px 22px; padding: 14px 16px; border-radius: 10px;
+  border: 1px solid #E8D4AF; background: #FFF7E9; color: #7A5A27; font-size: 12px; line-height: 1.85; }
+.assistant-guidance > svg { flex-shrink: 0; margin-top: 2px; }
+.assistant-guidance strong { display: block; font-size: 12.5px; font-weight: 600; margin-bottom: 2px; }
+.assistant-guidance p { margin: 0; }
+.assistant-guidance small { display: block; margin-top: 6px; opacity: .85; }
+.assistant-guidance.is-success { background: #EDF6E6; border-color: #CFE3C2; color: #456B3F; }
+.assistant-guidance.is-danger { background: #FAEAE5; border-color: #EBC9BF; color: #8E4638; }
+.assistant-guidance.is-active { background: #EAF2E6; border-color: #D6E4CE; color: #456B3F; }
+.assistant-guidance.is-neutral { background: #F4F6EF; border-color: #E1E7D9; color: #5D6957; }
+.assistant-guidance-hint { align-self: center; margin-right: auto; }
+.assistant-intake-issues .assistant-issue-dismiss { margin-left: 8px; vertical-align: baseline; }

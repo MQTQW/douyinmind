@@ -629,3 +629,41 @@ class DraftReadTests(unittest.TestCase):
 
 
 if __name__ == "__main__": unittest.main()
+
+class StableCookieRowsTests(unittest.TestCase):
+    def test_short_lived_telemetry_cookies_are_not_credentials(self):
+        from app.assistant.native_lifecycle import _stable_cookie_rows
+
+        now = 1_800_000_000.0
+        rows = [{"name": "sdk_source_info", "expires": now + 29},
+                {"name": "bit_env", "expires": now + 29},
+                {"name": "sessionid", "expires": now + 3600},
+                {"name": "ttwid", "expires": -1}]
+        stable = _stable_cookie_rows(rows, now=now)
+        self.assertEqual([row["name"] for row in stable], ["sessionid", "ttwid"])
+
+    def test_known_telemetry_does_not_cap_credential_lifetime(self):
+        from app.assistant.native_lifecycle import _cookie_snapshot
+
+        now = 1_800_000_000.0
+        rows = [{"name": "sessionid", "value": "abc123", "domain": ".douyin.com",
+                 "path": "/", "expires": now + 3600},
+                {"name": "sdk_source_info", "value": "telemetry", "domain": ".douyin.com",
+                 "path": "/", "expires": now + 29},
+                {"name": "is_dbsc", "value": "device", "domain": ".douyin.com",
+                 "path": "/", "expires": now + 120}]
+        snapshot = _cookie_snapshot(rows, "Mozilla/5.0 test", "1234567890123456",
+                                    now=now, ttl_cap=3600)
+        self.assertEqual(snapshot.expires_at, now + 3600)
+
+    def test_expiring_credential_cookie_still_fails_closed(self):
+        from app.assistant.native_lifecycle import (SessionLifecycleError, _cookie_snapshot,
+                                                    _stable_cookie_rows)
+
+        now = 1_800_000_000.0
+        rows = [{"name": "sessionid", "value": "abc123", "domain": ".douyin.com",
+                 "path": "/", "expires": now + 30}]
+        stable = _stable_cookie_rows(rows, now=now)
+        with self.assertRaises(SessionLifecycleError) as raised:
+            _cookie_snapshot(stable, "Mozilla/5.0 test", "1234567890123456", now=now, ttl_cap=3600)
+        self.assertEqual(raised.exception.code, "session_cookie_expiring")

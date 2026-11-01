@@ -375,6 +375,21 @@ class AssistantQueueTests(unittest.TestCase):
         self.assertEqual(self.queue.public_task(final)["stages"]["reply"], "not_public")
         self.assertIsNone(self.queue.claim_next("publish"))
 
+    def test_dismiss_intake_issue_keeps_row_and_clears_count(self):
+        observed = self.queue.observe_notification("issue-dismiss", "测试评论", "fingerprint-dismiss") if False else None
+        issue = self.queue.record_intake_issue(
+            "dismiss-issue", "https://www.douyin.com/user/sender-dismiss",
+            "https://www.douyin.com/user/receiver-dismiss", "@虚构助手 保存",
+            evidence={"real_mention": True, "sender_verified": True, "receiver_verified": True, "unique_count": 1})
+        self.assertEqual(self.queue.intake_issue_summary()["unresolved_count"], 1)
+        dismissed = self.queue.dismiss_intake_issue(issue["id"])
+        self.assertEqual(dismissed["state"], "dismissed_by_operator")
+        self.assertEqual(self.queue.intake_issue_summary()["unresolved_count"], 0)
+        with self.assertRaisesRegex(QueueError, "invalid_intake_issue_id"):
+            self.queue.dismiss_intake_issue("not-an-issue-id")
+        with self.assertRaisesRegex(QueueError, "intake_issue_or_task_missing"):
+            self.queue.dismiss_intake_issue("a" * 32)
+
     def test_intake_issues_are_verified_nonexecutable_and_idempotent(self):
         observed = envelope()
         evidence = {"real_mention": True, "sender_verified": True, "receiver_verified": True, "video_verified": True, "unique_count": 1}

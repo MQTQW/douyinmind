@@ -69,7 +69,7 @@ def test_import_completion_then_single_publication_and_reopen_dedup(tmp_path):
     result=service(store,binding,model,backend).process(env)
     assert result['state']=='answer_ready'
     assert result['reply']['kind']=='import_status' and result['reply']['source_ids']==[]
-    assert '已加入“测试库”' in result['reply']['text']
+    assert '测试库' in result['reply']['text'] and '存好啦' in result['reply']['text']
     assert backend.posts==1 and backend.gets>=1 and model.count==2
     adapter=Adapter();published=ReplyPublisher(store,binding,adapter,tmp_path/'reply-evidence').publish(result['task_id'])
     assert published['state']=='b_view_visible' and adapter.submits==1
@@ -86,7 +86,7 @@ def test_new_status_comment_reuses_import_without_second_post(tmp_path):
     followup={**env,'command_id':'command-status-02','reference_id':'reference-status-02',
               'comment_text':'@助手 请查询当前视频的入库进度，测试编号 DM-STATUS-02。'}
     second=service(store,binding,Model([('get_import_status',{}),('propose_import_status',{})]),backend).process(followup)
-    assert second['state']=='answer_ready' and '已加入“测试库”' in second['reply']['text']
+    assert second['state']=='answer_ready' and '测试库' in second['reply']['text']
     assert store.get_task_ingestion(first['task_id'])['job_id']==store.get_task_ingestion(second['task_id'])['job_id']
     assert backend.posts==1
 
@@ -96,5 +96,5 @@ def test_false_backend_success_cannot_produce_completed_reply(tmp_path):
     model=Model([('save_current_video',{'knowledge_base_id':7}),('get_import_status',{}),('propose_import_status',{})])
     result=service(store,binding,model,backend).process(env)
     assert backend.posts==1 and result['state']=='answer_ready'
-    assert '尚未确认完成' in result['reply']['text']
-    assert '已加入' not in result['reply']['text']
+    assert '还在入库' in result['reply']['text']
+    assert '存好啦' not in result['reply']['text']
