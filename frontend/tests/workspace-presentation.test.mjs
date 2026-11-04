@@ -197,12 +197,44 @@ test('materials title remains a real detail action and exports/removal/global de
   assert.equal(findButton(tree,'添加视频'),undefined);
   assert.equal(findButton(tree,'查看识别结果'),undefined);
   assert.ok(findButton(tree,'导出原文与时间'));
-  assert.ok(buttons(tree).some(button=>/AI.*导出/.test(text(button))));
+  assert.ok(findButton(tree,'AI 笔记：生成与下载'));
   assert.ok(findButton(tree,'仅移出当前知识库'));
   assert.ok(buttons(tree).some(button=>button.props.className==='danger-action' && text(button).startsWith('删除全部')));
   const title=all(tree,n=>n.props?.className==='resource-title')[0];
   title.props.onClick();
   assert.equal(h.state.viewingItemId,'fixture-video');
+});
+test('local notes opens a single saved video without requiring favorites login or a paid legacy GET',()=>{
+  const video={platform_item_id:'fixture-video',title:'本地合成资料',status:'done'}, changed=[];
+  const h=harness(SourcesPanel,sourceProps({view:'materials',loggedIn:false,chatOnly:true,onChangeView:value=>changed.push(value)}),
+    {baseVideos:[video],baseVideosLoading:false,historyLoading:false});
+  findButton(h.render(),'AI 笔记：生成与下载').props.onClick();
+  assert.equal(h.state.notesVideo,video);assert.deepEqual(changed,['materials']);
+});
+test('original export remains an explicit original-only read',()=>{
+  const previous=globalThis.window,calls=[];globalThis.window={location:{search:''},open:(...args)=>calls.push(args)};
+  try{
+    const video={platform_item_id:'fixture-video',title:'合成资料',status:'done'};
+    const h=harness(SourcesPanel,sourceProps({view:'materials'}),{baseVideos:[video],baseVideosLoading:false,historyLoading:false});
+    findButton(h.render(),'导出原文与时间').props.onClick();
+    assert.deepEqual(calls,[['/api/knowledge/export/fixture-video?mode=original','_blank']]);
+  }finally{globalThis.window=previous;}
+});
+test('notes and unknown activity block destructive material controls while retaining notes and original reads',()=>{
+  for(const activity of [{maintenance_busy:true,activity_known:true,active_task_kind:'notes'}, {maintenance_busy:true,activity_known:false}]){
+    const video={platform_item_id:'fixture-video',title:'合成资料',status:'done'};
+    const h=harness(SourcesPanel,sourceProps({view:'materials',selectedKnowledgeBase:{id:1,name:'本地库'}}),
+      {baseVideos:[video],baseVideosLoading:false,historyLoading:false,stats:{...activity,current_task_id:null,video_cache:{done:1},capabilities:{guarded_video_delete:true}}});
+    const tree=h.render();assert.equal(findButton(tree,'删除全部入库资料').props.disabled,true);
+    assert.equal(findButton(tree,'仅移出当前知识库').props.disabled,true);
+    assert.ok(findButton(tree,'导出原文与时间'));assert.ok(findButton(tree,'AI 笔记：生成与下载'));
+  }
+});
+test('notes background work is described separately from video ingestion progress',()=>{
+  const h=harness(SourcesPanel,sourceProps({view:'progress'}),{historyLoading:false,stats:{current_task_id:null,
+    active_task_id:'notes-task',active_task_kind:'notes',maintenance_busy:true,activity_known:true,video_cache:{failed:1}}});
+  const tree=h.render();assert.match(text(tree),/AI 笔记正在整理.*视频入库进度不包含这项任务/);
+  assert.equal(findButton(tree,'重置失败/卡住的视频').props.disabled,true);
 });
 test('collection failure reason and empty-materials import CTA are retained',()=>{
   const failed={platform_item_id:'failed-video',title:'合成失败视频',status:'failed'};

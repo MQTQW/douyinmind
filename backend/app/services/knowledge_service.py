@@ -27,7 +27,7 @@ from app.services.video_media import download_video
 from app.services.media_service import download_audio
 from app.services.knowledge_base_service import knowledge_base_service
 from app.services.worker import WorkerBusyError, worker
-from app.services.ingestion_jobs import job_metadata, task_identity
+from app.services.ingestion_jobs import job_metadata, task_identity, record_kind
 from app.services.ingestion_metrics import IngestionRun
 
 logger = logging.getLogger(__name__)
@@ -70,7 +70,8 @@ def recovery_task_id(task_id, request_id):
 def retry_metadata(record):
     try:
         value = job_metadata(record.get('metadata'))
-        if (record.get('status') not in {'failed', 'interrupted', 'needs_review'}
+        if (record_kind(record) != 'ingestion'
+                or record.get('status') not in {'failed', 'interrupted', 'needs_review'}
                 or record.get('persistence_error') is True
                 or not value.get('platform_item_ids')
                 or not {'knowledge_base_id', 'analysis_mode'} <= value.keys()):
@@ -228,10 +229,14 @@ class KnowledgeService:
 
     @staticmethod
     def public_task(record):
-        keys = ('task_id', 'status', 'stage', 'progress', 'total', 'message', 'metadata', 'reason_code',
+        kind = record_kind(record)
+        if kind == 'notes':
+            raise KnowledgeRecoveryError('INGESTION_TASK_KIND_MISMATCH', '这项任务不是入库任务，请从原笔记任务查看。')
+        keys = ('task_id', 'kind', 'status', 'stage', 'progress', 'total', 'message', 'metadata', 'reason_code',
                 'current_item_id', 'created_at', 'updated_at', 'started_at', 'finished_at',
                 'needs_review', 'usage_state', 'shutdown_requested_at', 'shutdown_timed_out', 'persistence_error')
         value = {key: record[key] for key in keys if key in record}
+        value['kind'] = kind
         try:
             value['metadata'] = job_metadata(record.get('metadata'))
             retry_metadata(record)
@@ -250,16 +255,19 @@ class KnowledgeService:
         return value
 
     def list_tasks(self, limit=50, offset=0):
-        return {'items': [self.public_task(item) for item in worker.list_tasks(limit=limit, offset=offset)],
-                'total': worker.count_tasks(), 'limit': limit, 'offset': offset}
+        return {'items': [self.public_task(item) for item in worker.list_tasks(limit=limit, offset=offset, kind='ingestion')],
+                'total': worker.count_tasks(kind='ingestion'), 'limit': limit, 'offset': offset}
 
     def recovery_result(self, task_id, request_id):
         identity = recovery_task_id(task_id, request_id)
+        original = worker.get_progress(task_id)
+        if original is not None and record_kind(original) != 'ingestion':
+            raise KnowledgeRecoveryError('INGESTION_TASK_KIND_MISMATCH', '这项任务不是入库任务，未重新提交。')
         record = worker.get_progress(identity)
         if record is None:
             return {'found': False, 'task_id': identity, 'recovery_of': task_id,
                     'message': '尚未查到这次重新提交的任务记录，请核对视频状态；当前没有再次提交。'}
-        if record.get('metadata', {}).get('recovery_of') != task_id:
+        if record_kind(record) != 'ingestion' or record.get('metadata', {}).get('recovery_of') != task_id:
             raise KnowledgeRecoveryError('INGESTION_RETRY_ID_CONFLICT', '这次提交标识与原任务不一致，未继续处理。')
         return {'found': True, 'task_id': identity, 'recovery_of': task_id, 'task': self.public_task(record),
                 'message': '已找到这次提交的原任务记录，没有再次执行。'}
@@ -565,11 +573,20 @@ class KnowledgeService:
         chroma = get_chroma_service()
         chroma_chunks = chroma.count()
         chroma_videos = chroma.get_video_count()
+        activity_reader = getattr(worker, 'activity_snapshot', None)
+        if callable(activity_reader):
+            activity = activity_reader()
+        else:
+            # Legacy doubles/owners cannot prove the absence of queued work.
+            activity = {'active_task_id': worker.get_current_task(), 'active_task_kind': None,
+                        'maintenance_busy': True, 'activity_known': False}
+        legacy_current = (None if activity['active_task_kind'] == 'notes' else activity['active_task_id'])
 
         return {
             "analysis_mode": settings.knowledge_analysis_mode,
             "audio_transcription_concurrency": settings.audio_transcription_concurrency,
-            "current_task_id": worker.get_current_task(),
+            "current_task_id": legacy_current,
+            **activity,
             "video_cache": {
                 "pending": int(pending),
                 "downloading": int(downloading),
@@ -592,7 +609,10 @@ class KnowledgeService:
         :param task_id: 任务 ID
         :return: 进度信息
         """
-        return worker.get_progress(task_id)
+        value = worker.get_progress(task_id)
+        if value is not None and record_kind(value) == 'notes':
+            raise KnowledgeRecoveryError('INGESTION_TASK_KIND_MISMATCH', '这项任务不是入库任务，请从原笔记任务查看。')
+        return value
 
 
     def delete_video(self, db: Session, platform_item_id: str) -> dict:

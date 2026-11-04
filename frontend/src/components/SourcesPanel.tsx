@@ -12,6 +12,7 @@ import type { CollectionImportSource } from '../collectionImport';
 import { visibleHistory } from '../workspacePresentation';
 
 const KnowledgeRecoveryPanel = lazy(() => import('./KnowledgeRecoveryPanel'));
+const NotesPanel = lazy(() => import('./NotesPanel'));
 
 interface Props {
   view: WorkspaceView;
@@ -60,6 +61,7 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
   const [submittedTaskId, setSubmittedTaskId] = useState<string | null>(null);
   const startingBuildRef = useRef(false);
   const [viewingItemId, setViewingItemId] = useState<string | null>(null);
+  const [notesVideo, setNotesVideo] = useState<api.VideoItem | null>(null);
   const [sessions, setSessions] = useState<api.SessionItem[]>([]);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [historyError, setHistoryError] = useState('');
@@ -381,8 +383,15 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
     setShowBuildConfirm(true);
   };
 
-  const handleExport = (platformItemId: string, mode: 'original' | 'ai') => {
-    const url = `/api/knowledge/export/${platformItemId}?mode=${mode}`;
+  useEffect(() => { setNotesVideo(null); }, [selectedKnowledgeBase?.id]);
+  const closeNotes = () => {
+    const label = `更多操作：${notesVideo?.title}`;
+    setNotesVideo(null);
+    requestAnimationFrame(() => [...document.querySelectorAll<HTMLButtonElement>('button[aria-label]')]
+      .find(button => button.getAttribute('aria-label') === label)?.focus());
+  };
+  const handleExport = (platformItemId: string) => {
+    const url = `/api/knowledge/export/${encodeURIComponent(platformItemId)}?mode=original`;
     window.open(url, '_blank');
   };
 
@@ -418,7 +427,13 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
   const resultDescription = analysisMode === 'audio_visual' ? '完整文字稿、画面分析和时间信息' : '完整文字稿和时间信息';
   const selectableMaterials = baseVideos.filter(video => video.status === 'done');
   const allMaterialsSelected = selectableMaterials.length > 0 && selectableMaterials.every(video => selectedMaterialIds.has(video.platform_item_id));
-  const mutationBlocked = chatBusy || chatOnly || building || processingCount > 0 || Boolean(stats?.current_task_id) || bulkDeleting || Boolean(removingVideoId);
+  const maintenanceBusy = stats?.maintenance_busy === true || stats?.activity_known === false;
+  useEffect(() => {
+    if (!maintenanceBusy || stats?.current_task_id) return;
+    const timer = setInterval(() => void fetchStats(), 4000);
+    return () => clearInterval(timer);
+  }, [maintenanceBusy, stats?.current_task_id, fetchStats]);
+  const mutationBlocked = chatBusy || chatOnly || building || processingCount > 0 || Boolean(stats?.current_task_id) || maintenanceBusy || bulkDeleting || Boolean(removingVideoId);
   const bulkDeleteSupported = stats?.capabilities?.guarded_video_delete === true;
   const toggleMaterial = (id: string) => {
     if (mutationBlocked) return;
@@ -527,11 +542,11 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
   const videoActions = (video: api.VideoItem, inLibrary = false) => <ActionMenu label={`更多操作：${video.title}`}>
 
       {video.status === 'done' && <>
-        <button onClick={() => handleExport(video.platform_item_id, 'original')}><FileDown size={15} />导出原文与时间</button>
-        <button onClick={() => handleExport(video.platform_item_id, 'ai')}><ListChecks size={15} />AI 整理导出</button>
+        <button onClick={() => handleExport(video.platform_item_id)}><FileDown size={15} />导出原文与时间</button>
+        <button onClick={() => { setNotesVideo(video); onChangeView('materials'); }}><ListChecks size={15} />AI 笔记：生成与下载</button>
       </>}
-      {inLibrary && selectedKnowledgeBase && <button onClick={() => removeFromBase(video)} disabled={chatBusy || Boolean(removingVideoId)}><FolderMinus size={15} />仅移出当前知识库</button>}
-      {video.status === 'done' && <button className="danger-action" onClick={() => handleDelete(video.platform_item_id)} disabled={chatBusy}><Trash2 size={15} />删除全部入库资料</button>}
+      {inLibrary && selectedKnowledgeBase && <button onClick={() => removeFromBase(video)} disabled={chatBusy || maintenanceBusy || Boolean(removingVideoId)}><FolderMinus size={15} />仅移出当前知识库</button>}
+      {video.status === 'done' && <button className="danger-action" onClick={() => handleDelete(video.platform_item_id)} disabled={chatBusy || maintenanceBusy}><Trash2 size={15} />删除全部入库资料</button>}
   </ActionMenu>;
 
   return (
@@ -570,7 +585,9 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
       <div className="sidebar-footer assistant-sidebar-shortcuts"><button className={`task-shortcut ${view === 'assistant' ? 'assistant-shortcut-active' : ''}`} onClick={() => onChangeView('assistant')} aria-current={view === 'assistant' ? 'page' : undefined}><Inbox size={17} /><span><strong>抖音助手</strong></span><ChevronRight size={15} /></button>{!chatOnly && <button className="task-shortcut" onClick={() => onChangeView('progress')} aria-current={view === 'progress' ? 'page' : undefined}><AudioLines size={17} /><span><strong>{building || processingCount ? '视频正在处理中' : '处理进度'}</strong><small>{doneCount} 可提问{failedCount ? ` · ${failedCount} 失败` : ''}</small></span><ChevronRight size={15} /></button>}</div>
 
       {contentContainer && view !== 'chat' && view !== 'assistant' && createPortal(<div className="source-workspace">
-        {view === 'materials' && <>
+        {view === 'materials' && notesVideo && <Suspense fallback={<p role="status" className="empty-hint">正在打开笔记记录…</p>}><NotesPanel key={notesVideo.platform_item_id} video={notesVideo} onClose={closeNotes} onStateChanged={() => void fetchStats()} /></Suspense>}
+        {view === 'materials' && !notesVideo && <>
+          {maintenanceBusy && <p role="status" className="materials-bulk-feedback">后台任务、维护或状态核查尚未结束，暂不能修改资料。原文和笔记记录仍可查看。</p>}
           {deletionFeedback && <p role="alert" className="materials-bulk-feedback">{deletionFeedback} <button className="text-button" onClick={() => { setProgressSection('deletions'); onChangeView('progress'); }}>查看待完成删除</button></p>}
           {!baseVideosLoading && !baseVideosError && baseVideos.length > 0 && <div className="materials-bulk-toolbar" aria-label="批量管理视频资料">
             <label><input type="checkbox" checked={allMaterialsSelected} ref={element => { if (element) element.indeterminate = selectedMaterialIds.size > 0 && !allMaterialsSelected; }} onChange={toggleAllMaterials} disabled={mutationBlocked || !selectableMaterials.length} aria-label="全选可删除资料" />全选</label>
@@ -584,7 +601,7 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
             <span className="resource-icon"><FileAudio size={20} /></span><button className="resource-title" onClick={() => setViewingItemId(video.platform_item_id)}><strong>{video.title || '未命名视频'}</strong><small>{video.author ? `@${video.author} · ` : ''}{video.duration ? `${Math.floor(video.duration / 60)}:${String(video.duration % 60).padStart(2, '0')} · ` : ''}查看完整识别结果</small></button>
             <span className={`status-badge ${video.status === 'failed' ? 'status-failed' : ''}`}>{video.status === 'done' && <Check size={13} />}{statusLabel(video.status)}</span>{videoActions(video, true)}
           </div>)}</div>}
-          <p className="mt-5 text-xs text-[var(--color-ink-muted)] leading-relaxed">“移出”仅调整当前知识库；“删除全部入库资料”会影响所有知识库。原始导出保留完整文字稿与时间，AI 整理导出会额外调用模型。</p>
+          <p className="mt-5 text-xs text-[var(--color-ink-muted)] leading-relaxed">“移出”仅调整当前知识库；“删除全部入库资料”会影响所有知识库。原文导出读取已保存内容；AI 笔记需另行确认生成，已有笔记下载不会再调用模型。</p>
         </>}
         {view === 'collections' && !loggedIn && <div className="empty-resource"><Download size={28} /><h3>连接收藏，导入新视频</h3><p>本地已入库资料可继续查看和提问。同步与导入新收藏需要本人登录抖音。</p><button className="ui-button ui-button-primary" onClick={onConnectFavorites} disabled={loginBusy}>{loginBusy ? '正在连接…' : '连接抖音收藏'}</button></div>}
         {view === 'collections' && loggedIn && <>
@@ -607,6 +624,8 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
         </>}
         {view === 'progress' && <>
           <div className="page-section-heading processing-section-heading"><p>下载视频 → 识别转文字 → 建立索引</p><button className="ui-button" onClick={onBuildDone}><RefreshCw size={15} />刷新状态</button></div>
+          {stats?.active_task_kind === 'notes' && <p role="status" className="empty-hint">AI 笔记正在整理，下面的视频入库进度不包含这项任务。可在对应视频的“AI 笔记”中核查结果。</p>}
+          {stats?.activity_known === false && <p role="status" className="empty-hint">后台活动状态暂未确认，资料修改已暂停。读取原文和笔记记录不受影响，请刷新状态核对。</p>}
           <nav className="workspace-tabs mb-5" aria-label="处理记录分类">
             <button className={progressSection === 'videos' ? 'active' : ''} onClick={() => setProgressSection('videos')} aria-current={progressSection === 'videos' ? 'page' : undefined}>视频状态</button>
             <button className={progressSection === 'tasks' ? 'active' : ''} onClick={() => setProgressSection('tasks')} aria-current={progressSection === 'tasks' ? 'page' : undefined}>入库任务</button>
@@ -624,7 +643,7 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
           <div className="resource-list">{taskVideos.filter(video => video.status !== 'done').map(video => <div key={video.platform_item_id} className="resource-row flex-wrap"><span className="resource-icon"><FileAudio size={19} /></span><button className="resource-title" onClick={() => setViewingItemId(video.platform_item_id)}><strong>{video.title || '未命名视频'}</strong><small>{statusLabel(video.status)}</small></button>{video.status === 'failed' && <><button className="ui-button" onClick={() => setViewingItemId(video.platform_item_id)}>查看原因</button><button className="ui-button" disabled={building || chatBusy} onClick={() => { setSelectedVideos(previous => new Map(previous).set(video.platform_item_id, video)); const col = collections.find(item => item.id === Number(video.collection_id)); setExpandedId(col?.collection_id ?? 'all'); onChangeView('collections'); }}>选择重试<RotateCcw size={14} /></button></>}</div>)}</div>
           <div className="mt-4 flex flex-wrap items-center justify-between gap-3"><p className="text-xs text-[var(--color-ink-muted)]">{taskVideosUpdatedAt ? `已读取 ${taskVideos.length} / ${taskVideosTotal} 个视频，显示其中 ${taskVideos.filter(video => video.status !== 'done').length} 个未完成项。 更新于 ${taskVideosUpdatedAt}` : '尚未读取到视频清单。'}</p>{taskVideosHasMore && <button className="ui-button" onClick={loadMoreTaskVideos} disabled={taskVideosLoading} aria-busy={taskVideosLoading}>载入更多视频</button>}</div>
           {!taskVideosLoading && !taskVideosError && !taskVideos.some(video => video.status !== 'done') && taskVideosHasMore && <p className="mt-3 text-sm text-[var(--color-ink-soft)]">已读取的视频均已完成；继续载入可查看更早的未完成记录。</p>}
-          {(isStuck || failedCount > 0) && <div className="mt-6"><button onClick={handleResetInterrupted} disabled={resettingVideos || building} aria-busy={resettingVideos} className="ui-button"><RefreshCw size={15} />{resettingVideos ? '正在重置…' : '重置失败/卡住的视频'}</button><p className="mt-2 text-xs text-[var(--color-ink-muted)]">任务进行期间不能重置；重置后重新选择需要导入的视频。</p></div>}
+          {(isStuck || failedCount > 0) && <div className="mt-6"><button onClick={handleResetInterrupted} disabled={resettingVideos || building || maintenanceBusy} aria-busy={resettingVideos} className="ui-button"><RefreshCw size={15} />{resettingVideos ? '正在重置…' : '重置失败/卡住的视频'}</button><p className="mt-2 text-xs text-[var(--color-ink-muted)]">任务进行期间不能重置；重置后重新选择需要导入的视频。</p></div>}
           {buildMessage && !building && <p role="status" className="mt-4 text-sm text-[var(--color-ink-soft)]">{buildMessage}</p>}
           {!building && stats && !failedCount && !pendingCount && !processingCount && !taskVideosLoading && !taskVideosError && <div className="empty-resource"><Check size={28} /><h3>资料已准备好</h3><p>选择知识库，就可以开始提问。</p></div>}
           </>}

@@ -283,7 +283,8 @@ class ImportToolsTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         proposed = tools.proposal()
         self.assertEqual(proposed["import_state"], "failed")
-        self.assertIn("没有完成", proposed["text"])
+        self.assertEqual(proposed['text'], '这次没存成，记录我先留着了。')
+        self.assertEqual(len(self.backend.posts), 1)
         self.assertNotIn("DO-NOT-EXPOSE", json.dumps(result | proposed, ensure_ascii=False))
         self.assertNotIn("DO-NOT-EXPOSE", self.path.read_bytes().decode("utf-8", errors="ignore"))
 

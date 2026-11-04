@@ -6,7 +6,7 @@ AST selection avoids importing the live FastAPI application or Windows job API.
 """
 import ast
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 import sys
@@ -25,11 +25,19 @@ def complete_immediate(awaitable):
     pytest.fail("fake lifecycle unexpectedly requested real async I/O")
 
 
-def lifespan_case(monkeypatch, outcome, *, failure=None, dispose_failure=None):
+def lifespan_case(monkeypatch, outcome, *, failure=None, dispose_failure=None,
+                  start_failure=None, recovery_failure=None, enter=True):
     events, logs = [], []
     class FakeWorker:
         def start(self):
             events.append(("start",))
+            if start_failure is not None:
+                raise start_failure
+        @contextmanager
+        def maintenance_guard(self):
+            assert ("start",) in events
+            events.append(("notes_maintenance",))
+            yield
         def stop(self, *, timeout):
             events.append(("stop", timeout))
             if failure is not None:
@@ -44,6 +52,24 @@ def lifespan_case(monkeypatch, outcome, *, failure=None, dispose_failure=None):
     worker_module = ModuleType("app.services.worker")
     worker_module.worker = fake_worker
     monkeypatch.setitem(sys.modules, "app.services.worker", worker_module)
+    class FakeNotesSession:
+        def __enter__(self):
+            events.append(("notes_session",))
+            return self
+        def __exit__(self, *args):
+            return False
+    session_module = ModuleType('app.db.session')
+    session_module.session_factory = FakeNotesSession
+    monkeypatch.setitem(sys.modules, 'app.db.session', session_module)
+    notes_module = ModuleType('app.services.notes_store')
+    def recover(db):
+        assert isinstance(db, FakeNotesSession)
+        assert events.index(("start",)) < events.index(("notes_maintenance",)) < events.index(("notes_session",))
+        events.append(("notes_recovery",))
+        if recovery_failure is not None:
+            raise recovery_failure
+    notes_module.recover_incomplete_notes = recover
+    monkeypatch.setitem(sys.modules, 'app.services.notes_store', notes_module)
 
     async def to_thread(function, *args, **kwargs):
         assert function.__self__ is fake_worker
@@ -70,7 +96,8 @@ def lifespan_case(monkeypatch, outcome, *, failure=None, dispose_failure=None):
     }
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
     context = namespace["lifespan"](object())
-    complete_immediate(context.__aenter__())
+    if enter:
+        complete_immediate(context.__aenter__())
     return context, events, logs
 
 
@@ -78,8 +105,27 @@ def test_lifespan_waits_for_worker_before_disposing_and_preserves_chat_mode_star
     context, events, logs = lifespan_case(monkeypatch, {"stopped": True, "timed_out": False})
     complete_immediate(context.__aexit__(None, None, None))
     assert ("chat_mode_migration",) in events
+    assert events.index(("start",)) < events.index(("notes_recovery",)) < events.index(("to_thread",))
     assert events.index(("to_thread",)) < events.index(("stop", 30.0)) < events.index(("dispose",))
     assert not any(level == "warning" for level, text in logs)
+
+
+def test_rejected_second_worker_owner_never_quarantines_active_notes(monkeypatch):
+    context, events, _ = lifespan_case(monkeypatch, {"stopped": True},
+        start_failure=RuntimeError('synthetic-owner-busy'), enter=False)
+    with pytest.raises(RuntimeError, match='synthetic-owner-busy'):
+        complete_immediate(context.__aenter__())
+    assert ("notes_session",) not in events and ("notes_recovery",) not in events
+    assert not any(event[0] == 'stop' for event in events)
+
+
+def test_failed_notes_recovery_stops_the_acquired_worker_before_serving_requests(monkeypatch):
+    context, events, _ = lifespan_case(monkeypatch, {"stopped": True},
+        recovery_failure=RuntimeError('synthetic-notes-recovery-failure'), enter=False)
+    with pytest.raises(RuntimeError, match='synthetic-notes-recovery-failure'):
+        complete_immediate(context.__aenter__())
+    assert events.index(("start",)) < events.index(("notes_recovery",)) < events.index(("stop", 30.0))
+    assert ("dispose",) not in events
 
 
 @pytest.mark.parametrize("outcome", [None, True, {}, {"stopped": False, "timed_out": True},

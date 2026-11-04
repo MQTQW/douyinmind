@@ -122,7 +122,7 @@ def test_second_writer_is_refused_but_readonly_history_remains_available(tmp_pat
         second.stop(timeout=3)
 
 
-def test_stop_timeout_is_durable_and_retains_owner_until_current_call_finishes(tmp_path):
+def test_zero_budget_reports_unconfirmed_marker_and_retains_owner_until_current_call_finishes(tmp_path):
     path = tmp_path / "jobs.sqlite3"
     local, other = Worker(path), Worker(path)
     entered, release = threading.Event(), threading.Event()
@@ -137,16 +137,21 @@ def test_stop_timeout_is_durable_and_retains_owner_until_current_call_finishes(t
         local.submit("slow", inert_job, job_metadata=META)
         assert entered.wait(3)
         outcome = local.stop(timeout=0)
-        assert outcome == {"stopped": False, "timed_out": True, "current_task_id": "slow", "pending_count": 0}
+        assert outcome == {"stopped": False, "timed_out": True, "current_task_id": "slow", "pending_count": 0,
+                           "state_recorded": False}
         snapshot = Worker(path).get_progress("slow")
         assert snapshot["status"] == "running" and snapshot["stage"] == "transcribing"
-        assert snapshot["shutdown_timed_out"] is True and snapshot["needs_review"] is True
+        # No budget was available for a durable marker; only this owner can
+        # report the unconfirmed write. A read-only reopen must not invent it.
+        assert snapshot["shutdown_timed_out"] is False
+        assert local.get_progress("slow")["persistence_error"] is True
+        assert local.get_progress("slow")["needs_review"] is True
         assert snapshot["progress"] == 0 and snapshot["usage_state"] == "not_recorded"
         with pytest.raises(IngestionJobError, match="owner_busy"):
             other.start()
         release.set()
         done = wait_status(local, "slow", "done")
-        assert done["shutdown_timed_out"] is True and done["needs_review"] is False
+        assert done["shutdown_timed_out"] is False and done["needs_review"] is False
         assert local.stop(timeout=3)["stopped"] is True
         other.start()
         assert other.get_progress("slow")["status"] == "done"
@@ -196,7 +201,7 @@ def test_stop_quarantines_queued_jobs_instead_of_running_them(tmp_path):
     local = Worker(tmp_path / "jobs.sqlite3")
     calls = []
     local.submit("not-started", lambda *, task_id: calls.append(task_id), job_metadata=META)
-    assert local.stop(timeout=0)["pending_count"] == 1
+    assert local.stop(timeout=2)["pending_count"] == 1
     assert local.get_progress("not-started")["status"] == "needs_review"
     assert local._queue.unfinished_tasks == 0
     try:

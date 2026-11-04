@@ -17,6 +17,7 @@ import sqlite3
 import stat
 import threading
 import time
+from typing import Literal
 
 from app.storage_guard import (
     assert_no_orphan_sqlite_files, guarded_sqlite_file, verified_readonly_connection,
@@ -27,7 +28,7 @@ COMPONENT = "DouyinMind.ingestion_jobs.v1"
 _STATUSES = {"queued", "running", "done", "failed", "interrupted", "needs_review"}
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 _STAGE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
-_SCHEMA = {
+_SCHEMA_V1 = {
     "ingestion_job_meta": "CREATE TABLE ingestion_job_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)",
     "ingestion_jobs": """CREATE TABLE ingestion_jobs(
       task_id TEXT PRIMARY KEY,owner_token TEXT NOT NULL,status TEXT NOT NULL,
@@ -41,6 +42,10 @@ _SCHEMA = {
       stage TEXT NOT NULL,status TEXT NOT NULL,progress INTEGER NOT NULL,total INTEGER NOT NULL,
       reason_code TEXT,created_at REAL NOT NULL)""",
 }
+_KIND_COLUMN = "kind TEXT NOT NULL DEFAULT 'generic' CHECK(kind IN ('generic','ingestion','notes'))"
+_SCHEMA = {**_SCHEMA_V1, "ingestion_jobs": _SCHEMA_V1["ingestion_jobs"][:-1] + ", " + _KIND_COLUMN + ")"}
+_KINDS = frozenset({"generic", "ingestion", "notes"})
+TaskKind = Literal["generic", "ingestion", "notes"]
 _OWNER_MAGIC = b"DouyinMind ingestion worker owner v1\n"
 _OWNERS_LOCK = threading.Lock()
 _OWNERS = set()
@@ -82,6 +87,27 @@ def job_metadata(value):
     return result
 
 
+def checked_kind(value: TaskKind | None, metadata=None) -> TaskKind:
+    """None preserves legacy submission semantics, never guesses a notes job."""
+    if value is None:
+        return "ingestion" if "platform_item_ids" in job_metadata(metadata) else "generic"
+    if type(value) is not str or value not in _KINDS:
+        raise IngestionJobError("invalid_job_kind")
+    return value
+
+
+def record_kind(record):
+    if "kind" in record:
+        if record["kind"] is None:
+            raise IngestionJobError("invalid_job_kind")
+        return checked_kind(record["kind"])
+    return checked_kind(None, record.get("metadata"))
+
+
+def _page_kind(value):
+    return None if value is None else checked_kind(value)
+
+
 def progress_values(progress, total, message="", stage=None):
     if (type(progress) is not int or type(total) is not int
             or not 0 <= progress <= total <= 1000000
@@ -117,13 +143,15 @@ class IngestionJobLedger:
     @staticmethod
     def _owned(db):
         try:
-            if dict(db.execute("SELECT key,value FROM ingestion_job_meta")) != {"component": COMPONENT, "version": "1"}:
+            meta = dict(db.execute("SELECT key,value FROM ingestion_job_meta"))
+            if meta not in ({"component": COMPONENT, "version": "1"}, {"component": COMPONENT, "version": "2"}):
                 return False
+            schema = _SCHEMA_V1 if meta["version"] == "1" else _SCHEMA
             rows = list(db.execute("SELECT name,type,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"))
             normalize = lambda value: " ".join(value.lower().split())
             return (all(row[1] == "table" for row in rows)
-                    and {row[0] for row in rows} == set(_SCHEMA)
-                    and all(normalize(row[2]) == normalize(_SCHEMA[row[0]]) for row in rows))
+                    and {row[0] for row in rows} == set(schema)
+                    and all(normalize(row[2]) == normalize(schema[row[0]]) for row in rows))
         except (sqlite3.Error, ValueError, TypeError):
             return False
 
@@ -146,7 +174,7 @@ class IngestionJobLedger:
                 db.execute("BEGIN IMMEDIATE")
                 for statement in _SCHEMA.values():
                     db.execute(statement)
-                db.executemany("INSERT INTO ingestion_job_meta VALUES(?,?)", [("component", COMPONENT), ("version", "1")])
+                db.executemany("INSERT INTO ingestion_job_meta VALUES(?,?)", [("component", COMPONENT), ("version", "2")])
                 db.commit()
             except BaseException:
                 db.rollback()
@@ -156,21 +184,47 @@ class IngestionJobLedger:
         return self
 
     @contextmanager
-    def _db(self, *, write=False):
+    def _db(self, *, write=False, deadline=None):
         self._location()
         if not self.path.is_file():
             raise IngestionJobError("ingestion_job_ledger_missing")
-        with guarded_sqlite_file(self.path):
-            with verified_readonly_connection(self.path, self._owned, guard=self._location):
-                pass
-            db = sqlite3.connect(self.path.as_uri() + ("?mode=rw" if write else "?mode=ro"), uri=True, timeout=5)
+        def remaining(cap):
+            if deadline is None:
+                return cap
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise IngestionJobError("ingestion_job_deadline_exhausted")
+            return min(cap, value)
+        def budget(db):
+            if deadline is not None:
+                db.execute("PRAGMA busy_timeout=" + str(int(remaining(5) * 1000)))
+                db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        with guarded_sqlite_file(self.path, timeout=remaining(10)):
+            if deadline is None:
+                with verified_readonly_connection(self.path, self._owned, guard=self._location):
+                    pass
+            else:
+                # Shutdown never spends an unbounded hot-journal recovery wait.
+                # Failure leaves the record for normal, owned restart recovery.
+                probe = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=remaining(5))
+                try:
+                    budget(probe)
+                    if not self._owned(probe):
+                        remaining(5)
+                        raise IngestionJobError("ingestion_job_ledger_not_owned")
+                finally:
+                    probe.close()
+                self._location()
+            db = sqlite3.connect(self.path.as_uri() + ("?mode=rw" if write else "?mode=ro"), uri=True, timeout=remaining(5))
             db.row_factory = sqlite3.Row
             try:
+                budget(db)
                 db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
                 if not self._owned(db):
                     raise IngestionJobError("ingestion_job_ledger_not_owned")
                 yield db
                 if write:
+                    budget(db)
                     db.commit()
             except BaseException:
                 if write:
@@ -179,6 +233,20 @@ class IngestionJobLedger:
             finally:
                 db.close()
 
+    def upgrade_owned_schema(self):
+        """Called only after the worker owns its OS lock; never from a read API."""
+        with self._db(write=True) as db:
+            version = db.execute("SELECT value FROM ingestion_job_meta WHERE key='version'").fetchone()[0]
+            if version == "2":
+                return
+            rows = [(row[0], checked_kind(None, job_metadata(json.loads(row[1]))))
+                    for row in db.execute("SELECT task_id,metadata FROM ingestion_jobs")]
+            db.execute("ALTER TABLE ingestion_jobs ADD COLUMN " + _KIND_COLUMN)
+            db.executemany("UPDATE ingestion_jobs SET kind=? WHERE task_id=?", [(kind, identity) for identity, kind in rows])
+            db.execute("UPDATE ingestion_job_meta SET value='2' WHERE key='version'")
+            if not self._owned(db):
+                raise IngestionJobError("ingestion_job_schema_upgrade_unconfirmed")
+
     @staticmethod
     def _view(row):
         if row is None:
@@ -186,6 +254,7 @@ class IngestionJobLedger:
         value = dict(row)
         value.pop("owner_token", None)
         value["metadata"] = job_metadata(json.loads(value["metadata"]))
+        value["kind"] = record_kind(value)
         value["shutdown_timed_out"] = bool(value["shutdown_timed_out"])
         value["needs_review"] = (value["status"] in {"interrupted", "needs_review"}
                                  or value["status"] == "running" and value["shutdown_timed_out"])
@@ -202,7 +271,20 @@ class IngestionJobLedger:
         with self._db() as db:
             return self._view(db.execute("SELECT * FROM ingestion_jobs WHERE task_id=?", (task_id,)).fetchone())
 
-    def list(self, *, limit=50, offset=0):
+    @staticmethod
+    def _kind_filter(db, kind):
+        kind = _page_kind(kind)
+        if kind is None:
+            return "", ()
+        version = db.execute("SELECT value FROM ingestion_job_meta WHERE key='version'").fetchone()[0]
+        if version == "2":
+            return " WHERE kind=?", (kind,)
+        # Read-only v1 projection; filtering still precedes pagination/count.
+        return (" WHERE (CASE WHEN json_type(metadata,'$.platform_item_ids')='array' "
+                "THEN 'ingestion' ELSE 'generic' END)=?"), (kind,)
+
+    def list(self, *, limit=50, offset=0, kind: TaskKind | None = None):
+        _page_kind(kind)
         if type(limit) is not int or not 1 <= limit <= 200 or type(offset) is not int or not 0 <= offset <= 1000000:
             raise IngestionJobError("invalid_ingestion_job_page")
         if not self.path.exists():
@@ -210,24 +292,28 @@ class IngestionJobLedger:
                 raise IngestionJobError("ingestion_job_ledger_missing")
             return []
         with self._db() as db:
+            clause, values = self._kind_filter(db, kind)
             return [self._view(row) for row in db.execute(
-                "SELECT * FROM ingestion_jobs ORDER BY created_at DESC,task_id DESC LIMIT ? OFFSET ?", (limit, offset))]
+                "SELECT * FROM ingestion_jobs" + clause + " ORDER BY created_at DESC,task_id DESC LIMIT ? OFFSET ?", (*values, limit, offset))]
 
-    def count(self):
+    def count(self, *, kind: TaskKind | None = None):
+        _page_kind(kind)
         if not self.path.exists():
             if Path(str(self.path) + ".owner.lock").exists():
                 raise IngestionJobError("ingestion_job_ledger_missing")
             return 0
         with self._db() as db:
-            return db.execute("SELECT COUNT(*) FROM ingestion_jobs").fetchone()[0]
+            clause, values = self._kind_filter(db, kind)
+            return db.execute("SELECT COUNT(*) FROM ingestion_jobs" + clause, values).fetchone()[0]
 
     def _event(self, db, task_id, event, now):
         db.execute("""INSERT INTO ingestion_job_events(task_id,event,stage,status,progress,total,reason_code,created_at)
           SELECT task_id,?,stage,status,progress,total,reason_code,? FROM ingestion_jobs WHERE task_id=?""", (event, now, task_id))
 
-    def register(self, task_id, owner_token, metadata=None):
+    def register(self, task_id, owner_token, metadata=None, *, kind: TaskKind | None = None):
         task_identity(task_id)
         metadata = job_metadata(metadata)
+        kind = checked_kind(kind, metadata)
         now = self._now()
         total = len(metadata.get("platform_item_ids", []))
         with self._db(write=True) as db:
@@ -235,12 +321,12 @@ class IngestionJobLedger:
                 raise IngestionJobError("ingestion_task_exists")
             predecessor = metadata.get("recovery_of")
             if predecessor:
-                old = db.execute("SELECT status FROM ingestion_jobs WHERE task_id=?", (predecessor,)).fetchone()
-                if old is None or old[0] not in {"failed", "interrupted", "needs_review"}:
+                old = self._view(db.execute("SELECT * FROM ingestion_jobs WHERE task_id=?", (predecessor,)).fetchone())
+                if old is None or old['kind'] != kind or old['status'] not in {"failed", "interrupted", "needs_review"}:
                     raise IngestionJobError("ingestion_recovery_not_reviewable")
-            db.execute("""INSERT INTO ingestion_jobs(task_id,owner_token,status,stage,progress,total,message,metadata,created_at,updated_at)
-              VALUES(?,?,'queued','queued',0,?,'等待处理...',?,?,?)""", (task_id, owner_token, total,
-                json.dumps(metadata, ensure_ascii=False, separators=(",", ":")), now, now))
+            db.execute("""INSERT INTO ingestion_jobs(task_id,owner_token,status,stage,progress,total,message,metadata,created_at,updated_at,kind)
+              VALUES(?,?,'queued','queued',0,?,'等待处理...',?,?,?,?)""", (task_id, owner_token, total,
+                json.dumps(metadata, ensure_ascii=False, separators=(",", ":")), now, now, kind))
             self._event(db, task_id, "registered", now)
             return self._view(db.execute("SELECT * FROM ingestion_jobs WHERE task_id=?", (task_id,)).fetchone())
 
@@ -301,13 +387,13 @@ class IngestionJobLedger:
             self._event(db, task_id, "progress", now)
             return self._view(db.execute("SELECT * FROM ingestion_jobs WHERE task_id=?", (task_id,)).fetchone())
 
-    def finish(self, task_id, owner_token, status, *, reason_code=None, message=None):
+    def finish(self, task_id, owner_token, status, *, reason_code=None, message=None, deadline=None):
         if status not in {"done", "failed", "interrupted", "needs_review"}:
             raise IngestionJobError("invalid_ingestion_job_status")
         now = self._now()
         messages = {"done": "处理完成", "failed": "处理失败，请核对已保存资料与任务记录。",
                     "interrupted": "处理已中断，请核对原资料与调用结果。", "needs_review": "任务未继续执行，请核对后明确重新提交。"}
-        with self._db(write=True) as db:
+        with self._db(write=True, deadline=deadline) as db:
             updated = db.execute("""UPDATE ingestion_jobs SET status=?,stage=CASE WHEN ?='done' THEN 'finished' ELSE stage END,
               progress=CASE WHEN ?='done' THEN total ELSE progress END,message=?,reason_code=?,finished_at=?,updated_at=?,revision=revision+1
               WHERE task_id=? AND owner_token=? AND status IN ('queued','running')""",
@@ -317,9 +403,9 @@ class IngestionJobLedger:
             self._event(db, task_id, "finished", now)
             return self._view(db.execute("SELECT * FROM ingestion_jobs WHERE task_id=?", (task_id,)).fetchone())
 
-    def shutdown(self, task_id, owner_token, *, timed_out=False):
+    def shutdown(self, task_id, owner_token, *, timed_out=False, deadline=None):
         now = self._now()
-        with self._db(write=True) as db:
+        with self._db(write=True, deadline=deadline) as db:
             updated = db.execute("""UPDATE ingestion_jobs SET shutdown_requested_at=COALESCE(shutdown_requested_at,?),
               shutdown_timed_out=MAX(shutdown_timed_out,?),updated_at=?,revision=revision+1
               WHERE task_id=? AND owner_token=? AND status='running'""", (now, int(timed_out), now, task_id, owner_token))

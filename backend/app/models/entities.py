@@ -363,3 +363,65 @@ class KnowledgeDeletionOperation(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
     completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class KnowledgeNoteGeneration(Base):
+    """Immutable source/output snapshots; deletion erases content, not call barriers."""
+    __tablename__ = 'knowledge_note_generations'
+    __table_args__ = (
+        _UniqueConstraint('platform_item_id', 'active_key', name='uq_note_active_video'),
+        _CheckConstraint("(active_key IS NOT NULL AND active_key = 1 AND state IN ('queued','running')) OR "
+                         "(active_key IS NULL AND state IN ('done','needs_review','failed','stale','deleted'))",
+                         name='ck_note_generation_state'),
+    )
+    note_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    platform_item_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    cache_key: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    configuration_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    model_label: Mapped[str] = mapped_column(String(128), nullable=False, default='')
+    source_snapshot: Mapped[str] = mapped_column(Text, nullable=False, default='')
+    markdown: Mapped[str] = mapped_column(Text, nullable=False, default='')
+    markdown_sha256: Mapped[str] = mapped_column(String(64), nullable=False, default='')
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default='queued')
+    active_key: Mapped[int | None] = mapped_column(Integer, nullable=True, default=1)
+    expected_calls: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reason_code: Mapped[str] = mapped_column(String(64), nullable=False, default='')
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class KnowledgeNoteRequest(Base):
+    """A UUID is a permanent receipt, including deleted/unknown generations."""
+    __tablename__ = 'knowledge_note_requests'
+    request_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    platform_item_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    note_id: Mapped[str] = mapped_column(String(36), ForeignKey('knowledge_note_generations.note_id'), nullable=False, index=True)
+    intent_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    task_id: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
+    recovery_of: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    cached: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class KnowledgeNoteStep(Base):
+    __tablename__ = 'knowledge_note_steps'
+    __table_args__ = (
+        _UniqueConstraint('note_id', 'ordinal', name='uq_note_step_ordinal'),
+        _CheckConstraint("state IN ('pending','started','succeeded','unknown','deleted')", name='ck_note_step_state'),
+    )
+    step_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    note_id: Mapped[str] = mapped_column(String(36), ForeignKey('knowledge_note_generations.note_id'), nullable=False, index=True)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    input_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default='pending')
+    output: Mapped[str] = mapped_column(Text, nullable=False, default='')
+    output_sha256: Mapped[str] = mapped_column(String(64), nullable=False, default='')
+    call_id: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
+    usage_json: Mapped[str] = mapped_column(Text, nullable=False, default='{}')
+    reused_from: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    started_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)

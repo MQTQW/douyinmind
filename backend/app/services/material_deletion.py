@@ -232,6 +232,8 @@ def _finalize(db, operation_id):
             raise DeletionIncomplete(operation_id, 'operation_conflict')
         db.execute(delete(KnowledgeBaseVideo).where(
             KnowledgeBaseVideo.platform_item_id == operation.platform_item_id))
+        from app.services.notes_store import erase_material_notes
+        erase_material_notes(db, operation.platform_item_id)
         cache.status = 'pending'
         cache.transcript_text = cache.visual_analysis_text = cache.analysis_model = cache.summary = ''
         cache.analysis_json = '{}'

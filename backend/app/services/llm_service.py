@@ -11,6 +11,9 @@ import logging
 import time
 import math
 import threading
+import hashlib
+import json
+from urllib.parse import urlsplit, urlunsplit
 from email.utils import parsedate_to_datetime
 from functools import wraps
 from numbers import Real
@@ -175,6 +178,31 @@ class LLMClient(_ObservedClient):
                                           base_url=settings.llm_base_url, max_retries=0)
         return self._client
 
+    def configuration_identity(self) -> dict[str, str]:
+        """Opaque actual transport identity without creating any SDK client.
+
+        No endpoint or credential value is returned, including userinfo/query.
+        A credential fingerprint is a local cache discriminator, not a bill.
+        """
+        client = self._client
+        endpoint = settings.llm_base_url if client is None else str(client.base_url)
+        credential = settings.deepseek_api_key if client is None else client.api_key
+        model = settings.llm_model
+        if not all(type(value) is str for value in (endpoint, credential, model)):
+            raise RuntimeError('llm_configuration_identity_unavailable')
+        try:
+            parts = urlsplit(endpoint)
+            if parts.scheme not in {'http', 'https'} or not parts.netloc:
+                raise ValueError()
+            endpoint = urlunsplit((parts.scheme.lower(), parts.netloc, parts.path.rstrip('/'), parts.query, parts.fragment))
+        except (TypeError, ValueError):
+            raise RuntimeError('llm_configuration_identity_unavailable') from None
+        parameters = {'extra_body': ({'thinking': {'type': 'enabled' if settings.llm_thinking_enabled else 'disabled'}}
+                                    if settings.llm_base_url.startswith('https://api.deepseek.com') else None)}
+        digest = lambda value: hashlib.sha256(value.encode('utf-8')).hexdigest()
+        return {'model': model, 'endpoint_hash': digest(endpoint), 'credential_hash': digest(credential),
+                'generation_parameters_hash': digest(json.dumps(parameters, sort_keys=True, separators=(',', ':')))}
+
     def chat(
         self,
         system_prompt: str,
@@ -182,6 +210,7 @@ class LLMClient(_ObservedClient):
         temperature: float = 0.6,
         max_tokens: int = 2048,
         timeout: float = 60.0,
+        *, observation_sink=None,
     ) -> str:
         """
         发送非流式对话请求
@@ -193,15 +222,18 @@ class LLMClient(_ObservedClient):
         :param timeout: 超时时间（秒）
         :return: LLM 生成的完整回复
         """
-        budget = _Budget(timeout, self._clock)
-        observation = CallObservation('chat', self._usage, clock=self._clock, budget_seconds=timeout)
+        observation = CallObservation('chat', self._usage, clock=self._clock, budget_seconds=timeout,
+                                      on_finish=observation_sink)
         try:
+            budget = _Budget(timeout, self._clock)
             client = self._get_client()
+            call_model = settings.llm_model
+            extra_body = ({"thinking": {"type": "enabled" if settings.llm_thinking_enabled else "disabled"}}
+                          if settings.llm_base_url.startswith("https://api.deepseek.com") else None)
             def create(remaining):
                 return _transport(client, remaining).chat.completions.create(
-                    extra_body={"thinking": {"type": "enabled" if settings.llm_thinking_enabled else "disabled"}}
-                    if settings.llm_base_url.startswith("https://api.deepseek.com") else None,
-                    model=settings.llm_model, temperature=temperature, max_tokens=max_tokens, timeout=remaining,
+                    extra_body=extra_body,
+                    model=call_model, temperature=temperature, max_tokens=max_tokens, timeout=remaining,
                     messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}])
             response, started = self._request(create, budget, observation, 0)
             try:

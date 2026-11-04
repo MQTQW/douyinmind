@@ -66,7 +66,17 @@ async def lifespan(app: FastAPI):
 
     # 启动后台 worker
     from app.services.worker import worker
+    from app.db.session import session_factory
+    from app.services.notes_store import recover_incomplete_notes
     worker.start()
+    # Only the confirmed cross-process worker owner may quarantine old notes.
+    # The HTTP app has not yielded and the worker never reconstructs callbacks.
+    try:
+        with worker.maintenance_guard(), session_factory() as notes_db:
+            recover_incomplete_notes(notes_db)
+    except BaseException:
+        worker.stop(timeout=30.0)
+        raise
     logger.info("后台工作线程已启动")
 
     try:

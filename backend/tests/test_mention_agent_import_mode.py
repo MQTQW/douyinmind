@@ -138,6 +138,55 @@ def test_import_factory_failure_is_safe_and_does_not_run_engine(tmp_path, monkey
     engine.assert_not_called()
 
 
+@pytest.mark.parametrize('allow_import', [False, True])
+def test_nonempty_prefix_is_explicitly_injected_without_model_save_or_reply(tmp_path, monkeypatch, allow_import):
+    store = AgentStore(tmp_path / 'agent.sqlite3')
+    model = SimpleNamespace(complete=Mock(side_effect=AssertionError('wiring cannot call model')))
+    tools = SimpleNamespace(save_current_video=Mock(side_effect=AssertionError('wiring cannot submit import')))
+    factory, constructed = Mock(return_value=tools), []
+    class Engine:
+        def __init__(self, actual_model, knowledge, *, reply_prefix, ingestion=None):
+            assert actual_model is model and reply_prefix == '少爷，'
+            assert ingestion is (tools if allow_import else None)
+            constructed.append(reply_prefix)
+        def run(self, *args, **kwargs):
+            return no_proposal()
+    monkeypatch.setattr(service_module, 'AgentEngine', Engine)
+    service = service_module.AgentService(store, binding(), model=model, knowledge=Knowledge(),
+        allow_import=allow_import, import_factory=factory, reply_prefix='少爷，')
+    result = service.process(envelope())
+    assert result['state'] == 'needs_review' and result['ran_model'] is False
+    assert constructed == ['少爷，'] and store.get_reply(result['task_id']) is None
+    assert store.list_ingestions() == []
+    model.complete.assert_not_called(); tools.save_current_video.assert_not_called()
+    assert factory.call_count == int(allow_import)
+
+
+@pytest.mark.parametrize('allow_import', [False, True])
+def test_nonempty_prefix_unsupported_by_legacy_engine_fails_closed_without_fallback(tmp_path, monkeypatch, allow_import):
+    store = AgentStore(tmp_path / 'agent.sqlite3')
+    model = SimpleNamespace(complete=Mock(side_effect=AssertionError('unsupported prefix cannot call model')))
+    tools = SimpleNamespace(save_current_video=Mock(side_effect=AssertionError('unsupported prefix cannot save')))
+    factory, constructed, runs = Mock(return_value=tools), [], []
+    class LegacyEngine:
+        def __init__(self, actual_model, knowledge, *, ingestion=None):
+            constructed.append(actual_model)
+        def run(self, *args, **kwargs):
+            runs.append(True)
+            return no_proposal()
+    monkeypatch.setattr(service_module, 'AgentEngine', LegacyEngine)
+    service = service_module.AgentService(store, binding(), model=model, knowledge=Knowledge(),
+        allow_import=allow_import, import_factory=factory, reply_prefix='少爷，')
+    result = service.process(envelope())
+    assert result['state'] == 'needs_review' and result['ran_model'] is False
+    assert constructed == runs == []  # Never retry a constructor after dropping the prefix.
+    assert store.get_reply(result['task_id']) is None and store.list_ingestions() == []
+    model.complete.assert_not_called(); tools.save_current_video.assert_not_called()
+    assert factory.call_count == int(allow_import)
+    assert service.process(envelope())['task_id'] == result['task_id']
+    assert factory.call_count == int(allow_import) and constructed == runs == []
+
+
 @pytest.mark.parametrize("description", [
     {"id": 99, "name": "其他库"}, {"id": True, "name": "测试知识库"}, {"id": 7, "name": ""},
 ])

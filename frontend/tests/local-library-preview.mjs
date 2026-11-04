@@ -30,16 +30,41 @@ const initialJobs = [
     created_at: 1793780000 - i * 3600, updated_at: 1793780120 - i * 3600, can_retry: false, usage_state: 'not_recorded' })),
 ];
 const jobs = structuredClone(initialJobs), retryResults = new Map(), operations = [];
+const notes = new Map(), noteArtifacts = new Map();
+let renderedNotesHTML = null;
 const state = { loggedIn: true, listFailure: false, progressFailure: false, activeTask: false,
-  taskHistoryFailure: false, retryAckFailure: false, deletionHistoryFailure: false, calls: [] };
+  taskHistoryFailure: false, retryAckFailure: false, deletionHistoryFailure: false,
+  notesSupported: true, notesReady: true, notesLookupFailure: false, notesPostUnknown: false,
+  notesSourceChanged: false, notesDeleted: false, notesHistoryFailure: false, calls: [] };
+const noteFingerprint = () => (state.notesSourceChanged ? 'b' : 'a').repeat(64);
+const noteView = row => {
+  const { fingerprint, deleted: storedDeleted, ...value } = row;
+  const stale = fingerprint !== noteFingerprint(), deleted = state.notesDeleted || storedDeleted === true;
+  const downloadable = row.state === 'done' && !deleted;
+  return { ...value, state: deleted ? 'deleted' : stale ? 'stale' : row.state,
+    source_current: !stale && !deleted, can_download: downloadable,
+    download_url: downloadable ? `/api/notes/artifacts/${row.note_id}.md` : null,
+    can_redo: !deleted && (stale || ['failed', 'needs_review'].includes(row.state)) };
+};
 const json = (res, code, data) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(data)); };
 const mime = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.svg': 'image/svg+xml' };
 
 createServer(async (req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');
   try {
+    // A static DOM capture from the synthetic production browser, served from
+    // the same origin so its real stylesheet/fonts keep their CORS contract.
+    if (url.pathname === '/__test/notes-rendered') {
+      if (req.method === 'POST') {
+        let body = ''; for await (const chunk of req) { body += chunk; if (body.length > 1_000_000) throw new Error(); }
+        renderedNotesHTML = body; json(res, 200, { success: true }); return;
+      }
+      if (!renderedNotesHTML) { res.writeHead(404); res.end(); return; }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); res.end(renderedNotesHTML); return;
+    }
     if (url.pathname === '/__test/state') {
-      for (const key of ['loggedIn', 'listFailure', 'progressFailure', 'activeTask', 'taskHistoryFailure', 'retryAckFailure', 'deletionHistoryFailure']) {
+      for (const key of ['loggedIn', 'listFailure', 'progressFailure', 'activeTask', 'taskHistoryFailure', 'retryAckFailure', 'deletionHistoryFailure',
+        'notesSupported', 'notesReady', 'notesLookupFailure', 'notesPostUnknown', 'notesSourceChanged', 'notesDeleted', 'notesHistoryFailure']) {
         if (url.searchParams.has(key)) state[key] = url.searchParams.get(key) === 'true';
       }
       if (url.searchParams.has('resetRecovery')) {
@@ -47,6 +72,16 @@ createServer(async (req, res) => {
         videos.forEach((video, i) => { video.status = i === 150 || i === 204 ? 'failed' : 'done'; });
       }
       if (url.searchParams.has('clearCalls')) state.calls = [];
+      if (url.searchParams.has('resetNotes')) { notes.clear(); noteArtifacts.clear(); }
+      if (url.searchParams.get('notesDeleted') === 'true') for (const row of notes.values()) {
+        row.deleted = true; noteArtifacts.delete(row.note_id);
+      }
+      if (url.searchParams.has('completeNotes')) for (const row of notes.values()) {
+        if (!['queued', 'running'].includes(row.state)) continue;
+        row.state = 'done'; row.progress = row.total;
+        row.usage = { state: 'complete', known_tokens: { prompt_tokens: 320, completion_tokens: 180, total_tokens: 500 }, request_attempts: 1, complete: true, is_invoice: false, scope: 'generation_observed_tokens_not_invoice' };
+        noteArtifacts.set(row.note_id, `# 合成笔记\n\n先核对已保存的识别内容，再整理要点。\n\n## 当时的原始识别结果\n\n合成文字稿版本 ${row.fingerprint[0]}：先核对原文。\n`);
+      }
       json(res, 200, state); return;
     }
     if (url.pathname.startsWith('/api/')) {
@@ -56,6 +91,51 @@ createServer(async (req, res) => {
         body = JSON.parse(raw || '{}');
       }
       state.calls.push({ method: req.method, path: url.pathname, query: url.search, body });
+      if (url.pathname === '/api/notes/capabilities') {
+        json(res, state.notesSupported ? 200 : 404, state.notesSupported ? { success: true, version: 1, ready: state.notesReady,
+          max_source_chars: 120000, chunk_chars: 12000, max_expected_calls: 11, usage_is_invoice: false } : { code: 'NOT_FOUND' }); return;
+      }
+      const noteVideo = url.pathname.match(/^\/api\/notes\/videos\/([A-Za-z0-9_-]+)$/);
+      if (noteVideo) {
+        if (req.method === 'GET') {
+          if (state.notesHistoryFailure) { json(res, 503, { success: false, code: 'NOTES_READ_UNAVAILABLE' }); return; }
+          const limit = Number(url.searchParams.get('limit') || 10), offset = Number(url.searchParams.get('offset') || 0);
+          const rows = [...notes.values()].filter(row => row.platform_item_id === noteVideo[1]).reverse().map(noteView);
+          json(res, 200, { success: true, source: { status: state.notesDeleted ? 'unavailable' : 'ready',
+            fingerprint: state.notesDeleted ? null : noteFingerprint(), char_count: state.notesDeleted ? null : 3200,
+            chunk_count: state.notesDeleted ? null : 1, expected_call_count: state.notesDeleted ? null : 1 },
+            items: rows.slice(offset, offset + limit), total: rows.length, limit, offset,
+            current_note: rows.find(row => row.state === 'done' && row.source_current) || null }); return;
+        }
+        if (body.confirm !== true || body.expected_source_fingerprint !== noteFingerprint() || state.notesDeleted) {
+          json(res, 409, { success: false, code: 'SOURCE_CHANGED', request_registered: false, needs_review: false }); return;
+        }
+        let row = notes.get(body.request_id), duplicate = Boolean(row);
+        if (!row) {
+          row = { request_id: body.request_id, platform_item_id: noteVideo[1], fingerprint: noteFingerprint(),
+            state: state.notesPostUnknown ? 'needs_review' : 'queued', task_id: randomUUID(), note_id: randomUUID(),
+            progress: 0, total: 1, expected_call_count: 1, reused_step_count: 0, reason_code: null,
+            model_label: '合成验证模型', cached: false,
+            created_at: new Date(Date.UTC(2026, 10, 4, 14, 0, 0) + notes.size * 1000).toISOString(),
+            updated_at: new Date(Date.UTC(2026, 10, 4, 14, 0, 0) + notes.size * 1000).toISOString(),
+            usage: { state: 'unknown', known_tokens: {}, request_attempts: null, complete: false, is_invoice: false, scope: 'generation_observed_tokens_not_invoice' } };
+          notes.set(body.request_id, row);
+        }
+        if (state.notesPostUnknown) { json(res, 503, { success: false, code: 'NOTES_UNCONFIRMED', needs_review: true }); return; }
+        json(res, 200, { success: true, duplicate, cached: false, item: noteView(row) }); return;
+      }
+      const noteRequest = url.pathname.match(/^\/api\/notes\/requests\/([a-f\d-]+)$/i);
+      if (noteRequest) {
+        if (state.notesLookupFailure) { json(res, 503, { success: false, code: 'NOTES_READ_UNAVAILABLE' }); return; }
+        const row = notes.get(noteRequest[1]);
+        json(res, 200, { success: true, found: Boolean(row), request_id: noteRequest[1], ...(row ? { item: noteView(row) } : {}) }); return;
+      }
+      const artifact = url.pathname.match(/^\/api\/notes\/artifacts\/([a-f\d-]+)\.md$/i);
+      if (artifact) {
+        if (state.notesDeleted || !noteArtifacts.has(artifact[1])) { json(res, 410, { code: 'NOTES_DELETED' }); return; }
+        res.writeHead(200, { 'Content-Type': 'text/markdown; charset=utf-8', 'Content-Disposition': `attachment; filename="${artifact[1]}.md"`, 'Cache-Control': 'no-store' });
+        res.end(noteArtifacts.get(artifact[1])); return;
+      }
       if (url.pathname === '/api/chat/capabilities') { json(res, 200, { success: true, chat_only_sessions: true, session_mode_persistent: true, modes: ['knowledge', 'chat_only'] }); return; }
       if (url.pathname === '/api/auth/douyin/login/status') {
         json(res, 200, { status: state.loggedIn ? 'logged_in' : 'logged_out', message: state.loggedIn ? '合成验证 · 收藏已连接' : '合成验证 · 收藏未连接' }); return;

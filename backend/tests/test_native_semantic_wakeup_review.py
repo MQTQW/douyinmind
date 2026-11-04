@@ -152,13 +152,15 @@ def test_actual_wakeup_error_branch_preserves_capture_deadline_and_propagates_hu
     gate=next(n for n in ast.walk(tree) if isinstance(n,ast.If) and ast.unparse(n.test)=='now >= next_capture')
     branch=gate.orelse[0];assert ast.unparse(branch.test)=='native_ui_wakeup.is_set()'
     module=ast.Module(body=[branch],type_ignores=[]);ast.fix_missing_locations(module)
-    event=threading.Event();event.set();health=[]
+    event=threading.Event();event.set();health=[];diagnostics=[]
     failure=lane_module.ReceiverInterventionRequired('synthetic challenge') if human else RuntimeError('synthetic page race')
     def fail():raise failure
     lane=SimpleNamespace(ready_persisted_ui_source=lambda:True,admitted=lambda rows:None,clear_buffer=lambda:None)
-    ns={'native_ui_wakeup':event,'runtime':SimpleNamespace(receive_once=fail),'lane':lane,
+    ns={'__name__':'app.assistant._isolated_wakeup_error','__package__':'app.assistant',
+        'native_ui_wakeup':event,'runtime':SimpleNamespace(receive_once=fail),'lane':lane,
         'admission_lock':threading.RLock(),'page_operations_stop':lambda:False,
         'receive_native_ui_wakeup':h.receive_native_ui_wakeup,'next_capture':45,'run_id':'fake',
+        'record_native_read_diagnostic':lambda control,run,lane,previous:diagnostics.append((run,previous)),
         'ReceiverInterventionRequired':lane_module.ReceiverInterventionRequired,
         'control':SimpleNamespace(set_receiver_health=lambda *a,**k:health.append(k['reason_code']))}
     code=compile(module,'actual-wakeup-error-branch','exec')
@@ -168,6 +170,7 @@ def test_actual_wakeup_error_branch_preserves_capture_deadline_and_propagates_hu
     else:
         exec(code,ns);assert health==['native_ui_wakeup_unconfirmed']
     assert not event.is_set() and ns['next_capture']==45
+    assert diagnostics == [('fake', None)]
 
 
 @pytest.mark.parametrize('lost_event',[False,True])
@@ -179,7 +182,7 @@ def test_actual_owner_schedule_wakes_ui_without_more_polling_or_capture_timestam
     ast.fix_missing_locations(wrapped);code=compile(wrapped,'actual-capture-gate','exec')
     from app.assistant import native_visibility_diagnostics
     monkeypatch.setattr(native_visibility_diagnostics,'record_visibility_probe',lambda *a:None)
-    clock=SimpleNamespace(now=0);event=threading.Event();polls=[];collects=[];captures=[];pending=[True]
+    clock=SimpleNamespace(now=0);event=threading.Event();polls=[];collects=[];captures=[];pending=[True];diagnostics=[]
     lane=SimpleNamespace(poll_native=lambda:polls.append(clock.now) or {'status':{'armed':True}},
         ready_persisted_ui_source=lambda:pending[0] and clock.now>=2,has_buffered_notices=False,
         admitted=lambda rows:None,clear_buffer=lambda:None)
@@ -194,6 +197,7 @@ def test_actual_owner_schedule_wakes_ui_without_more_polling_or_capture_timestam
         'time':SimpleNamespace(monotonic=lambda:clock.now),'next_capture':0,'poll_seconds':45,
         'native_ui_wakeup':event,'admission_lock':threading.RLock(),'should_stop':lambda:False,
         'page_operations_stop':lambda:False,'ReceiverInterventionRequired':lane_module.ReceiverInterventionRequired,
+        'record_native_read_diagnostic':lambda *args:diagnostics.append(clock.now),
         'receive_bounded_batch':h.receive_bounded_batch,'receive_native_ui_wakeup':h.receive_native_ui_wakeup}
     for now in (0,2,10,44.75,45):
         clock.now=now;ns['now']=now
@@ -202,4 +206,5 @@ def test_actual_owner_schedule_wakes_ui_without_more_polling_or_capture_timestam
         if now==2:assert ns['next_capture']==45
     assert polls==captures==[0,45]
     assert collects==([0,45] if lost_event else [0,2,45])
+    assert diagnostics == collects
     assert pending==[False]

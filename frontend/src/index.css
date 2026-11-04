@@ -382,3 +382,46 @@ input[type=checkbox] { width: 16px; height: 16px; flex-shrink: 0; accent-color: 
 .assistant-guidance.is-neutral { background: #F4F6EF; border-color: #E1E7D9; color: #5D6957; }
 .assistant-guidance-hint { align-self: center; margin-right: auto; }
 .assistant-intake-issues .assistant-issue-dismiss { margin-left: 8px; vertical-align: baseline; }
+
+/* Saved notes extend the material workspace; only paid confirmation floats. */
+.notes-panel { max-width: 960px; font-size: 14px; line-height: 1.8; }
+.notes-heading-row,.notes-confirm-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.notes-heading-row { margin-bottom: 22px; }
+.notes-panel h2 { margin: 0 0 8px; font-size: 22px; font-weight: 600; line-height: 1.4; }
+.notes-panel h2:focus { outline: none; }
+.notes-video-title { overflow-wrap: anywhere; color: var(--color-ink); font-size: 16px; font-weight: 500; margin: 0 0 12px; }
+.notes-scope { color: var(--color-ink-soft); max-width: 72ch; margin: 0 0 12px; }
+.notes-original { display: inline-flex; align-items: center; gap: 6px; }
+.notes-feedback,.notes-notice { max-width: 76ch; margin: 16px 0; padding: 12px 14px; background: #F4F6EF; border-radius: 9px; color: var(--color-ink-soft); overflow-wrap: anywhere; }
+.notes-feedback { color: #8E4638; background: #FAEEE9; }
+.notes-feedback .text-button { margin-inline-start: 8px; }
+.notes-source-summary { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 20px; padding: 22px 0; margin-top: 20px; border-block: 1px solid var(--color-border); }
+.notes-source-summary dl { display: flex; flex-wrap: wrap; gap: 24px; margin: 0; }
+.notes-source-summary dt { color: var(--color-ink-muted); font-size: 12px; }
+.notes-source-summary dd { margin: 4px 0 0; font-variant-numeric: tabular-nums; }
+.notes-pending { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 16px; padding: 16px 0; border-bottom: 1px solid var(--color-border); }
+.notes-pending>div { min-width: 0; flex: 1; }
+.notes-pending small { display: block; margin-top: 4px; color: var(--color-ink-muted); font-size: 12px; overflow-wrap: anywhere; }
+.notes-history-heading { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 12px; margin: 28px 0 10px; }
+.notes-history-heading h3 { margin: 0; font-weight: 600; font-size: 16px; }
+.notes-history-heading>span { color: var(--color-ink-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.notes-record { flex-wrap: wrap; align-items: center; padding-block: 18px; }
+.notes-record .resource-title { flex: 1 1 300px; }
+.notes-record .resource-title small { font-size: 12px; margin-top: 5px; }
+.notes-record .resource-title p { margin: 5px 0; font-size: 13px; color: var(--color-ink-soft); }
+.notes-record-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 10px; }
+.notes-load-more { margin-top: 18px; }
+.notes-footer { color: var(--color-ink-muted); max-width: 76ch; margin-top: 24px; font-size: 12px; }
+.notes-confirm-backdrop { position: fixed; inset: 0; z-index: 90; display: grid; place-items: center; padding: 20px; background: #17241755; }
+.notes-confirm-dialog { width: min(100%,560px); max-height: calc(100dvh - 40px); overflow-y: auto; overscroll-behavior: contain; padding: 24px; border-radius: 14px; background: var(--color-panel); box-shadow: 0 18px 60px #17241730; color: var(--color-ink); font-size: 14px; line-height: 1.8; }
+.notes-confirm-dialog h2 { font-size: 20px; font-weight: 600; margin: 0; }
+.notes-confirm-dialog p { margin: 16px 0; }
+.notes-confirm-dialog .notes-video-title { margin-top: 18px; }
+.notes-confirm-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 12px; margin-top: 24px; }
+@media(max-width: 640px) {
+  .notes-heading-row { margin-bottom: 20px; }.notes-panel h2 { font-size: 20px; }
+  .notes-source-summary dl { width: 100%; gap: 16px; justify-content: space-between; }
+  .notes-source-summary>.ui-button { width: 100%; }.notes-record-actions { justify-content: flex-start; width: 100%; }
+  .notes-confirm-backdrop { padding: 16px; }.notes-confirm-dialog { padding: 20px; max-height: calc(100dvh - 32px); }
+  .notes-confirm-actions { flex-direction: column; }.notes-confirm-actions .ui-button { min-height: 44px; width: 100%; }
+}

@@ -117,6 +117,8 @@ async def get_sync_progress(task_id: str):
     """
     try:
         progress = knowledge_service.get_progress(task_id)
+    except KnowledgeRecoveryError as error:
+        return recovery_failure(error)
     except Exception:
         return {'success': False, 'code': 'INGESTION_PROGRESS_UNAVAILABLE', 'message': '任务状态暂时无法读取，请保留原记录并稍后刷新。'}
     if progress is None:
@@ -344,8 +346,14 @@ async def export_video_markdown(
             from app.services.markdown_export import export_original
             md = export_original(cache)
         else:
-            from app.services.markdown_export import export_ai_organized
-            md = export_ai_organized(cache)
+            # Compatibility download only: paid generation is an explicit
+            # UUID-bearing POST under /notes, never a GET side effect.
+            from app.services.notes_service import NotesError, notes_service
+            try:
+                md = notes_service.latest_artifact(db, platform_item_id)
+            except NotesError as error:
+                return JSONResponse(status_code=error.status, content={
+                    'success': False, 'code': error.code, 'message': error.message})
     except ValueError as exc:
         return f"# 导出失败\n\n{exc}\n"
 

@@ -14,6 +14,14 @@ import uuid
 TOKEN_FIELDS = ('prompt_tokens', 'completion_tokens', 'total_tokens')
 
 
+class ObservationCaptureError(RuntimeError):
+    """A required per-call capture failed; the provider call is never replayed."""
+    reason = 'capture_unconfirmed'
+
+    def __init__(self):
+        super().__init__('capture_unconfirmed')
+
+
 def reported_usage(response):
     try:
         value = getattr(response, 'usage', None)
@@ -57,14 +65,19 @@ class UsageJournal:
 class CallObservation:
     """One logical call, whose individual SDK requests are counted separately."""
 
-    def __init__(self, operation, journal, *, clock=None, budget_seconds=None, batches=1):
+    def __init__(self, operation, journal, *, clock=None, budget_seconds=None, batches=1, on_finish=None):
+        if on_finish is not None and not callable(on_finish):
+            raise ValueError('invalid_usage_sink')
         self.clock = clock or time.perf_counter
         self.started = self.clock()
         self.journal = journal
         self.finished = False
+        self.on_finish = on_finish
         self.data = {
             'schema_version': 1, 'call_id': uuid.uuid4().hex, 'operation': operation,
-            'budget_seconds': budget_seconds, 'total_batches': batches, 'completed_batches': 0,
+            'budget_seconds': (budget_seconds if type(budget_seconds) in {int, float}
+                               and math.isfinite(budget_seconds) and budget_seconds > 0 else None),
+            'total_batches': batches, 'completed_batches': 0,
             'request_attempts': 0, 'requests_without_usage': 0, 'known_usage': {},
             'requests_with_incomplete_usage': 0,
             'unknown_outcome': False, 'attempts': [],
@@ -102,4 +115,14 @@ class CallObservation:
                          usage_complete=(self.data['request_attempts'] > 0
                                          and self.data['requests_with_incomplete_usage'] == 0
                                          and not self.data['unknown_outcome']))
-        self.journal.append(self.data)
+        snapshot = deepcopy(self.data)
+        try:
+            self.journal.append(snapshot)
+        finally:
+            if self.on_finish is not None:
+                try:
+                    self.on_finish(deepcopy(snapshot))
+                except Exception:
+                    # This is deliberately separate from the optional global
+                    # journal sink, whose historical best-effort contract remains.
+                    raise ObservationCaptureError() from None

@@ -500,6 +500,120 @@ export async function resumeDeletionOperation(operationId: string): Promise<Know
   });
 }
 
+// ---- Saved AI notes: generation is explicit; reads/downloads never generate. ----
+export interface AiNotesCapabilities {
+  success: boolean; version: number; ready: boolean; max_source_chars: number;
+  chunk_chars: number; max_expected_calls: number; usage_is_invoice: false;
+}
+export interface AiNotesSource {
+  status: 'ready' | 'unavailable' | 'too_large'; fingerprint: string | null;
+  char_count: number | null; chunk_count: number | null; expected_call_count: number | null;
+}
+export interface AiNoteRequest {
+  request_id: string; platform_item_id: string;
+  state: 'queued' | 'running' | 'done' | 'needs_review' | 'failed' | 'stale' | 'deleted';
+  task_id: string | null; note_id: string | null; progress: number; total: number;
+  expected_call_count: number; reused_step_count: number; source_current: boolean | null;
+  can_download: boolean; download_url: string | null; can_redo: boolean; reason_code: string | null;
+  model_label?: string | null; cached?: boolean;
+  usage: { state: 'not_recorded' | 'partial' | 'complete' | 'unknown';
+    known_tokens: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+    request_attempts: number | null; complete: boolean; is_invoice: false; scope?: string };
+  created_at: string; updated_at: string;
+}
+export interface AiNotesList {
+  success: boolean; source: AiNotesSource; items: AiNoteRequest[]; total: number;
+  limit: number; offset: number; current_note: AiNoteRequest | null;
+}
+export interface AiNoteResult {
+  success: boolean; found?: boolean; request_id?: string; duplicate?: boolean; cached?: boolean;
+  item?: AiNoteRequest; code?: string; needs_review?: boolean; request_registered?: boolean;
+}
+export interface AiNoteCreate {
+  request_id: string; confirm: true; expected_source_fingerprint: string;
+  redo?: boolean; recovery_of?: string;
+}
+export class AiNotesError extends Error {
+  constructor(public code: string, public requestSent = false, public requestRegistered?: boolean,
+    public needsReview?: boolean) { super(aiNotesFailureMessage(code)); }
+}
+const NOTE_UUID = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
+export function aiNotesSupported(value: AiNotesCapabilities | null | undefined): boolean {
+  return value?.success === true && value.version === 1 && typeof value.ready === 'boolean'
+    && value.usage_is_invoice === false && Number.isSafeInteger(value.max_source_chars) && value.max_source_chars > 0
+    && Number.isSafeInteger(value.chunk_chars) && value.chunk_chars > 0
+    && Number.isSafeInteger(value.max_expected_calls) && value.max_expected_calls > 0;
+}
+export function aiNotesFailureMessage(code?: string): string {
+  const messages: Record<string, string> = {
+    NOTES_BACKEND_UNSUPPORTED: '尚未确认当前后台支持保存 AI 笔记，请连接或更新后台后再试。原文仍可导出。',
+    NOTES_NOT_READY: '笔记生成服务尚未就绪，当前未提交。已有记录和原文仍可读取。',
+    NOTES_INPUT_INVALID: '资料或请求编号无法确认，当前未提交。请重新读取原记录。',
+    NOTES_SOURCE_CHANGED: '保存的识别内容已变化，请刷新资料范围后再次确认。',
+    NOTE_SOURCE_CHANGED: '保存的识别内容已变化，请刷新资料范围后再次确认。',
+    SOURCE_CHANGED: '保存的识别内容已变化，请刷新资料范围后再次确认。',
+    SOURCE_UNAVAILABLE: '当前没有可整理的已保存识别内容，请先核对原资料。',
+    SOURCE_TOO_LARGE: '这份已保存内容超过当前整理上限，本次未生成笔记。',
+    NOT_READY: '笔记生成服务尚未就绪，当前未开始整理。',
+    DELETION_PENDING: '这份资料的删除尚未完成，当前不生成笔记。请先核对原删除操作。',
+    NOTES_SOURCE_UNAVAILABLE: '当前没有可整理的已保存识别内容，请先核对原文。',
+    NOTES_SOURCE_TOO_LARGE: '这份已保存内容超过当前整理上限，本次未生成笔记。',
+    NOTES_BUSY: '有任务正在处理，请保留本次请求编号并核查原结果。',
+  };
+  return code && messages[code] || '笔记请求的结果暂时无法确认。请保留原请求编号，读取结果后再决定下一步。';
+}
+async function notesRequest<T>(path: string, options?: RequestInit, requestSent = false): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(`${BASE}${path}`, {
+      ...options, headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok || !data || typeof data !== 'object') {
+      throw new AiNotesError(typeof data?.code === 'string' ? data.code : 'NOTES_UNCONFIRMED', requestSent,
+        typeof data?.request_registered === 'boolean' ? data.request_registered : undefined,
+        typeof data?.needs_review === 'boolean' ? data.needs_review : undefined);
+    }
+    return data;
+  } catch (error) {
+    if (error instanceof AiNotesError) throw error;
+    throw new AiNotesError('NOTES_UNCONFIRMED', requestSent);
+  } finally { clearTimeout(timer); }
+}
+function noteVideoPath(id: string): string {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) throw new AiNotesError('NOTES_INPUT_INVALID');
+  return encodeURIComponent(id);
+}
+export async function getAiNotesCapabilities(): Promise<AiNotesCapabilities> {
+  return notesRequest('/notes/capabilities');
+}
+export async function listAiNotes(id: string, limit = 10, offset = 0): Promise<AiNotesList> {
+  return notesRequest(`/notes/videos/${noteVideoPath(id)}?limit=${limit}&offset=${offset}`);
+}
+export async function getAiNoteRequest(id: string): Promise<AiNoteResult> {
+  if (!NOTE_UUID.test(id)) throw new AiNotesError('NOTES_INPUT_INVALID');
+  return notesRequest(`/notes/requests/${encodeURIComponent(id)}`);
+}
+export async function createAiNote(id: string, body: AiNoteCreate): Promise<AiNoteResult> {
+  const path = noteVideoPath(id);
+  if (!NOTE_UUID.test(body.request_id) || body.confirm !== true || !/^[a-f\d]{64}$/i.test(body.expected_source_fingerprint)
+      || (body.redo === true ? !NOTE_UUID.test(body.recovery_of || '') : body.recovery_of !== undefined)) {
+    throw new AiNotesError('NOTES_INPUT_INVALID');
+  }
+  // Check every generation, including an already-open panel after a backend restart.
+  const capability = await getAiNotesCapabilities().catch(() => null);
+  if (!aiNotesSupported(capability)) throw new AiNotesError('NOTES_BACKEND_UNSUPPORTED');
+  if (!capability!.ready) throw new AiNotesError('NOTES_NOT_READY');
+  return notesRequest(`/notes/videos/${path}`, { method: 'POST', body: JSON.stringify(body) }, true);
+}
+export function aiNoteDownloadURL(item: AiNoteRequest): string | null {
+  if (!['done', 'stale'].includes(item.state) || item.can_download !== true
+      || !NOTE_UUID.test(item.note_id || '')) return null;
+  const expected = `/api/notes/artifacts/${item.note_id}.md`;
+  return item.download_url === expected ? expected : null;
+}
+
 export async function getKnowledgeStats(): Promise<any> {
   return request('/knowledge/stats');
 }

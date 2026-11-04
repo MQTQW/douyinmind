@@ -29,7 +29,14 @@ def test_validation_error_audit_persists_only_fixed_code(arguments, expected):
     decision, errors, records = run_error(arguments)
     assert len(errors) == 1 and errors[0]['code'] == expected
     assert 'synthetic-secret-marker' not in json.dumps(records, ensure_ascii=False)
-    assert set(errors[0]) == {'round', 'tool_name', 'status', 'source_count', 'elapsed_ms', 'code'}
+    expected_fields = {'round', 'tool_name', 'status', 'source_count', 'elapsed_ms', 'code'}
+    if expected == 'invalid_public_reply':
+        expected_fields.add('public_text_validation')
+        assert errors[0]['public_text_validation'] == {
+            'field': 'text', 'violations': ['too_long'], 'observed_chars': 321,
+            'effective_max_chars': 320, 'control_count': 0}
+        assert arguments['text'] not in json.dumps(records, ensure_ascii=False)
+    assert set(errors[0]) == expected_fields
 
 
 def test_original_quote_schema_error_audit_is_fixed_and_does_not_change_validation():

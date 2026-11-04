@@ -146,7 +146,9 @@ class AgentService:
             if self.usage_budget is not None:
                 from app.assistant.usage_model import BudgetedModel
                 model = BudgetedModel(model, self.usage_budget, self.budget_scope_id or task_id)
-            engine_options = {'reply_prefix': self.reply_prefix}
+            engine_options = {}
+            if self.reply_prefix:
+                engine_options['reply_prefix'] = self.reply_prefix
             if self.trusted_semantic_decision is not None:
                 engine_options.update(trusted_semantic_decision=self.trusted_semantic_decision,
                     trusted_semantic_grant_id=self.trusted_semantic_grant_id,

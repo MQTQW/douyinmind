@@ -140,8 +140,67 @@ def test_nonreviewable_or_active_originals_do_not_reset_or_publish(scope, status
 
 def test_missing_metadata_never_guesses_a_video_scope(scope):
     c = scope; old_job(c, metadata={}); before = statuses(c)
-    with pytest.raises(module.KnowledgeRecoveryError, match='已记录范围'): retry(c)
+    with pytest.raises(module.KnowledgeRecoveryError, match='不是入库任务'): retry(c)
     assert statuses(c) == before and c.worker._queue.empty()
+
+
+def test_notes_and_generic_history_do_not_enter_ingestion_pages_or_retry_lookup(scope):
+    c = scope; old_job(c); before = statuses(c)
+    ledger = c.worker._get_ledger(create=True, owner=True)
+    note = ledger.register('notes-job', c.worker._owner_token,
+        {'platform_item_ids': ['video-done'], 'knowledge_base_id': None, 'analysis_mode': 'audio'}, kind='notes')
+    note = ledger.finish('notes-job', c.worker._owner_token, 'failed')
+    c.worker._cache('notes-job', note)
+    generic = ledger.register('generic-job', c.worker._owner_token)
+    c.worker._cache('generic-job', generic)
+    history = c.client.get('/api/knowledge/tasks?limit=1&offset=0').json()
+    assert history['success'] and history['total'] == 1
+    assert [r['task_id'] for r in history['items']] == ['old-batch']
+    for method, url, options in (
+        ('get', '/api/knowledge/tasks/notes-job/retry-result', {'params': {'request_id': REQUEST}}),
+        ('post', '/api/knowledge/tasks/notes-job/retry', {'json': {'confirm_reprocess': True, 'request_id': REQUEST}}),
+        ('get', '/api/knowledge/sync/notes-job', {}),
+    ):
+        result = getattr(c.client, method)(url, **options).json()
+        assert result['success'] is False and result['code'] == 'INGESTION_TASK_KIND_MISMATCH'
+    assert c.worker.get_progress('notes-job')['kind'] == 'notes'
+    assert statuses(c) == before and c.worker._queue.empty() and c.checks == []
+
+
+def test_ingestion_result_cannot_adopt_a_notes_job_with_the_same_request_id(scope):
+    c = scope; old_job(c); before = statuses(c)
+    identity = module.recovery_task_id('old-batch', REQUEST)
+    ledger = c.worker._get_ledger(create=True, owner=True)
+    note = ledger.register(identity, c.worker._owner_token,
+        {'platform_item_ids': ['video-done'], 'recovery_of': 'old-batch'}, kind='ingestion')
+    # Typed registration normally rejects cross-kind predecessors. Simulate a
+    # conflicting existing deterministic ID while keeping a fully owned schema.
+    with ledger._db(write=True) as db:
+        db.execute("UPDATE ingestion_jobs SET kind='notes' WHERE task_id=?", (identity,))
+    c.worker._cache(identity, ledger.get(identity))
+    with pytest.raises(module.KnowledgeRecoveryError) as refused:
+        c.service.recovery_result('old-batch', REQUEST)
+    assert refused.value.code == 'INGESTION_RETRY_ID_CONFLICT'
+    assert statuses(c) == before and c.worker._queue.empty() and c.checks == []
+
+
+@pytest.mark.parametrize('running', [False, True])
+def test_notes_activity_is_busy_but_never_reported_as_ingestion_progress_or_video_counts(scope, monkeypatch, running):
+    c = scope; before = statuses(c)
+    ledger = c.worker._get_ledger(create=True, owner=True)
+    row = ledger.register('notes-active', c.worker._owner_token,
+        {'platform_item_ids': ['video-done']}, kind='notes')
+    if running:
+        row = ledger.start_job('notes-active', c.worker._owner_token)
+        c.worker._current_task_id = 'notes-active'
+    c.worker._cache('notes-active', row)
+    monkeypatch.setattr(module, 'get_chroma_service', lambda: SimpleNamespace(count=lambda: 12, get_video_count=lambda: 3))
+    stats = c.service.get_stats(c.db)
+    assert stats['current_task_id'] is None and stats['maintenance_busy'] is True and stats['activity_known'] is True
+    assert stats['active_task_id'] == ('notes-active' if running else None)
+    assert stats['active_task_kind'] == ('notes' if running else None)
+    assert stats['video_cache']['done'] == 1 and statuses(c) == before
+    assert stats['chromadb'] == {'total_chunks': 12, 'total_videos': 3} and c.checks == []
 
 
 @pytest.mark.parametrize('change,code', [('missing', 'INGESTION_TARGET_MISSING'),

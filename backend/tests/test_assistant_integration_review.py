@@ -137,7 +137,7 @@ def test_verified_failed_import_reports_failure_once_without_model_or_post_repla
     monkeypatch.setattr("app.assistant.queue.time.time", lambda: now + 20)
     ready = runtime.poll_waiting_once()
     assert ready["state"] == "ready_to_publish" and ready["import_state"] == "failed"
-    assert "没有完成" in ready["details"]["reply_text"]
+    assert ready['details']['reply_text'] == '这次没存成，记录我先留着了。'
     assert runtime.publish_once()["state"] == "b_view_visible"
     assert runtime.publish_once() is None
     assert backend.posts == 1 and model.count == 1 and adapter.submits == 1
@@ -309,6 +309,13 @@ def test_actual_owner_loop_latches_challenge_even_when_resume_action_returns_fix
 
     events = []
     run_id = "e" * 32
+    authority_state = {'source': True, 'semantic': True}
+    authority_calls = []
+    from app.assistant.semantic_routing import SemanticIntentInterpreter
+    def semantic_authority(self, task):
+        authority_calls.append(('semantic', task))
+        return authority_state['semantic']
+    monkeypatch.setattr(SemanticIntentInterpreter, 'native_authority_current', semantic_authority)
     class Page:
         ticks = 0
         challenge = False
@@ -347,7 +354,9 @@ def test_actual_owner_loop_latches_challenge_even_when_resume_action_returns_fix
             events.append(('native_poll', page.challenge))
             return {'received':0,'status':{'armed':native_armed}}
         def recover(self): events.append(('native_recover', page.challenge))
-        def authority_current(self, task): return True
+        def authority_current(self, task):
+            authority_calls.append(('source', task))
+            return authority_state['source']
         def collect(self): page.goto("synthetic-local-snapshot"); return []
         def admitted(self, tasks): pass
     class Bridge:
@@ -355,7 +364,18 @@ def test_actual_owner_loop_latches_challenge_even_when_resume_action_returns_fix
         def __init__(self, *args, **kwargs):
             assert kwargs['usage_budget'].path == tmp_path/'usage-budget.sqlite3'
             assert kwargs['usage_budget'].summary()['all_time']['request_count'] == 0
-            assert kwargs['source_authorizer'].__self__.__class__ is Lane
+            authorize = kwargs['source_authorizer']
+            task = object()
+            assert authorize(task) is True
+            assert authority_calls[-2:] == [('source', task), ('semantic', task)]
+            authority_state['semantic'] = False
+            assert authorize(task) is False
+            assert authority_calls[-2:] == [('source', task), ('semantic', task)]
+            authority_state.update(source=False, semantic=True)
+            before = len(authority_calls)
+            assert authorize(task) is False
+            assert authority_calls[before:] == [('source', task)]
+            authority_state['source'] = True
         def execute(self, task): pass
         def publish(self, task): pass
         def reconcile(self, task): pass
@@ -364,6 +384,9 @@ def test_actual_owner_loop_latches_challenge_even_when_resume_action_returns_fix
         def observe_existing_delivery(self, task): pass
         def inspect_existing_reply(self, task_id): pass
         def get_recorded_delivery(self, task): pass
+        def verify_unsent_reply(self, task): raise AssertionError('owner probe cannot prepare a send')
+        def reopen_after_readback(self, task): raise AssertionError('owner probe cannot reopen a draft')
+        def finalize_operator_query_draft(self, task): raise AssertionError('owner probe cannot create a draft')
     class Runtime:
         def __init__(self, *args, **kwargs):
             self.intake = kwargs["intake"]

@@ -3,7 +3,7 @@ name: Public synthetic checks
 # A workflow definition is not execution evidence; inspect its hosted run.
 "on":
   push:
-    branches: [master]
+    branches: [master, 'codex/**']
   pull_request:
   workflow_dispatch:
 
@@ -102,20 +102,27 @@ jobs:
             '--disable-optional-httpx-cli',
             '--tests',
             'tests/test_llm_retry_accounting.py',
+            'tests/test_llm_call_observation.py',
             'tests/test_query_embedding.py',
             'tests/test_embedding_batches.py',
             'tests/test_prepared_lexical.py',
             'tests/test_material_deletion.py',
             'tests/test_material_audit.py',
+            'tests/test_notes_persistence.py',
+            'tests/test_notes_deletion_and_worker.py',
             'tests/test_retrieval_pipeline.py',
             'tests/test_persistent_ingestion_jobs.py',
+            'tests/test_typed_job_kinds.py',
+            'tests/test_worker_shutdown_deadline.py',
             'tests/test_ingestion_shutdown_boundaries.py',
             'tests/test_runtime_identity.py',
             'tests/test_local_service_identity.py',
             'tests/test_chat_modes.py',
             'tests/test_intent_clarification_sessions.py',
             'tests/test_clarification_recovery_safety.py',
-            'tests/test_choice_menu_versions.py'
+            'tests/test_choice_menu_versions.py',
+            'tests/test_mention_agent_import_mode.py',
+            'tests/test_thread_followup_semantic_limits.py'
           )
           & $backendPython @runnerArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -136,7 +143,8 @@ jobs:
             'tests/test_ingestion_recovery_api.py',
             'tests/test_ingestion_maintenance.py',
             'tests/test_knowledge_base_deletion.py',
-            'tests/test_maintenance_api.py'
+            'tests/test_maintenance_api.py',
+            'tests/test_notes_api.py'
           )
           & $backendPython @runnerArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
