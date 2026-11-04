@@ -1,8 +1,8 @@
 import { BookOpen, ScanLine } from 'lucide-react';
 
-interface Props { onStartLogin: () => void; onTryChat: () => void; busy: boolean; }
+interface Props { onStartLogin: () => void; onTryChat: () => void; onOpenLocal: () => void; busy: boolean; }
 
-export default function LandingPage({ onStartLogin, onTryChat, busy }: Props) {
+export default function LandingPage({ onStartLogin, onTryChat, onOpenLocal, busy }: Props) {
   return (
     <div className="min-h-screen flex flex-col bg-[var(--color-bg)]">
       {/* Top Bar */}
@@ -36,9 +36,12 @@ export default function LandingPage({ onStartLogin, onTryChat, busy }: Props) {
           <ScanLine size={20} />{busy ? '启动中...' : '扫码登录 · 开始构建'}
         </button>
 
-        <div className="-mt-5">
-          <button onClick={onTryChat} className="text-sm text-accent underline underline-offset-4">先体验 AI 对话</button>
-          <p className="mt-2 text-xs text-[var(--color-ink-muted)]">无需登录抖音；根据收藏视频回答需要先同步并入库</p>
+        <div className="-mt-5 space-y-3">
+          <div className="flex flex-wrap items-center justify-center gap-x-6 gap-y-3">
+            <button onClick={onOpenLocal} className="ui-button"><BookOpen size={17} />打开本地知识库</button>
+            <button onClick={onTryChat} className="text-sm text-accent underline underline-offset-4 min-h-11">先体验 AI 对话</button>
+          </div>
+          <p className="text-xs text-[var(--color-ink-muted)]">已有资料可直接查看和提问；同步新收藏时再登录抖音。</p>
         </div>
 
         {/* Pipeline */}

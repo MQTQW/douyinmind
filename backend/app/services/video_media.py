@@ -10,12 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
-from yt_dlp import YoutubeDL
-
 from app.core.config import settings
 from app.services.douyin_media import DouyinMediaError, download_douyin_media, is_douyin_video_url
 from app.services.media_service import (
-    DOUYIN_REFERER, USER_AGENT, MediaPipelineError,
+    DOUYIN_REFERER, USER_AGENT, MediaPipelineError, YoutubeDL,
     _export_cookiefile, _resolve_ffmpeg_path,
 )
 

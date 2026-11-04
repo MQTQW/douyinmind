@@ -14,7 +14,7 @@ from tenacity import RetryError
 
 from app.api.routes import chat
 from app.db.base import Base
-from app.models.entities import ChatMessage, ChatSession
+from app.models.entities import ChatMessage, ChatSession, KnowledgeBase
 from app.services.chat_errors import MESSAGES, logged_chat_error, public_chat_error
 from app.services import rag_service as production
 from app.services.retrieval_errors import EmbeddingUnavailable
@@ -117,11 +117,19 @@ def test_inner_stream_failure_keeps_delivered_text_but_does_not_persist_or_leak(
 
 def test_early_scope_rejection_preserves_known_business_message(monkeypatch):
     service = production.RagService()
-    def mismatch(*args):
-        raise ValueError('这段历史对话属于另一个知识库，请切回原知识库或新建对话。')
-    monkeypatch.setattr(service, '_validate_session_scope', mismatch)
     monkeypatch.setattr(production.llm_client, 'stream_chat', lambda **kwargs: pytest.fail('scope mismatch cannot call model'))
-    events = list(service.answer_stream(object(), '它是什么意思？', 1, knowledge_base_id=2))
+    engine = create_engine('sqlite:///:memory:')
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        db.add_all([KnowledgeBase(id=1, name='原测试库', name_key='原测试库'),
+                    KnowledgeBase(id=2, name='另一测试库', name_key='另一测试库')])
+        db.flush()
+        db.add(ChatSession(id=1, title='合成历史', knowledge_base_id=1,
+                           collection_id=None, chat_only=False))
+        db.commit()
+        events = list(service.answer_stream(db, '它是什么意思？', 1, knowledge_base_id=2))
+        assert db.scalar(select(func.count()).select_from(ChatMessage)) == 0
+    engine.dispose()
     assert events == [('error', {'code': 'CHAT_SCOPE_MISMATCH', 'message': MESSAGES['CHAT_SCOPE_MISMATCH']})]
 
 

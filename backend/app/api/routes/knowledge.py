@@ -6,19 +6,22 @@
 import logging
 import json
 from typing import Literal
+from uuid import UUID
+from datetime import timezone
 
 from fastapi import APIRouter, Depends, Query
-from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.models.entities import FavoriteVideo, VideoCache
-from app.services.knowledge_service import knowledge_service
-from app.services.markdown_export import export_ai_organized, export_original
+from app.models.entities import FavoriteVideo, VideoCache, KnowledgeDeletionOperation
+from app.services.knowledge_service import KnowledgeRecoveryError, knowledge_service
 from app.services.worker import WorkerBusyError, worker
 from app.services.ingestion_metrics import latest_ingestion_run
+from app.services.material_deletion import DeletionIncomplete, describe_operation
+from app.assistant.routes import local_request
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +61,27 @@ class SyncRequest(BaseModel):
     selected_ids: list[str] | None = None
     knowledge_base_id: int | None = Field(default=None, gt=0)
 
+
+class RetryTaskRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    confirm_reprocess: StrictBool
+    request_id: UUID
+
+
+class ResumeDeletionRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    confirm: StrictBool
+
+
+def recovery_failure(error):
+    return {'success': False, 'code': error.code, 'message': error.message,
+            'needs_review': error.needs_review, 'reset_count': error.reset_count, 'task_id': error.task_id}
+
+
+def deletion_failure(error):
+    return {'success': False, 'code': 'DELETION_INCOMPLETE', 'operation_id': error.operation_id,
+            'reason_code': error.reason, 'status': 'deleting', 'message': error.message}
+
 @router.post("/sync")
 async def sync_knowledge(body: SyncRequest, db: Session = Depends(get_db)):
     """
@@ -72,9 +96,14 @@ async def sync_knowledge(body: SyncRequest, db: Session = Depends(get_db)):
     """
     try:
         result = knowledge_service.start_sync(db, body.selected_ids, body.knowledge_base_id)
-    except (RuntimeError, ValueError) as exc:
-        db.rollback()
-        return {"success": False, "message": str(exc)}
+    except KnowledgeRecoveryError as error:
+        return recovery_failure(error)
+    except WorkerBusyError:
+        return {'success': False, 'code': 'INGESTION_BUSY', 'message': '有资料正在处理、排队或恢复，请先刷新原任务后再操作。'}
+    except ValueError:
+        return {'success': False, 'code': 'INGESTION_SELECTION_INVALID', 'message': '所选视频或目标知识库暂不可用，请刷新并核对范围后再提交。'}
+    except Exception:
+        return {'success': False, 'code': 'INGESTION_SUBMISSION_UNAVAILABLE', 'message': '入库任务尚未确认提交，请核对服务配置与原记录后重试。'}
     return {"success": True, **result}
 
 
@@ -86,13 +115,99 @@ async def get_sync_progress(task_id: str):
     :param task_id: 任务 ID（由 /sync 返回）
     :return: 任务状态和进度
     """
-    progress = knowledge_service.get_progress(task_id)
+    try:
+        progress = knowledge_service.get_progress(task_id)
+    except Exception:
+        return {'success': False, 'code': 'INGESTION_PROGRESS_UNAVAILABLE', 'message': '任务状态暂时无法读取，请保留原记录并稍后刷新。'}
     if progress is None:
         return {
             "success": False,
             "message": f"任务不存在: {task_id}",
         }
-    return {"success": True, **progress}
+    return {"success": True, **knowledge_service.public_task(progress)}
+
+
+@router.get('/tasks')
+def list_ingestion_tasks(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
+    try:
+        return {'success': True, **knowledge_service.list_tasks(limit=limit, offset=offset)}
+    except Exception:
+        return {'success': False, 'code': 'INGESTION_HISTORY_UNAVAILABLE',
+                'message': '入库任务记录暂时无法读取，原任务未被重新执行。请稍后刷新。'}
+
+
+@router.get('/tasks/{task_id}/retry-result', dependencies=[Depends(local_request)])
+def get_ingestion_retry_result(task_id: str, request_id: UUID):
+    try:
+        return {'success': True, **knowledge_service.recovery_result(task_id, request_id)}
+    except KnowledgeRecoveryError as error:
+        return recovery_failure(error)
+    except Exception:
+        return {'success': False, 'code': 'INGESTION_RETRY_LOOKUP_UNAVAILABLE',
+                'message': '这次提交的结果暂不可读。请保留原请求，当前没有再次提交。'}
+
+
+@router.post('/tasks/{task_id}/retry', dependencies=[Depends(local_request)])
+def retry_ingestion_task(task_id: str, body: RetryTaskRequest, db: Session = Depends(get_db)):
+    if body.confirm_reprocess is not True:
+        return {'success': False, 'code': 'INGESTION_CONFIRMATION_REQUIRED', 'message': '请先确认重新处理可能再次产生费用。'}
+    try:
+        return {'success': True, **knowledge_service.retry_sync(db, task_id, body.request_id)}
+    except KnowledgeRecoveryError as error:
+        return recovery_failure(error)
+    except WorkerBusyError:
+        return {'success': False, 'code': 'INGESTION_BUSY', 'message': '有任务正在处理或排队，尚未重新提交。请先核对现有任务。'}
+    except Exception:
+        return {'success': False, 'code': 'INGESTION_RETRY_UNAVAILABLE',
+                'message': '这次重新提交的结果尚未确认。请保留原请求并先核查任务记录。', 'needs_review': True}
+
+
+def operation_view(operation):
+    def stamp(value):
+        return value.replace(tzinfo=timezone.utc).isoformat() if value is not None else None
+    return {**describe_operation(operation), 'created_at': stamp(operation.created_at),
+            'updated_at': stamp(operation.updated_at), 'can_resume': operation.active_key == 1}
+
+
+@router.get('/deletions')
+def list_deletions(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0),
+                   active_only: bool = False, db: Session = Depends(get_db)):
+    try:
+        conditions = [KnowledgeDeletionOperation.active_key == 1] if active_only else []
+        total = db.scalar(select(func.count()).select_from(KnowledgeDeletionOperation).where(*conditions)) or 0
+        rows = db.scalars(select(KnowledgeDeletionOperation).where(*conditions)
+            .order_by(KnowledgeDeletionOperation.updated_at.desc(), KnowledgeDeletionOperation.operation_id.desc())
+            .offset(offset).limit(limit))
+        return {'success': True, 'items': [operation_view(operation) for operation in rows],
+                'total': total, 'limit': limit, 'offset': offset}
+    except Exception:
+        db.rollback()
+        return {'success': False, 'code': 'DELETION_HISTORY_UNAVAILABLE', 'message': '删除记录暂时无法读取，请保留原资料并稍后刷新。'}
+
+
+@router.post('/deletions/{operation_id}/resume', dependencies=[Depends(local_request)])
+def resume_deletion(operation_id: UUID, body: ResumeDeletionRequest, db: Session = Depends(get_db)):
+    if body.confirm is not True:
+        return {'success': False, 'code': 'DELETION_CONFIRMATION_REQUIRED', 'message': '请先确认继续完成这一次删除。'}
+    try:
+        identity = str(operation_id)
+        old = db.get(KnowledgeDeletionOperation, identity)
+        if old is not None and old.state == 'done':
+            return {'success': True, **knowledge_service.resume_deletion(db, identity)}
+        with worker.maintenance_guard():
+            try:
+                result = knowledge_service.resume_deletion(db, identity)
+            except BaseException:
+                db.rollback()
+                raise
+        return {'success': True, **result}
+    except DeletionIncomplete as error:
+        return deletion_failure(error)
+    except WorkerBusyError:
+        db.rollback()
+        return {'success': False, 'code': 'DELETION_BUSY', 'message': '有资料正在处理或排队，尚未继续删除。请等待任务结束后再核对。'}
+    except Exception:
+        return {'success': False, 'code': 'DELETION_RESUME_UNAVAILABLE', 'message': '删除结果尚未确认，请保留原操作记录并刷新核对。'}
 
 
 @router.post("/reset-failed")
@@ -148,11 +263,15 @@ async def delete_video(platform_item_id: str, db: Session = Depends(get_db)):
                 db.rollback()
                 raise
         return {"success": True, **result}
+    except DeletionIncomplete as error:
+        return deletion_failure(error)
     except WorkerBusyError:
         db.rollback()
         return {"success": False, "message": "有资料正在处理或排队，请等待入库任务结束后再删除。"}
     except ValueError as exc:
-        return {"success": False, "message": str(exc)}
+        return {"success": False, "code": "DELETION_SELECTION_INVALID", "message": "这份资料当前不能删除，请刷新核对原视频与处理状态。"}
+    except Exception:
+        return {'success': False, 'code': 'DELETION_UNAVAILABLE', 'message': '删除结果尚未确认，请保留原资料并刷新核对。'}
 
 
 @router.get("/stats")
@@ -216,11 +335,16 @@ async def export_video_markdown(
 
     if cache is None:
         return f"# 导出失败\n\n视频 `{platform_item_id}` 未找到，请先同步收藏夹。\n"
+    if cache.status == 'deleting' and mode == 'ai':
+        return JSONResponse(status_code=409, content={'success': False, 'code': 'DELETION_PENDING',
+            'message': '这份资料的删除尚未完成，暂不调用 AI 整理。可导出原文核对，或先查看原删除记录。'})
 
     try:
         if mode == "original":
+            from app.services.markdown_export import export_original
             md = export_original(cache)
         else:
+            from app.services.markdown_export import export_ai_organized
             md = export_ai_organized(cache)
     except ValueError as exc:
         return f"# 导出失败\n\n{exc}\n"

@@ -16,12 +16,16 @@ import tempfile
 import wave
 from pathlib import Path
 
-from yt_dlp import YoutubeDL
-
 from app.core.config import settings
 from app.services.douyin_media import DouyinMediaError, download_douyin_media, is_douyin_video_url
 
 logger = logging.getLogger(__name__)
+
+
+def YoutubeDL(*args, **kwargs):
+    """Load the media downloader only for an actual download, not API startup."""
+    from yt_dlp import YoutubeDL as downloader
+    return downloader(*args, **kwargs)
 
 # 抖音请求头
 DOUYIN_REFERER = "https://www.douyin.com/"

@@ -33,6 +33,7 @@ from app.services.audio_media import AudioSegment, prepare_audio_segments, split
 from app.services.audio_checkpoint import AudioCheckpoint
 from app.services.audio_boundary import STRATEGY_VERSION, select_boundary_candidates, propose_boundary_splice
 from app.services.media_service import MediaPipelineError
+from app.services.media_timestamps import timestamp
 
 
 class OmniServiceError(RuntimeError):
@@ -83,13 +84,6 @@ class SegmentAnalysis(BaseModel):
     transcript_segments: list[TimedText]
     visual_segments: list[VisualObservation] = Field(min_length=1)
     warnings: list[str] = Field(default_factory=list)
-
-
-def timestamp(seconds: float) -> str:
-    value = max(0, int(seconds))
-    hours, remaining = divmod(value, 3600)
-    minutes, secs = divmod(remaining, 60)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
 
 
 @dataclass

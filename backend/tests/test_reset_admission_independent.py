@@ -181,8 +181,12 @@ def test_configuration_or_submit_failure_releases_admission_after_rollback(cold,
                         fail if failure == 'configuration' else lambda: None)
     if failure == 'submit':
         monkeypatch.setattr(cold, 'submit', fail)
-    with pytest.raises(RuntimeError):
+    expected = RuntimeError if failure == 'configuration' else service_module.KnowledgeRecoveryError
+    with pytest.raises(expected) as refused:
         KnowledgeService().start_sync(db)
+    if failure == 'submit':
+        assert refused.value.code == 'INGESTION_PUBLICATION_UNCONFIRMED'
+        assert refused.value.needs_review is True
     assert db.events[-1] == 'rollback'
     assert cold._queue.empty()
     with cold.maintenance_guard():

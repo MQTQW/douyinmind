@@ -12,7 +12,7 @@
   --color-amber: #96682D;
   --color-ink: #273A2A;
   --color-ink-soft: #4D5E4E;
-  --color-ink-muted: #647360;
+  --color-ink-muted: #5E6D5A;
   --color-border: #DCE5D5;
   --color-success: #3E6747;
 }
@@ -257,7 +257,9 @@ input[type=checkbox] { width: 16px; height: 16px; flex-shrink: 0; accent-color: 
 .resource-icon { display: grid; place-items: center; width: 34px; height: 41px; background: var(--color-bg); border-radius: 8px; color: var(--color-accent); flex-shrink: 0; }
 .resource-title { min-width: 0; flex: 1; text-align: left; }
 .resource-title strong { display: block; font-size: 13px; line-height: 1.7; font-weight: 500; overflow-wrap: anywhere; }
-.resource-title small { display: block; font-size: 11px; color: var(--color-ink-muted); margin-top: 4px; line-height: 1.7; }
+.resource-title small { display: block; font-size: 11px; color: var(--color-ink-muted); margin-top: 4px; line-height: 1.7; overflow-wrap: anywhere; }
+.knowledge-recovery .resource-icon { background: transparent; }
+.knowledge-recovery .resource-title small { font-size: 12px; }
 .status-badge { display: inline-flex; align-items: center; gap: 3px; padding: 4px 7px; border-radius: 6px; background: var(--color-bg); color: var(--color-accent); font-size: 11px; white-space: nowrap; flex-shrink: 0; }
 .status-failed { background: #FBEFEB; color: #A2493B; }
 .action-menu { position: relative; flex-shrink: 0; }

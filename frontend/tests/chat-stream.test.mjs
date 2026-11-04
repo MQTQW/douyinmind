@@ -15,7 +15,7 @@ async function moduleURL(path, imports = {}) {
 
 const sseURL = await moduleURL('../src/sse.ts');
 const { readSSE } = await import(sseURL);
-const { chatAskStream } = await import(await moduleURL('../src/api.ts', { './sse': sseURL }));
+const { chatAsk, chatAskStream } = await import(await moduleURL('../src/api.ts', { './sse': sseURL }));
 const encoder = new TextEncoder();
 const wire = (event, data, newline = '\n') => `event: ${event}${newline}data: ${JSON.stringify(data)}${newline}${newline}`;
 
@@ -37,11 +37,82 @@ async function collect(events) {
 async function withResponse(body, run, options = {}) {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (...args) => {
+    if (args[0] === '/api/chat/capabilities') return new Response(JSON.stringify({ success: true,
+      chat_only_sessions: true, session_mode_persistent: true, modes: ['knowledge', 'chat_only'] }), { headers: { 'Content-Type': 'application/json' } });
     options.checkRequest?.(...args);
     return new Response(body, { headers: { 'Content-Type': 'text/event-stream' }, ...options.response });
   };
   try { await run(); } finally { globalThis.fetch = originalFetch; }
 }
+
+test('explicit pure AI scope is sent for streams without local library identifiers', async () => {
+  const bytes = encoder.encode(wire('meta', { session_id: 82, chat_only: true }) + wire('done', { ok: true }));
+  await withResponse(stream(bytes), async () => {
+    await collect(chatAskStream('纯AI合成问题', null, null, undefined, null, true));
+  }, { checkRequest(_url, options) {
+    assert.deepEqual(JSON.parse(options.body), { query: '纯AI合成问题', session_id: null, collection_id: null, chat_only: true });
+  }});
+});
+
+test('explicit local mode and legacy omitted mode remain distinct requests', async () => {
+  for (const mode of [false, undefined]) {
+    const bytes = encoder.encode(wire('meta', { session_id: 81 }) + wire('done', { ok: true }));
+    await withResponse(stream(bytes), async () => {
+      await collect(chatAskStream('本地资料问题', 81, 'all', undefined, 7, mode));
+    }, { checkRequest(_url, options) {
+      const body = JSON.parse(options.body);
+      assert.equal(body.knowledge_base_id, 7);assert.equal(body.session_id, 81);
+      assert.equal(Object.hasOwn(body, 'chat_only'), mode !== undefined);
+      if (mode !== undefined) assert.equal(body.chat_only, false);
+    }});
+  }
+});
+
+test('nonstreaming AI requests carry the same explicit mode', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    if (url === '/api/chat/capabilities') return new Response(JSON.stringify({ success: true,
+      chat_only_sessions: true, session_mode_persistent: true, modes: ['knowledge', 'chat_only'] }), { headers: { 'Content-Type': 'application/json' } });
+    assert.equal(JSON.parse(options.body).chat_only, true);
+    return new Response(JSON.stringify({ success: true, answer: '合成回答' }), { headers: { 'Content-Type': 'application/json' } });
+  };
+  try { assert.equal((await chatAsk('纯AI问题', null, null, null, true)).success, true); }
+  finally { globalThis.fetch = originalFetch; }
+});
+
+test('old or unverified backends never receive a pure AI question', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const backend of ['missing', 'incomplete', 'network']) {
+      const calls = [];
+      globalThis.fetch = async url => {
+        calls.push(url);
+        assert.equal(url, '/api/chat/capabilities', 'an unsupported backend must never receive the question');
+        if (backend === 'network') throw new TypeError('synthetic network failure');
+        if (backend === 'missing') return new Response('{}', { status: 404 });
+        return new Response(JSON.stringify({ success: true, chat_only_sessions: true, modes: ['chat_only'] }));
+      };
+      await assert.rejects(collect(chatAskStream('不能泄漏到旧资料模式的问题', null, null, undefined, null, true)), /没有发送问题或读取本地资料/);
+      assert.deepEqual(calls, ['/api/chat/capabilities']);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('capability failure in AI mode does not disable a local library request', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push(url);
+    if (url === '/api/chat/capabilities') return new Response('{}', { status: 404 });
+    assert.equal(JSON.parse(options.body).chat_only, false);
+    return new Response(JSON.stringify({ success: true, answer: '本地合成回答' }), { headers: { 'Content-Type': 'application/json' } });
+  };
+  try {
+    await assert.rejects(chatAsk('纯AI问题', null, null, null, true), /更新并重新启动后台/);
+    assert.equal((await chatAsk('本地问题', null, 'all', 7, false)).success, true);
+    assert.deepEqual(calls, ['/api/chat/capabilities', '/api/chat/ask']);
+  } finally { globalThis.fetch = originalFetch; }
+});
 
 test('Chinese, emoji and all events survive every byte boundary', async () => {
   const expected = [

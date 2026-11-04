@@ -32,6 +32,19 @@ def ensure_chat_knowledge_base_column(engine: Engine) -> None:
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_chat_sessions_knowledge_base_id ON chat_sessions (knowledge_base_id)"))
 
 
+def ensure_chat_mode_column(engine: Engine) -> None:
+    """Old conversations keep their knowledge mode; new pure-AI is explicit."""
+    with engine.begin() as connection:
+        inspector = inspect(connection)
+        if "chat_sessions" not in inspector.get_table_names():
+            return
+        columns = {column["name"] for column in inspector.get_columns("chat_sessions")}
+        if "chat_only" not in columns:
+            connection.execute(text("ALTER TABLE chat_sessions ADD COLUMN chat_only BOOLEAN NOT NULL DEFAULT 0"))
+        if "collection_id" not in columns:
+            connection.execute(text("ALTER TABLE chat_sessions ADD COLUMN collection_id VARCHAR(128)"))
+
+
 def ensure_knowledge_base_tombstones(engine: Engine) -> None:
     """Retain library IDs and stop legacy writers assigning deleted scopes."""
     with engine.begin() as connection:

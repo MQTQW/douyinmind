@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import time
+from datetime import timezone
 from typing import Iterable
 
 from sqlalchemy import desc, func, select
@@ -40,6 +41,15 @@ from app.services.chat_errors import logged_chat_error, public_chat_error
 from app.services.retrieval_observation import RetrievalObservation
 
 logger = logging.getLogger(__name__)
+
+
+def _public_timestamp(value):
+    """SQLite CURRENT_TIMESTAMP is UTC, even when its datetime is naive."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
 
 # ==================================================================
 # 静态工具函数
@@ -329,12 +339,14 @@ class RagService:
         knowledge_base_id: int | None,
     ) -> set[str] | None:
         """Resolve a scope once, retaining the difference between empty and global."""
-        scope = None
+        # SQL completion is authoritative. Stale vectors from an interrupted
+        # index/delete operation must never become globally queryable material.
+        scope = set(db.scalars(select(VideoCache.platform_item_id).where(VideoCache.status == 'done')))
         if knowledge_base_id is not None:
-            scope = set(knowledge_base_service.list_video_ids(db, knowledge_base_id, done_only=True))
+            scope &= set(knowledge_base_service.list_video_ids(db, knowledge_base_id, done_only=True))
         if collection_id and collection_id != "all":
             collection_scope = self._resolve_collection_scope(db, collection_id)
-            scope = collection_scope if scope is None else scope & collection_scope
+            scope &= collection_scope
         return scope
 
     def _validate_session_scope(
@@ -347,6 +359,36 @@ class RagService:
             raise ValueError("该历史对话已不存在，请新建对话。")
         if session.knowledge_base_id != knowledge_base_id:
             raise ValueError("这段历史对话属于另一个知识库，请切回原知识库或新建对话。")
+
+    @staticmethod
+    def _resolve_chat_mode(db, session_id, requested, knowledge_base_id, collection_id):
+        if requested is not None and type(requested) is not bool:
+            raise ValueError("纯 AI 对话不能同时指定知识库或收藏夹，请新建对应模式的对话。")
+        session = db.get(ChatSession, session_id) if session_id is not None else None
+        if session_id is not None and session is None:
+            raise ValueError("该历史对话已不存在，请新建对话。")
+        saved = bool(getattr(session, 'chat_only', False)) if session is not None else False
+        if session is not None and requested is not None and requested != saved:
+            raise ValueError("这段历史对话的资料模式已固定，请恢复原模式或新建对话。")
+        resolved = saved if requested is None else requested
+        if resolved and (knowledge_base_id is not None or collection_id not in (None, '', 'all')):
+            raise ValueError("纯 AI 对话不能同时指定知识库或收藏夹，请新建对应模式的对话。")
+        return resolved
+
+    @staticmethod
+    def _resolve_session_collection(db, session_id, requested):
+        normalized = None if requested in (None, '', 'all') else requested
+        if session_id is None:
+            return normalized
+        session = db.get(ChatSession, session_id)
+        if session is None:
+            raise ValueError("该历史对话已不存在，请新建对话。")
+        saved = getattr(session, 'collection_id', None)
+        if requested is None:
+            return saved
+        if normalized != saved:
+            raise ValueError("这段历史对话属于另一个知识库，请切回原知识库或新建对话。")
+        return saved
 
     @staticmethod
     def _scope_prompt(system: str, scope_ids: set[str] | None) -> str:
@@ -727,6 +769,7 @@ class RagService:
         session_id: int | None,
         collection_id: str | None = None,
         knowledge_base_id: int | None = None,
+        chat_only: bool | None = None,
     ) -> dict:
         """
         非流式 RAG 问答
@@ -742,14 +785,16 @@ class RagService:
         """
         started = time.perf_counter()
 
+        collection_id = self._resolve_session_collection(db, session_id, collection_id)
+        chat_only = self._resolve_chat_mode(db, session_id, chat_only, knowledge_base_id, collection_id)
         self._validate_session_scope(db, session_id, knowledge_base_id)
 
         # Step 1: 路由
         t0 = time.perf_counter()
         normalized = _normalize_query(query)
-        scope_ids = self._resolve_scope(db, collection_id, knowledge_base_id)
-        has_data = bool(scope_ids) if scope_ids is not None else get_chroma_service().count() > 0
-        route = self._route(normalized, has_data)
+        scope_ids = None if chat_only else self._resolve_scope(db, collection_id, knowledge_base_id)
+        has_data = False if chat_only else bool(scope_ids) if scope_ids is not None else get_chroma_service().count() > 0
+        route = "direct" if chat_only else self._route(normalized, has_data)
         t_route = time.perf_counter() - t0
 
         # Step 2: 检索（支持收藏夹筛选）
@@ -775,6 +820,8 @@ class RagService:
             route, normalized, context, history
         )
         system = self._scope_prompt(system, scope_ids)
+        if chat_only:
+            system += "\n当前是纯 AI 对话，不检索或使用本地知识库和收藏资料，不能声称看到了用户的收藏或视频原文。"
         t_ctx = time.perf_counter() - t0
 
         # Step 5: LLM 生成
@@ -801,7 +848,7 @@ class RagService:
             raise ValueError("该历史对话已被删除，请新建对话。")
         if not session:
             title = normalized[:40] if normalized else "新对话"
-            session = ChatSession(title=title, knowledge_base_id=knowledge_base_id)
+            session = ChatSession(title=title, knowledge_base_id=knowledge_base_id, chat_only=chat_only, collection_id=collection_id)
             db.add(session)
             db.flush()
 
@@ -879,6 +926,8 @@ class RagService:
             "sources": sources,
             "session_id": session.id,
             "knowledge_base_id": session.knowledge_base_id,
+            "chat_only": bool(session.chat_only),
+            "collection_id": session.collection_id,
             "route_type": route,
             "latency_ms": latency_ms,
             "trace": trace,
@@ -895,6 +944,7 @@ class RagService:
         session_id: int | None,
         collection_id: str | None = None,
         knowledge_base_id: int | None = None,
+        chat_only: bool | None = None,
     ) -> Iterable[tuple[str, dict]]:
         """
         SSE 流式 RAG 问答
@@ -910,8 +960,10 @@ class RagService:
         started = time.perf_counter()
 
         try:
+            collection_id = self._resolve_session_collection(db, session_id, collection_id)
+            chat_only = self._resolve_chat_mode(db, session_id, chat_only, knowledge_base_id, collection_id)
             self._validate_session_scope(db, session_id, knowledge_base_id)
-            scope_ids = self._resolve_scope(db, collection_id, knowledge_base_id)
+            scope_ids = None if chat_only else self._resolve_scope(db, collection_id, knowledge_base_id)
         except ValueError as exc:
             yield ("error", public_chat_error(exc))
             return
@@ -919,8 +971,8 @@ class RagService:
         # Step 1-4 与非流式一致
         t0 = time.perf_counter()
         normalized = _normalize_query(query)
-        has_data = bool(scope_ids) if scope_ids is not None else get_chroma_service().count() > 0
-        route = self._route(normalized, has_data)
+        has_data = False if chat_only else bool(scope_ids) if scope_ids is not None else get_chroma_service().count() > 0
+        route = "direct" if chat_only else self._route(normalized, has_data)
         t_route = time.perf_counter() - t0
 
         t0 = time.perf_counter()
@@ -942,6 +994,8 @@ class RagService:
             route, normalized, context, history
         )
         system = self._scope_prompt(system, scope_ids)
+        if chat_only:
+            system += "\n当前是纯 AI 对话，不检索或使用本地知识库和收藏资料，不能声称看到了用户的收藏或视频原文。"
         t_ctx = time.perf_counter() - t0
 
         # Citations are unknown until generation ends. Do not advertise every
@@ -976,7 +1030,7 @@ class RagService:
                 raise ValueError("该历史对话已被删除，请新建对话。")
             if not session:
                 title = normalized[:40] if normalized else "新对话"
-                session = ChatSession(title=title, knowledge_base_id=knowledge_base_id)
+                session = ChatSession(title=title, knowledge_base_id=knowledge_base_id, chat_only=chat_only, collection_id=collection_id)
                 db.add(session)
                 db.flush()
 
@@ -1019,6 +1073,8 @@ class RagService:
                 {
                     "session_id": session.id,
                     "knowledge_base_id": session.knowledge_base_id,
+                    "chat_only": bool(session.chat_only),
+                    "collection_id": session.collection_id,
                     "route_type": route,
                     "latency_ms": latency_ms,
                     "sources": sources,
@@ -1099,10 +1155,12 @@ class RagService:
             {
                 "id": session.id,
                 "knowledge_base_id": session.knowledge_base_id,
+                "chat_only": bool(session.chat_only),
+                "collection_id": session.collection_id,
                 "title": session.title,
                 "message_count": int(count or 0),
-                "last_message_at": str(last_message) if last_message else None,
-                "created_at": str(session.created_at),
+                "last_message_at": _public_timestamp(last_message),
+                "created_at": _public_timestamp(session.created_at),
             }
             for session, count, last_message in rows
         ]
@@ -1168,7 +1226,7 @@ class RagService:
                     }
                     for item in source_ids[row.id]
                 ],
-                "created_at": str(row.created_at),
+                "created_at": _public_timestamp(row.created_at),
             }
             for row in rows
         ]

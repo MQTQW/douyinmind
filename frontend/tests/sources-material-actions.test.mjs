@@ -24,6 +24,7 @@ const reactURL = asURL(`
 export function useState(initial,label){const h=globalThis.__materialActions;if(!(label in h.state))h.state[label]=typeof initial==='function'?initial():initial;return[h.state[label],value=>{h.state[label]=typeof value==='function'?value(h.state[label]):value}];}
 export function useRef(initial,label){const h=globalThis.__materialActions;if(!(label in h.refs))h.refs[label]={current:label==='aliveRef'?true:initial};return h.refs[label];}
 export const useEffect=()=>{};export const useCallback=value=>value;
+export const lazy=()=>()=>null;export const Suspense=()=>null;
 `);
 const jsxURL = asURL('export const jsx=(type,props,key)=>({type,props,key});export const jsxs=jsx;export const Fragment="fixture-fragment";');
 const stubURL = asURL('export default function Stub(){return null;}');
@@ -37,7 +38,7 @@ const imports = {
   react: reactURL, 'react/jsx-runtime': jsxURL, 'react-dom': asURL('export const createPortal=children=>children;'),
   'lucide-react': asURL(`export const ${iconNames.map(x=>`${x}=()=>null`).join(',')};`), '../api': apiURL,
   './ActionMenu': stubURL, './BuildConfirmModal': stubURL, './VideoContentModal': stubURL,
-  './SessionActionModal': stubURL, './KnowledgeBasesPanel': stubURL,
+  './SessionActionModal': stubURL, './KnowledgeBasesPanel': stubURL, './KnowledgeRecoveryPanel': stubURL,
   '../workspacePresentation': asURL('export const visibleHistory=(items)=>items;'),
 };
 let { outputText } = ts.transpileModule(source, {compilerOptions:{target:ts.ScriptTarget.ES2020,module:ts.ModuleKind.ESNext,jsx:ts.JsxEmit.ReactJSX},transformers:{before:[tagHooks]}});

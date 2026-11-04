@@ -11,25 +11,84 @@ from __future__ import annotations
 import logging
 import uuid
 import json
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import delete, desc, func, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models.entities import KnowledgeBaseVideo, VideoCache
+from app.models.entities import VideoCache
 from app.db.session import session_factory
 from app.services.chroma_service import get_chroma_service
 from app.services.llm_service import embedding_client
 from app.services.video_media import download_video
 from app.services.media_service import download_audio
-from app.services.omni_service import omni_service
 from app.services.knowledge_base_service import knowledge_base_service
-from app.services.worker import worker
+from app.services.worker import WorkerBusyError, worker
+from app.services.ingestion_jobs import job_metadata, task_identity
 from app.services.ingestion_metrics import IngestionRun
 
 logger = logging.getLogger(__name__)
+
+
+class _OmniFacade:
+    """Read-only knowledge APIs do not initialize optional recognition SDKs."""
+    @staticmethod
+    def check_configuration(*args, **kwargs):
+        from app.services.omni_service import omni_service as actual
+        return actual.check_configuration(*args, **kwargs)
+
+    @staticmethod
+    def analyze_audio(*args, **kwargs):
+        from app.services.omni_service import omni_service as actual
+        return actual.analyze_audio(*args, **kwargs)
+
+    @staticmethod
+    def analyze_video(*args, **kwargs):
+        from app.services.omni_service import omni_service as actual
+        return actual.analyze_video(*args, **kwargs)
+
+
+omni_service = _OmniFacade()
+
+
+class KnowledgeRecoveryError(ValueError):
+    def __init__(self, code, message, *, reset_count=0, needs_review=False, task_id=None):
+        self.code, self.message = code, message
+        self.reset_count, self.needs_review, self.task_id = reset_count, needs_review, task_id
+        super().__init__(message)
+
+
+def recovery_task_id(task_id, request_id):
+    task_identity(task_id)
+    request_id = str(uuid.UUID(str(request_id)))
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, 'DouyinMind.ingestion.retry.v1:' + task_id + ':' + request_id))
+
+
+def retry_metadata(record):
+    try:
+        value = job_metadata(record.get('metadata'))
+        if (record.get('status') not in {'failed', 'interrupted', 'needs_review'}
+                or record.get('persistence_error') is True
+                or not value.get('platform_item_ids')
+                or not {'knowledge_base_id', 'analysis_mode'} <= value.keys()):
+            raise ValueError()
+        return value
+    except (ValueError, TypeError, AttributeError):
+        raise KnowledgeRecoveryError('INGESTION_RETRY_NOT_ALLOWED',
+            '这项任务没有可安全重新提交的已记录范围。请核对原记录后从收藏夹重新选择。') from None
+
+
+@contextmanager
+def _business_boundary(db, guard):
+    with guard:
+        try:
+            yield
+        except BaseException:
+            db.rollback()
+            raise
 
 
 class KnowledgeService:
@@ -45,6 +104,7 @@ class KnowledgeService:
     def start_sync(
         self, db: Session, selected_ids: list[str] | None = None,
         knowledge_base_id: int | None = None,
+        *, _recovery_of: str | None = None, _task_id: str | None = None,
     ) -> dict:
         """Coordinate this request's DB transaction with explicit recovery.
 
@@ -55,7 +115,8 @@ class KnowledgeService:
         """
         with worker.submission_guard():
             try:
-                return self._start_sync_reserved(db, selected_ids, knowledge_base_id)
+                return self._start_sync_reserved(db, selected_ids, knowledge_base_id,
+                    recovery_of=_recovery_of, task_id=_task_id)
             except BaseException:
                 db.rollback()
                 raise
@@ -63,6 +124,7 @@ class KnowledgeService:
     def _start_sync_reserved(
         self, db: Session, selected_ids: list[str] | None = None,
         knowledge_base_id: int | None = None,
+        *, recovery_of: str | None = None, task_id: str | None = None,
     ) -> dict:
         """
         启动入库任务
@@ -80,7 +142,7 @@ class KnowledgeService:
             # Importing into a named destination must have an explicit selection.
             # A missing list must never classify every synchronized favorite.
             if not selected_ids:
-                raise ValueError("请至少选择一个视频导入知识库。")
+                raise KnowledgeRecoveryError('INGESTION_EMPTY_SELECTION', '请至少选择一个视频导入知识库。')
         if selected_ids is None:
             # Keep the original all-pending behavior; failed videos require an
             # explicit selection or the existing reset-failed action.
@@ -90,16 +152,18 @@ class KnowledgeService:
             ).all()
         else:
             if not selected_ids:
-                raise ValueError("请至少选择一个待入库视频。")
+                raise KnowledgeRecoveryError('INGESTION_EMPTY_SELECTION', '请至少选择一个待入库视频。')
             if any(not item_id.strip() for item_id in selected_ids):
                 raise ValueError("所选视频编号无效，请重新选择。")
             ids = list(dict.fromkeys(selected_ids))
             selected_videos = db.scalars(
-                select(VideoCache).where(VideoCache.platform_item_id.in_(ids))
+                select(VideoCache).where(VideoCache.platform_item_id.in_(ids)).execution_options(populate_existing=True)
             ).all()
             by_id = {video.platform_item_id: video for video in selected_videos}
             if any(item_id not in by_id for item_id in ids):
                 raise ValueError("部分所选视频已不存在，请刷新收藏夹后重新选择。")
+            if any(by_id[item_id].status == 'deleting' for item_id in ids):
+                raise ValueError('所选视频有删除待完成的资料，请先核对原删除操作。')
             pending_videos = [by_id[item_id] for item_id in ids
                               if by_id[item_id].status in ("pending", "failed")]
             skipped_count = len(ids) - len(pending_videos)
@@ -108,6 +172,10 @@ class KnowledgeService:
         # A later queue-publication failure cannot undo an already committed
         # assignment; it must not auto-submit another model task.
         if pending_videos:
+            active_reader = getattr(worker, 'active_video_tasks', None)
+            active = active_reader() if callable(active_reader) else {}
+            if any(video.platform_item_id in active for video in pending_videos):
+                raise WorkerBusyError('所选视频已有正在处理或排队的任务，请刷新原任务后再操作。')
             omni_service.check_configuration()
 
         assignment = {}
@@ -139,12 +207,16 @@ class KnowledgeService:
                             else "没有待入库的视频，请先同步收藏夹"),
             }
 
-        task_id = str(uuid.uuid4())[:8]
-        worker.submit(
-            task_id,
-            self._run_sync,
-            pending_ids,
-        )
+        task_id = task_id or str(uuid.uuid4())
+        metadata = {'platform_item_ids': pending_ids, 'knowledge_base_id': knowledge_base_id,
+                    'analysis_mode': settings.knowledge_analysis_mode}
+        if recovery_of is not None: metadata['recovery_of'] = task_identity(recovery_of)
+        try:
+            worker.submit(task_id, self._run_sync, pending_ids, job_metadata=metadata)
+        except Exception:
+            raise KnowledgeRecoveryError('INGESTION_PUBLICATION_UNCONFIRMED',
+                '当前资料和归类状态已保留，但未确认新入库任务提交。请刷新任务与视频状态核对，不要重复提交。',
+                needs_review=True, task_id=task_id) from None
 
         return {
             "task_id": task_id,
@@ -154,9 +226,117 @@ class KnowledgeService:
             "message": f"已提交入库任务，共 {len(pending_videos)} 个视频",
         }
 
+    @staticmethod
+    def public_task(record):
+        keys = ('task_id', 'status', 'stage', 'progress', 'total', 'message', 'metadata', 'reason_code',
+                'current_item_id', 'created_at', 'updated_at', 'started_at', 'finished_at',
+                'needs_review', 'usage_state', 'shutdown_requested_at', 'shutdown_timed_out', 'persistence_error')
+        value = {key: record[key] for key in keys if key in record}
+        try:
+            value['metadata'] = job_metadata(record.get('metadata'))
+            retry_metadata(record)
+            value['can_retry'] = True
+        except (ValueError, TypeError, AttributeError):
+            value['can_retry'] = False
+            try: value['metadata'] = job_metadata(record.get('metadata'))
+            except (ValueError, TypeError): value['metadata'] = {}
+        value['usage_state'] = 'not_recorded'
+        fixed = {'failed': '本次处理未完成，已保留原任务与已保存资料。',
+                 'interrupted': '处理已中断，请核对原资料与调用结果后再明确重新提交。',
+                 'needs_review': '任务需要核对，未自动重新执行。'}
+        if value.get('status') in fixed: value['message'] = fixed[value['status']]
+        if record.get('persistence_error') is True:
+            value.update(can_retry=False, message='任务记录暂未确认，请保留原记录并核对服务状态。')
+        return value
+
+    def list_tasks(self, limit=50, offset=0):
+        return {'items': [self.public_task(item) for item in worker.list_tasks(limit=limit, offset=offset)],
+                'total': worker.count_tasks(), 'limit': limit, 'offset': offset}
+
+    def recovery_result(self, task_id, request_id):
+        identity = recovery_task_id(task_id, request_id)
+        record = worker.get_progress(identity)
+        if record is None:
+            return {'found': False, 'task_id': identity, 'recovery_of': task_id,
+                    'message': '尚未查到这次重新提交的任务记录，请核对视频状态；当前没有再次提交。'}
+        if record.get('metadata', {}).get('recovery_of') != task_id:
+            raise KnowledgeRecoveryError('INGESTION_RETRY_ID_CONFLICT', '这次提交标识与原任务不一致，未继续处理。')
+        return {'found': True, 'task_id': identity, 'recovery_of': task_id, 'task': self.public_task(record),
+                'message': '已找到这次提交的原任务记录，没有再次执行。'}
+
+    def retry_sync(self, db: Session, task_id: str, request_id: str):
+        existing = self.recovery_result(task_id, request_id)
+        if existing['found']: return {**existing, 'duplicate': True}
+        reset_count = 0
+        reset_committed = False
+        try:
+            with _business_boundary(db, worker.maintenance_guard()):
+                existing = self.recovery_result(task_id, request_id)
+                if existing['found']: return {**existing, 'duplicate': True}
+                old = worker.get_progress(task_id)
+                if old is None:
+                    raise KnowledgeRecoveryError('INGESTION_TASK_MISSING', '原任务记录不存在，未重新提交。')
+                metadata = retry_metadata(old)
+                ids, base_id = metadata['platform_item_ids'], metadata['knowledge_base_id']
+                if base_id is not None:
+                    try: knowledge_base_service.require_base(db, base_id)
+                    except ValueError:
+                        raise KnowledgeRecoveryError('INGESTION_LIBRARY_UNAVAILABLE',
+                            '原任务的目标知识库已不可用，未重新提交。请保留原记录并重新选择目标。') from None
+                rows = list(db.scalars(select(VideoCache).where(VideoCache.platform_item_id.in_(ids))
+                    .execution_options(populate_existing=True)))
+                by_id = {row.platform_item_id: row for row in rows}
+                if any(identity not in by_id for identity in ids):
+                    raise KnowledgeRecoveryError('INGESTION_TARGET_MISSING', '原任务中的部分视频已不存在，未重新提交。')
+                if any(row.status == 'deleting' for row in rows):
+                    raise KnowledgeRecoveryError('INGESTION_TARGET_DELETING', '原任务中有删除待完成的资料，请先核对原删除操作。')
+                if any(row.status not in {'done', 'pending', 'failed', 'downloading', 'transcribing', 'embedding'} for row in rows):
+                    raise KnowledgeRecoveryError('INGESTION_TARGET_UNCONFIRMED', '原任务中的视频状态需要核对，未重新提交。')
+                for row in rows:
+                    if row.status in {'downloading', 'transcribing', 'embedding'}:
+                        row.status = 'pending'
+                        reset_count += 1
+                try:
+                    db.commit()
+                    reset_committed = True
+                except Exception:
+                    raise KnowledgeRecoveryError('INGESTION_RETRY_RESET_UNCONFIRMED',
+                        '视频状态重置结果尚未确认，尚未提交新任务。请保留原记录并刷新核对。',
+                        needs_review=True, task_id=existing['task_id']) from None
+            result = self.start_sync(db, ids, base_id, _recovery_of=task_id, _task_id=existing['task_id'])
+            if result['task_id'] is None:
+                with _business_boundary(db, worker.submission_guard()):
+                    current = dict(db.execute(select(VideoCache.platform_item_id, VideoCache.status)
+                        .where(VideoCache.platform_item_id.in_(ids))).all())
+                    if len(current) != len(ids) or any(current.get(identity) != 'done' for identity in ids):
+                        raise KnowledgeRecoveryError('INGESTION_RETRY_ALREADY_ACTIVE',
+                            '原视频已由其他处理接手或状态发生变化，本次没有另建处理任务。请先核对现有任务。')
+                    db.commit()
+                    # A zero-work record is an idempotency receipt. It does not
+                    # run recognition or erase unknown service usage.
+                    worker.submit(existing['task_id'], self._run_sync, [], job_metadata={
+                        'platform_item_ids': [], 'knowledge_base_id': base_id,
+                        'analysis_mode': settings.knowledge_analysis_mode, 'recovery_of': task_id})
+                    result['task_id'] = existing['task_id']
+            return {**result, 'recovery_of': task_id, 'reset_count': reset_count, 'duplicate': False,
+                    'message': '已登记新的处理任务；原记录和未知费用保留，已完成资料会复用。'}
+        except BaseException as error:
+            if not isinstance(error, Exception): raise
+            # A racing request may have registered this exact deterministic ID.
+            observed = self.recovery_result(task_id, request_id)
+            if observed['found']: return {**observed, 'duplicate': True, 'reset_count': reset_count}
+            if reset_committed and reset_count:
+                raise KnowledgeRecoveryError('INGESTION_RETRY_PARTIAL_RESET',
+                    '这批视频的中断状态已重置，但未确认新任务提交。请保留原记录并刷新核对，不要直接换新请求重试。',
+                    reset_count=reset_count, needs_review=True, task_id=existing['task_id']) from None
+            if isinstance(error, (KnowledgeRecoveryError, WorkerBusyError)): raise
+            raise KnowledgeRecoveryError('INGESTION_RETRY_UNAVAILABLE',
+                '这次重新提交未完成，请先核对原任务、知识库和服务状态。原记录已保留。') from None
+
     def _run_sync(
         self, platform_item_ids: list[str], task_id: str = "",
     ) -> None:
+        if not platform_item_ids: return
         # A long-running job must own its session, rather than reuse the API's session.
         with session_factory() as db:
             self._process_videos(db, platform_item_ids, task_id)
@@ -193,11 +373,15 @@ class KnowledgeService:
                 failures += 1
                 logger.warning("VideoCache 记录不存在: %s", platform_item_id)
                 continue
+            if cache.status == 'deleting':
+                failures += 1
+                continue
 
             # Two libraries can request the same pending video before a queued
             # task starts. If an earlier task has finished it, reuse its result.
             if cache.status == "done":
-                worker.update_progress(task_id, idx + 1, total, f"复用已入库资料: {cache.title[:30]}")
+                self._report_progress(task_id, idx + 1, total, f"复用已入库资料: {cache.title[:30]}",
+                    stage='reusing', item_id=platform_item_id)
                 continue
 
             run = IngestionRun(platform_item_id, cache.title, task_id, settings.knowledge_analysis_mode)
@@ -209,9 +393,10 @@ class KnowledgeService:
                 # The audio release avoids visual downloads/encoding and visual calls.
                 cache.status = "downloading"
                 db.commit()
-                worker.update_progress(
+                self._report_progress(
                     task_id, idx, total,
                     f"{'下载音频' if audio_only else '下载完整视频'}: {cache.title[:30]}...",
+                    stage='downloading', item_id=platform_item_id,
                 )
                 run.start_stage("download")
                 media_path = (download_audio if audio_only else download_video)(video_url, platform_item_id)
@@ -221,8 +406,9 @@ class KnowledgeService:
                 cache.status = "transcribing"
                 db.commit()
                 def analysis_progress(part: int, count: int) -> None:
-                    worker.update_progress(task_id, idx, total,
-                        f"{'完整语音转写，已完成片段' if audio_only else '声音与画面识别'} {part}/{count}: {cache.title[:30]}...")
+                    self._report_progress(task_id, idx, total,
+                        f"{'完整语音转写，已完成片段' if audio_only else '声音与画面识别'} {part}/{count}: {cache.title[:30]}...",
+                        stage='transcribing', item_id=platform_item_id)
                 run.start_stage("recognition")
                 result = (omni_service.analyze_audio if audio_only else omni_service.analyze_video)(media_path, analysis_progress)
                 run.end_stage()
@@ -273,9 +459,10 @@ class KnowledgeService:
                 # Step 4: Embedding + 存入 ChromaDB
                 cache.status = "embedding"
                 db.commit()
-                worker.update_progress(
+                self._report_progress(
                     task_id, idx, total,
                     f"向量化入库: {cache.title[:30]}...",
+                    stage='embedding', item_id=platform_item_id,
                 )
                 embeddings = embedding_client.embed_texts(chunks)
                 chroma.upsert_video_chunks(
@@ -296,7 +483,8 @@ class KnowledgeService:
                            "transcript_characters": len(cache.transcript_text), "indexed_chunks": len(chunks),
                            "audio_retained_for_test": keep_audio,
                            "audio_processing": result.payload.get("audio_processing")})
-                worker.update_progress(task_id, idx + 1, total, f"已完成: {cache.title[:30]}")
+                self._report_progress(task_id, idx + 1, total, f"已完成: {cache.title[:30]}",
+                    stage='saving', item_id=platform_item_id)
 
                 logger.info(
                     "入库成功 (%d/%d): %s (%d chunks)",
@@ -326,6 +514,16 @@ class KnowledgeService:
 
         if failures:
             raise RuntimeError(f"入库结束：{total - failures} 个成功，{failures} 个失败。识别成功的结果已保存，可查看后重试。")
+
+    @staticmethod
+    def _report_progress(task_id, progress, total, message, *, stage, item_id):
+        kwargs = {'stage': stage}
+        active_reader = getattr(worker, 'active_video_tasks', None)
+        declared = active_reader() if callable(active_reader) else {}
+        # Legacy/native jobs may not declare business IDs. Do not invent a
+        # current-item assertion for them merely because they share this code.
+        if declared.get(item_id) == task_id: kwargs['item_id'] = item_id
+        worker.update_progress(task_id, progress, total, message, **kwargs)
 
     def get_stats(self, db: Session) -> dict:
         """
@@ -361,6 +559,7 @@ class KnowledgeService:
             )
         ) or 0
         embedding = db.scalar(select(func.count()).select_from(VideoCache).where(VideoCache.status == "embedding")) or 0
+        deleting = db.scalar(select(func.count()).select_from(VideoCache).where(VideoCache.status == 'deleting')) or 0
 
         # ChromaDB 统计
         chroma = get_chroma_service()
@@ -378,6 +577,7 @@ class KnowledgeService:
                 "embedding": int(embedding),
                 "done": int(done),
                 "failed": int(failed),
+                "deleting": int(deleting),
             },
             "chromadb": {
                 "total_chunks": chroma_chunks,
@@ -396,60 +596,24 @@ class KnowledgeService:
 
 
     def delete_video(self, db: Session, platform_item_id: str) -> dict:
-        """
-        删除已入库视频
+        """Caller holds maintenance exclusion across every deletion phase."""
+        from app.services.material_deletion import delete_material
+        return delete_material(db, platform_item_id, chroma=get_chroma_service(),
+            audio_dir=Path(settings.audio_cache_dir), video_dir=Path(settings.video_cache_dir))
 
-        清理 ChromaDB 向量、重置 VideoCache 状态、删除音频缓存。
-
-        :param db: 数据库会话
-        :param platform_item_id: 抖音视频 ID
-        :return: 删除结果
-        :raises ValueError: 视频不存在或正在入库中
-        """
-        cache = db.query(VideoCache).filter(
-            VideoCache.platform_item_id == platform_item_id
-        ).first()
-
-        if cache is None:
-            raise ValueError(f"视频 {platform_item_id} 不存在")
-        import re
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", platform_item_id):
-            raise ValueError("视频编号无效")
-        if cache.status in ("downloading", "transcribing", "embedding"):
-            raise ValueError("视频正在入库中，无法删除")
-
-        # 1. 删除 ChromaDB 向量
-        chroma = get_chroma_service()
-        chroma.delete_by_video(platform_item_id)
-
-        # 2. 重置 VideoCache
-        # This action deletes the shared transcript everywhere. Removing from a
-        # single library uses the dedicated membership endpoint instead.
-        db.execute(delete(KnowledgeBaseVideo).where(
-            KnowledgeBaseVideo.platform_item_id == platform_item_id))
-        cache.status = "pending"
-        cache.transcript_text = ""
-        cache.visual_analysis_text = ""
-        cache.analysis_json = "{}"
-        cache.analysis_model = ""
-        cache.analysis_duration_seconds = 0
-        cache.error_message = ""
-        cache.processed_at = None
-
-        # 3. 清理音频缓存
-        audio_dir = Path(settings.audio_cache_dir)
-        for ext in (".mp3", ".wav", ".m4a", ".webm", ".opus"):
-            audio_file = audio_dir / f"{platform_item_id}{ext}"
-            if audio_file.exists():
-                audio_file.unlink(missing_ok=True)
-            audio_file.with_name(audio_file.name + ".analysis.json").unlink(missing_ok=True)
-        for ext in (".mp4", ".mkv", ".webm", ".mov"):
-            video_file = Path(settings.video_cache_dir) / f"{platform_item_id}{ext}"
-            video_file.unlink(missing_ok=True)
-
-        db.commit()
-        logger.info("视频已删除: %s", platform_item_id)
-        return {"platform_item_id": platform_item_id, "status": "pending"}
+    def resume_deletion(self, db: Session, operation_id: str):
+        from app.models.entities import KnowledgeDeletionOperation
+        from app.services.material_deletion import DeletionIncomplete, delete_material, describe_operation
+        operation = db.scalar(select(KnowledgeDeletionOperation).where(
+            KnowledgeDeletionOperation.operation_id == operation_id).execution_options(populate_existing=True))
+        if operation is None: raise DeletionIncomplete(operation_id, 'operation_not_found')
+        if operation.state == 'done':
+            # An old completed operation is only a receipt. Do not instantiate
+            # the index or delete a later re-import of the same video ID.
+            return {**describe_operation(operation), 'status': 'pending', 'already_completed': True}
+        return delete_material(db, operation.platform_item_id, chroma=get_chroma_service(),
+            audio_dir=Path(settings.audio_cache_dir), video_dir=Path(settings.video_cache_dir),
+            expected_operation_id=operation_id)
 
 
 # 全局单例

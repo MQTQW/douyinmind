@@ -243,6 +243,11 @@ class ChatSession(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     """主键 ID"""
 
+    chat_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    """Explicit AI-only mode, independent from the collection login session."""
+    collection_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    """Optional frozen favorite scope; legacy NULL keeps its original all-local meaning."""
+
     title: Mapped[str] = mapped_column(String(128), nullable=False, default="New Chat")
     """会话标题（默认取首条用户消息前 40 字）"""
 
@@ -332,3 +337,29 @@ class ChatMessage(Base):
 
     def __repr__(self) -> str:
         return f"<ChatMessage id={self.id} role='{self.role}' session_id={self.session_id}>"
+
+
+# Additive deletion intents keep destructive external work separate from SQL
+# rollback. NULL active keys retain history without reserving another slot.
+from sqlalchemy import CheckConstraint as _CheckConstraint, UniqueConstraint as _UniqueConstraint
+
+
+class KnowledgeDeletionOperation(Base):
+    __tablename__ = 'knowledge_deletion_operations'
+    __table_args__ = (
+        _UniqueConstraint('platform_item_id', 'active_key', name='uq_material_active_deletion'),
+        _CheckConstraint("(active_key IS NOT NULL AND active_key = 1 AND state IN ('pending','index_deleted','files_deleted')) "
+                         "OR (active_key IS NULL AND state = 'done')", name='ck_material_deletion_state'),
+    )
+
+    operation_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    platform_item_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    cache_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    material_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    active_key: Mapped[int | None] = mapped_column(Integer, nullable=True, default=1)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default='pending')
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    last_error_code: Mapped[str] = mapped_column(String(64), nullable=False, default='')
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime, nullable=True)

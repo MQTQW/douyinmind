@@ -8,17 +8,22 @@ import type { WorkspaceView } from '../workspaceView';
 
 const AssistantPanel = lazy(() => import('../components/AssistantPanel'));
 
-interface Props { onLogout: () => void; loggedIn: boolean; }
+interface Props { onLogout: () => void; loggedIn: boolean; initialChatOnly?: boolean;
+  onConnectFavorites?: () => void; loginBusy?: boolean; loginError?: string; }
 
-export default function Workspace({ onLogout, loggedIn }: Props) {
+export default function Workspace({ onLogout, loggedIn, initialChatOnly = false, onConnectFavorites, loginBusy = false, loginError = '' }: Props) {
+  const [chatOnly, setChatOnly] = useState(initialChatOnly);
   const [leftWidth, setLeftWidth] = useState(272);
-  const [view, setView] = useState<WorkspaceView>(() => typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('panel') === 'assistant' ? 'assistant' : 'chat');
+  const [view, setView] = useState<WorkspaceView>(() => {
+    const requested = typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('panel') : null;
+    return requested === 'assistant' || requested === 'progress' ? requested : 'chat';
+  });
   const [contentContainer, setContentContainer] = useState<HTMLDivElement | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [selectedCollectionId, setSelectedCollectionId] = useState<string>('all');
   const [selectedKnowledgeBase, setSelectedKnowledgeBase] = useState<api.KnowledgeBaseItem | null>(null);
   const [statsRefreshKey, setStatsRefreshKey] = useState(0);
-  const [statusMsg, setStatusMsg] = useState(loggedIn ? '已登录' : 'AI 对话体验 · 尚未登录抖音');
+  const [statusMsg, setStatusMsg] = useState(loggedIn ? '收藏已连接' : '收藏未连接 · 本地资料可用');
   const [showSources, setShowSources] = useState(false);
   const [currentSession, setCurrentSession] = useState<{id: number; title: string} | null>(null);
   const [openedSessionId, setOpenedSessionId] = useState<number | null>(null);
@@ -44,18 +49,20 @@ export default function Workspace({ onLogout, loggedIn }: Props) {
   }, [interactionBusy]);
   const selectKnowledgeBase = useCallback((base: api.KnowledgeBaseItem | null) => {
     if (interactionBusy) return;
-    if ((selectedKnowledgeBase?.id ?? null) !== (base?.id ?? null)) {
+    if (chatOnly || (selectedKnowledgeBase?.id ?? null) !== (base?.id ?? null)) {
       setCurrentSession(null);
       setOpenedSessionId(null);
       setConversationVersion(version => version + 1);
     }
+    setChatOnly(false);
     setSelectedKnowledgeBase(base);
     setSelectedCollectionId('all');
     setView('chat');
     setShowSources(false);
-  }, [interactionBusy, selectedKnowledgeBase?.id]);
+  }, [interactionBusy, selectedKnowledgeBase?.id, chatOnly]);
   const selectCollection = useCallback((id: string) => {
     if (interactionBusy) return;
+    setChatOnly(false);
     setSelectedKnowledgeBase(null);
     setSelectedCollectionId(id);
     setCurrentSession(null);
@@ -67,8 +74,9 @@ export default function Workspace({ onLogout, loggedIn }: Props) {
   const selectSession = useCallback((session: api.SessionItem, base: api.KnowledgeBaseItem | null = null) => {
     if (interactionBusy) return;
     if (currentSession?.id !== session.id) {
+      setChatOnly(session.chat_only === true);
       setSelectedKnowledgeBase(base);
-      setSelectedCollectionId('all');
+      setSelectedCollectionId(session.chat_only === true ? 'all' : session.collection_id || 'all');
       setCurrentSession({id: session.id, title: session.title});
       setOpenedSessionId(session.id);
       setConversationVersion(version => version + 1);
@@ -76,6 +84,17 @@ export default function Workspace({ onLogout, loggedIn }: Props) {
     setShowSources(false);
     setView('chat');
   }, [interactionBusy, currentSession?.id]);
+  const startMode = useCallback((pureAI: boolean) => {
+    if (interactionBusy) return;
+    setChatOnly(pureAI);
+    setSelectedKnowledgeBase(null);
+    setSelectedCollectionId('all');
+    setCurrentSession(null);
+    setOpenedSessionId(null);
+    setConversationVersion(version => version + 1);
+    setShowSources(false);
+    setView('chat');
+  }, [interactionBusy]);
   const sessionSaved = useCallback((id: number, title: string) => {
     setCurrentSession(previous => previous?.id === id ? previous : {id, title});
     refreshHistory();
@@ -155,11 +174,12 @@ export default function Workspace({ onLogout, loggedIn }: Props) {
           </button>
           <span className="workspace-status inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs max-w-md truncate" title={statusMsg}
             style={{ backgroundColor: 'rgba(91,140,90,0.12)', color: 'var(--color-success)' }}>
-            <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: 'var(--color-success)' }} /><span className="connection-detail">{statusMsg}</span><span className="connection-short">{loggedIn ? '抖音已连接' : '体验模式'}</span>
+            <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: 'var(--color-success)' }} /><span className="connection-detail">{statusMsg}</span><span className="connection-short">{loggedIn ? '抖音已连接' : '收藏未连接'}</span>
           </span>
           <button onClick={onLogout} aria-label={loggedIn ? '退出登录' : '返回首页'} title={loggedIn ? '退出登录' : '返回首页'} className="icon-button"><LogOut size={17} /></button>
         </div>
       </header>
+      {loginError && <div role="alert" className="flex flex-wrap items-center justify-between gap-2 px-5 py-3 text-sm bg-[var(--color-accent-light)]"><span>{loginError}</span><button className="text-button" onClick={onConnectFavorites} disabled={loginBusy}>重试连接收藏</button></div>}
 
       {/* Main Area */}
       <div ref={containerRef} className="flex-1 flex min-h-0" style={{ userSelect: isDragging ? 'none' : undefined }}>
@@ -181,7 +201,8 @@ export default function Workspace({ onLogout, loggedIn }: Props) {
             onSessionDeleted={sessionDeleted}
             onMutationBusyChange={setMaterialMutationBusy}
             onKnowledgeBaseDeleted={knowledgeBaseDeleted}
-            view={view} onChangeView={next => { setView(next); setShowSources(false); }} contentContainer={contentContainer} chatOnly={!loggedIn}
+            view={view} onChangeView={next => { setView(next); setShowSources(false); }} contentContainer={contentContainer} chatOnly={chatOnly}
+            loggedIn={loggedIn} onConnectFavorites={onConnectFavorites} loginBusy={loginBusy}
             onKnowledgeBaseUpdated={base => setSelectedKnowledgeBase(previous => previous?.id === base.id ? base : previous)}
           />
         </aside>
@@ -195,22 +216,23 @@ export default function Workspace({ onLogout, loggedIn }: Props) {
         <main className={`${showSources ? 'hidden' : 'flex'} md:!flex flex-col flex-1 h-full min-w-0 bg-[var(--color-panel)]`}>
           <div className="workspace-heading">
             <div className="min-w-0">
-              <p className="eyebrow">{view === 'assistant' ? '我的助手 /' : view === 'collections' || view === 'progress' ? '资料管理 /' : !loggedIn ? '体验模式 /' : '我的知识库 /'}</p>
-              <h2 className="workspace-title">{view === 'assistant' ? '抖音助手' : view === 'collections' ? '我的收藏夹' : view === 'progress' ? '处理进度' : !loggedIn ? '先体验 AI 对话' : selectedKnowledgeBase?.name || (selectedCollectionId === 'all' ? '全部已入库资料' : '当前收藏夹的已入库资料')}</h2>
+              <h2 className="workspace-title">{view === 'assistant' ? '抖音助手' : view === 'collections' ? '我的收藏夹' : view === 'progress' ? '处理进度' : chatOnly ? '纯 AI 对话' : selectedKnowledgeBase?.name || (selectedCollectionId === 'all' ? '全部已入库资料' : '当前收藏夹的已入库资料')}</h2>
+              {view === 'chat' && chatOnly && <p className="mt-1 text-xs text-[var(--color-ink-muted)]">仅与模型对话，不读取本地资料。</p>}
               {selectedKnowledgeBase && (view === 'chat' || view === 'materials') && <p className="mt-1 text-xs text-[var(--color-ink-muted)]">{selectedKnowledgeBase.video_count} 个视频 · {selectedKnowledgeBase.ready_count} 个可提问</p>}
             </div>
             {view !== 'assistant' && <div className="flex flex-wrap gap-2">
               <button onClick={startNewChat} disabled={interactionBusy} className="ui-button"><Plus size={16} />新对话</button>
-              {loggedIn && view !== 'collections' && <button onClick={() => setView('collections')} disabled={interactionBusy} className="ui-button ui-button-primary"><Download size={16} />从收藏夹导入</button>}
+              <button onClick={() => startMode(!chatOnly)} disabled={interactionBusy} className="text-button">{chatOnly ? '使用本地资料' : '纯 AI 新对话'}</button>
+              {view !== 'collections' && <button onClick={() => loggedIn ? setView('collections') : onConnectFavorites?.()} disabled={interactionBusy || loginBusy} className="ui-button ui-button-primary"><Download size={16} />{loggedIn ? '从收藏夹导入' : loginBusy ? '正在连接…' : '连接收藏'}</button>}
             </div>}
             {view === 'assistant' && <button className="text-button" onClick={() => setView('chat')}><ChevronLeft size={15} />返回知识库</button>}
           </div>
           {(view === 'chat' || view === 'materials') ? <nav className="workspace-tabs" aria-label="知识库工作区">
             <button className={view === 'chat' ? 'active' : ''} onClick={() => setView('chat')} aria-current={view === 'chat' ? 'page' : undefined}><MessagesSquare size={16} />对话</button>
-            {loggedIn && <button className={view === 'materials' ? 'active' : ''} onClick={() => setView('materials')} aria-current={view === 'materials' ? 'page' : undefined}><Files size={16} />视频资料</button>}
+            {!chatOnly && <button className={view === 'materials' ? 'active' : ''} onClick={() => setView('materials')} aria-current={view === 'materials' ? 'page' : undefined}><Files size={16} />视频资料</button>}
           </nav> : view === 'assistant' ? null : <div className="border-b border-[var(--color-border)] px-6 pb-3"><button className="text-button" onClick={() => setView('chat')}><ChevronLeft size={15} />返回知识库</button></div>}
           <div className={view === 'chat' ? 'flex-1 min-h-0' : 'hidden'}>
-          <ChatPanel key={conversationVersion} collectionId={selectedKnowledgeBase ? 'all' : selectedCollectionId} statsRefreshKey={statsRefreshKey} chatOnly={!loggedIn}
+          <ChatPanel key={conversationVersion} collectionId={selectedCollectionId} statsRefreshKey={statsRefreshKey} chatOnly={chatOnly}
             interactionDisabled={materialMutationBusy}
             knowledgeBaseId={selectedKnowledgeBase?.id ?? null} knowledgeBaseName={selectedKnowledgeBase?.name ?? ''}
             openedSessionId={openedSessionId} sessionTitle={currentSession?.title ?? '新对话'}

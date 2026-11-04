@@ -12,7 +12,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from app.db.base import Base
-from app.models.entities import ChatMessage
+from app.models.entities import ChatMessage, VideoCache
 
 
 @pytest.fixture
@@ -62,6 +62,8 @@ def test_deltas_arrive_before_completion_and_messages_are_saved(rag_module, db):
 
 
 def test_final_answer_matches_saved_answer_and_retains_sources_and_trace(rag_module, db, monkeypatch):
+    db.add(VideoCache(platform_item_id='test-video', title='测试视频', status='done', transcript_text='学习内容'))
+    db.commit()
     service = rag_module.RagService()
     hit = {"platform_item_id": "test-video", "chunk_id": "test-video-0", "title": "测试视频", "text": "学习内容", "score": 0.9}
     monkeypatch.setattr(service, "_dense_retrieve", lambda *args: [hit])

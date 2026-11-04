@@ -88,6 +88,7 @@ export default function ChatPanel({
         const result = await api.getSessionMessages(historicalSessionId, controller.signal);
         if (!isCurrent()) return;
         if (!result.success) throw new Error(result.message || '历史对话加载失败，请重试。');
+        if ((result.chat_only === true) !== chatOnly) throw new Error('历史对话的资料范围与当前模式不一致，请重新打开这段对话。');
         const history: Message[] = result.items
           .filter(item => item.role === 'user' || item.role === 'assistant' || item.role === 'system')
           .map(item => ({
@@ -101,7 +102,8 @@ export default function ChatPanel({
         setHistoryReady(true);
       } catch (error) {
         if (isCurrent()) {
-          setHistoryError(error instanceof Error && error.message.includes('404')
+          setHistoryError(error instanceof Error && error.message === '历史对话的资料范围与当前模式不一致，请重新打开这段对话。'
+            ? error.message : error instanceof Error && error.message.includes('404')
             ? '这段历史对话已不存在，请选择其他对话或开始新对话。'
             : '历史对话加载失败，请重试。');
         }
@@ -154,7 +156,7 @@ export default function ChatPanel({
     };
 
     try {
-      for await (const event of api.chatAskStream(q, sessionId, collectionId, controller.signal, knowledgeBaseId)) {
+      for await (const event of api.chatAskStream(q, sessionId, chatOnly ? null : collectionId, controller.signal, chatOnly ? null : knowledgeBaseId, chatOnly)) {
         if (!mountedRef.current || controller.signal.aborted || requestRef.current !== controller) return;
         switch (event._event) {
           case 'sources':
@@ -230,7 +232,7 @@ export default function ChatPanel({
             <div aria-hidden="true" className="welcome-mark"><BookOpen size={30} /></div>
             <div>
               <h2 className="font-display text-xl text-[var(--color-ink)]">{chatOnly ? '先体验 AI 对话' : '想了解什么？'}</h2>
-              <p className="text-sm text-[var(--color-ink-muted)] mt-1">{chatOnly ? '直接提问，体验回答逐步出现。收藏内容问答需要先登录并入库。' : '围绕下方资料范围提问，已完成处理的资料可用于回答。'}</p>
+          <p className="text-sm text-[var(--color-ink-muted)] mt-1">{chatOnly ? '本次不读取本地资料。选择左侧知识库后，可以另开资料对话。' : '围绕下方资料范围提问，已完成处理的资料可用于回答。'}</p>
             </div>
             <div className="flex flex-wrap gap-2 justify-center max-w-md">
               {promptChips.map((text, i) => (

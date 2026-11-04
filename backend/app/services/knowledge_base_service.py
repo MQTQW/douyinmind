@@ -141,6 +141,10 @@ class KnowledgeBaseService:
         )).all())
         if any(item_id not in found for item_id in selected_ids):
             raise ValueError("部分所选视频已不存在，请刷新后重新选择。")
+        deleting = db.scalar(select(VideoCache.platform_item_id).where(
+            VideoCache.platform_item_id.in_(selected_ids), VideoCache.status == 'deleting').limit(1))
+        if deleting is not None:
+            raise ValueError("部分资料正在删除或等待核对，请先完成原删除操作。")
         existing = set(db.scalars(select(KnowledgeBaseVideo.platform_item_id).where(
             KnowledgeBaseVideo.knowledge_base_id == knowledge_base_id,
             KnowledgeBaseVideo.platform_item_id.in_(selected_ids),

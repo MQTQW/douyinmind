@@ -58,7 +58,7 @@ const helperURL = await moduleURL('../src/workspacePresentation.ts');
 const { visibleHistory } = await import(helperURL);
 const { default: SourcesPanel } = await import(await moduleURL('../src/components/SourcesPanel.tsx', {
   ...common, 'react-dom': portalURL, './ActionMenu': stubURL, './BuildConfirmModal': stubURL,
-  './VideoContentModal': stubURL, './SessionActionModal': stubURL, './KnowledgeBasesPanel': stubURL,
+  './VideoContentModal': stubURL, './SessionActionModal': stubURL, './KnowledgeBasesPanel': stubURL, './KnowledgeRecoveryPanel': stubURL,
   '../workspacePresentation': helperURL,
 }));
 const { default: ChatPanel } = await import(await moduleURL('../src/components/ChatPanel.tsx', {
@@ -242,4 +242,84 @@ test('a material mutation locks range switching and new questions without remoun
   assert.equal(h.state.selectedKnowledgeBase.id,4);assert.equal(h.state.currentSession.id,9);assert.equal(h.state.conversationVersion,2);
   source.props.onKnowledgeBaseDeleted(4);
   assert.equal(h.state.selectedKnowledgeBase,null);assert.equal(h.state.currentSession,null);
+});
+
+test('local library scope and open conversation survive collection login expiry',()=>{
+  const props={loggedIn:true,onLogout(){}};
+  const base={id:7,name:'本地合成资料',video_count:3,ready_count:3};
+  const h=harness(Workspace,props,{selectedKnowledgeBase:base,currentSession:{id:81,title:'原对话'},openedSessionId:81,conversationVersion:3});
+  let chat=all(h.render(),node=>typeof node.props?.onSessionSaved==='function')[0];
+  assert.equal(chat.props.chatOnly,false);
+  props.loggedIn=false;
+  const tree=h.render();
+  chat=all(tree,node=>typeof node.props?.onSessionSaved==='function')[0];
+  assert.equal(chat.props.chatOnly,false);assert.equal(chat.props.knowledgeBaseId,7);assert.equal(chat.props.openedSessionId,81);
+  assert.equal(h.state.conversationVersion,3);assert.ok(findButton(tree,'视频资料'));assert.ok(findButton(tree,'连接收藏'));
+});
+
+test('explicit pure AI and local selections start new scopes independently of login',()=>{
+  const h=harness(Workspace,{loggedIn:false,onLogout(){}},{selectedKnowledgeBase:{id:7,name:'本地合成资料'},currentSession:{id:81,title:'原对话'},openedSessionId:81,conversationVersion:3});
+  findButton(h.render(),'纯 AI 新对话').props.onClick();
+  assert.equal(h.state.chatOnly,true);assert.equal(h.state.currentSession,null);assert.equal(h.state.openedSessionId,null);
+  assert.equal(h.state.selectedKnowledgeBase,null);assert.equal(h.state.conversationVersion,4);
+  const source=all(h.render(),node=>typeof node.props?.onKnowledgeBaseDeleted==='function')[0];
+  source.props.onSelectKnowledgeBase({id:8,name:'另一个本地合成库'});
+  assert.equal(h.state.chatOnly,false);assert.equal(h.state.selectedKnowledgeBase.id,8);assert.equal(h.state.conversationVersion,5);
+});
+
+test('history restores its persisted AI or material mode instead of collection connection',()=>{
+  const h=harness(Workspace,{loggedIn:false,onLogout(){},initialChatOnly:true});
+  const source=()=>all(h.render(),node=>typeof node.props?.onKnowledgeBaseDeleted==='function')[0];
+  source().props.onSelectSession({id:81,title:'旧资料对话',knowledge_base_id:7},{id:7,name:'本地库'});
+  assert.equal(h.state.chatOnly,false);assert.equal(h.state.selectedKnowledgeBase.id,7);assert.equal(h.state.openedSessionId,81);
+  source().props.onSelectSession({id:82,title:'纯AI对话',chat_only:true});
+  assert.equal(h.state.chatOnly,true);assert.equal(h.state.selectedKnowledgeBase,null);assert.equal(h.state.openedSessionId,82);
+});
+
+test('historical collection scope is restored exactly and is independent of browsing or login',()=>{
+  const props={loggedIn:false,onLogout(){}};
+  const h=harness(Workspace,props,{selectedCollectionId:'unrelated-browsed-folder'});
+  const source=()=>all(h.render(),node=>typeof node.props?.onKnowledgeBaseDeleted==='function')[0];
+  const chat=()=>all(h.render(),node=>typeof node.props?.onSessionSaved==='function')[0];
+  source().props.onSelectSession({id:84,title:'收藏夹里的旧对话',collection_id:'frozen-collection'});
+  assert.equal(chat().props.collectionId,'frozen-collection');
+  props.loggedIn=true;assert.equal(chat().props.collectionId,'frozen-collection');
+  source().props.onSelectSession({id:85,title:'库与收藏夹的交集',knowledge_base_id:7,collection_id:'intersection-folder'},{id:7,name:'合成库'});
+  assert.equal(chat().props.knowledgeBaseId,7);assert.equal(chat().props.collectionId,'intersection-folder');
+  source().props.onSelectSession({id:86,title:'旧版全库对话',collection_id:null});
+  assert.equal(chat().props.collectionId,'all');
+});
+
+test('new mode requests stay blocked during active chat or material mutation',()=>{
+  for(const flag of ['chatBusy','materialMutationBusy']){
+    const h=harness(Workspace,{loggedIn:false,onLogout(){}},{[flag]:true,currentSession:{id:81,title:'原对话'},openedSessionId:81,conversationVersion:3});
+    const button=findButton(h.render(),'纯 AI 新对话');
+    assert.equal(button.props.disabled,true);button.props.onClick();
+    assert.equal(h.state.chatOnly,false);assert.equal(h.state.openedSessionId,81);assert.equal(h.state.conversationVersion,3);
+  }
+});
+
+test('AI experience can explicitly select local libraries while disconnected collections require login',()=>{
+  const local=harness(SourcesPanel,sourceProps({loggedIn:false,chatOnly:true}),{historyLoading:false}).render();
+  assert.equal(all(local,node=>typeof node.props?.onListLoaded==='function')[0].props.disabled,false);
+  let connects=0;
+  const tree=harness(SourcesPanel,sourceProps({view:'collections',loggedIn:false,onConnectFavorites(){connects++;}})).render();
+  assert.match(text(tree),/本地已入库资料可继续查看和提问/);
+  assert.equal(findButton(tree,'同步收藏夹'),undefined);
+  findButton(tree,'连接抖音收藏').props.onClick();assert.equal(connects,1);
+});
+
+test('progress load-more preserves rows and refuses fast repeated clicks',()=>{
+  const row={platform_item_id:'older-failed',title:'旧失败记录',status:'failed'};
+  const h=harness(SourcesPanel,sourceProps({view:'progress'}),{taskVideos:[row],taskVideosHasMore:true,taskVideosTotal:205,taskVideosUpdatedAt:'18:30:00',historyLoading:false});
+  const tree=h.render();
+  assert.match(text(tree),/旧失败记录/);assert.match(text(tree),/已读取 1 \/ 205 个视频/);
+  const button=findButton(tree,'载入更多视频');button.props.onClick();button.props.onClick();
+  assert.equal(h.state.taskVideoPages,2);assert.equal(h.state.taskVideos.length,1);
+});
+
+test('progress failure stays actionable with retained records and never calls it ready',()=>{
+  const h=harness(SourcesPanel,sourceProps({view:'progress'}),{taskVideos:[{platform_item_id:'old',title:'保留中的失败资料',status:'failed'}],taskVideosError:'视频状态暂时未能更新，已保留上次读取结果。',historyLoading:false});
+  const tree=h.render();assert.match(text(tree),/保留中的失败资料/);assert.doesNotMatch(text(tree),/资料已准备好/);
+  findButton(tree,'重新加载').props.onClick();assert.equal(h.state.taskVideosRefreshKey,1);
 });

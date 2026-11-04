@@ -30,9 +30,11 @@ def selection_context(monkeypatch):
                               analysis_json='{"raw_results":["原始返回"]}',
                               error_message="旧失败信息" if status == "failed" else ""))
         db.commit()
-        submissions, checks = [], []
-        monkeypatch.setattr(knowledge_module.worker, "submit",
-                            lambda *args: submissions.append(args))
+        submissions, metadata, checks = [], [], []
+        def submit(*args, **kwargs):
+            submissions.append(args)
+            metadata.append(kwargs['job_metadata'])
+        monkeypatch.setattr(knowledge_module.worker, "submit", submit)
         monkeypatch.setattr(knowledge_module.omni_service, "check_configuration",
                             lambda: checks.append(True))
         app = FastAPI()
@@ -42,7 +44,7 @@ def selection_context(monkeypatch):
         app.dependency_overrides[get_db] = test_db
         with TestClient(app) as client:
             yield SimpleNamespace(db=db, client=client, submissions=submissions,
-                                  checks=checks)
+                                  metadata=metadata, checks=checks)
     engine.dispose()
 
 
@@ -53,6 +55,7 @@ def test_omitted_or_null_selection_keeps_all_pending_behavior(selection_context,
     assert result["success"] is True
     assert result["pending_count"] == 2
     assert context.submissions[0][2] == ["pending-1", "pending-2"]
+    assert context.metadata[0]['platform_item_ids'] == ['pending-1', 'pending-2']
     assert context.checks == [True]
 
 

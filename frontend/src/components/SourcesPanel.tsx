@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { lazy, Suspense, useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { AudioLines, Check, ChevronRight, Download, Ellipsis, FileAudio, FileDown, FolderMinus, History, Inbox, ListChecks, MessageCircle, Pencil, RefreshCw, RotateCcw, Trash2 } from 'lucide-react';
 import type { WorkspaceView } from '../workspaceView';
@@ -11,11 +11,16 @@ import KnowledgeBasesPanel from './KnowledgeBasesPanel';
 import type { CollectionImportSource } from '../collectionImport';
 import { visibleHistory } from '../workspacePresentation';
 
+const KnowledgeRecoveryPanel = lazy(() => import('./KnowledgeRecoveryPanel'));
+
 interface Props {
   view: WorkspaceView;
   onChangeView: (view: WorkspaceView) => void;
   contentContainer: HTMLElement | null;
   chatOnly: boolean;
+  loggedIn?: boolean;
+  onConnectFavorites?: () => void;
+  loginBusy?: boolean;
   onKnowledgeBaseUpdated: (base: api.KnowledgeBaseItem) => void;
   onBuildDone: () => void;
   selectedId: string;
@@ -34,7 +39,7 @@ interface Props {
   onKnowledgeBaseDeleted?: (id: number) => void;
 }
 
-export default function SourcesPanel({ view, onChangeView, contentContainer, chatOnly, onKnowledgeBaseUpdated, onBuildDone, selectedId, onSelectCollection, selectedKnowledgeBase, onSelectKnowledgeBase, statsRefreshKey, historyRefreshKey, activeSessionId, chatBusy, onSelectSession, onNewChat, onSessionRenamed, onSessionDeleted, onMutationBusyChange, onKnowledgeBaseDeleted }: Props) {
+export default function SourcesPanel({ view, onChangeView, contentContainer, chatOnly, loggedIn = true, onConnectFavorites, loginBusy = false, onKnowledgeBaseUpdated, onBuildDone, selectedId, onSelectCollection, selectedKnowledgeBase, onSelectKnowledgeBase, statsRefreshKey, historyRefreshKey, activeSessionId, chatBusy, onSelectSession, onNewChat, onSessionRenamed, onSessionDeleted, onMutationBusyChange, onKnowledgeBaseDeleted }: Props) {
   const [collections, setCollections] = useState<api.CollectionItem[]>([]);
   const [stats, setStats] = useState<any>(null);
   const collectionsRequestRef = useRef(0);
@@ -46,6 +51,8 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
   const [buildProgress, setBuildProgress] = useState(0);
   const [buildTotal, setBuildTotal] = useState(0);
   const [buildMessage, setBuildMessage] = useState('');
+  const [buildProgressError, setBuildProgressError] = useState('');
+  const [progressRetryKey, setProgressRetryKey] = useState(0);
   const [showBuildConfirm, setShowBuildConfirm] = useState(false);
   const [buildSelection, setBuildSelection] = useState<api.VideoItem[] | undefined>();
   const [buildSource, setBuildSource] = useState<CollectionImportSource | undefined>();
@@ -75,6 +82,17 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
   const [taskVideosError, setTaskVideosError] = useState('');
   const [taskVideosTotal, setTaskVideosTotal] = useState(0);
   const [taskVideosLoading, setTaskVideosLoading] = useState(false);
+  const [taskVideoPages, setTaskVideoPages] = useState(1);
+  const [taskVideosHasMore, setTaskVideosHasMore] = useState(false);
+  const [taskVideosRefreshKey, setTaskVideosRefreshKey] = useState(0);
+  const [taskVideosUpdatedAt, setTaskVideosUpdatedAt] = useState<string | null>(null);
+  const [progressSection, setProgressSection] = useState<'videos' | 'tasks' | 'deletions'>(() => {
+    const requested = typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('section') : null;
+    return requested === 'tasks' || requested === 'deletions' ? requested : 'videos';
+  });
+  const [deletionFeedback, setDeletionFeedback] = useState('');
+  const taskVideosRequestRef = useRef(0);
+  const taskVideosBusyRef = useRef(false);
   const [collectionSearch, setCollectionSearch] = useState('');
   const [selectedMaterialIds, setSelectedMaterialIds] = useState<Set<string>>(new Set());
   const [bulkDeleting, setBulkDeleting] = useState(false);
@@ -137,23 +155,39 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
     if (view !== 'progress') return;
     let active = true;
     let loading = false;
+    const generation = ++taskVideosRequestRef.current;
     const refresh = async () => {
       if (loading) return;
       loading = true;
+      taskVideosBusyRef.current = true;
       try {
-        const [result] = await Promise.all([api.listKnowledgeVideos('all'), fetchStats()]);
-        if (active) {
-          if (!result.success) throw new Error('加载失败');
-          setTaskVideos(result.items); setTaskVideosTotal(result.total); setTaskVideosError('');
+        const [pages] = await Promise.all([
+          Promise.all(Array.from({length: taskVideoPages}, (_, index) => api.listKnowledgeVideos('all', index + 1, 100))),
+          fetchStats(),
+        ]);
+        if (active && generation === taskVideosRequestRef.current) {
+          if (pages.some(page => !page.success || !Array.isArray(page.items) || !Number.isSafeInteger(page.total) || page.total < 0)) throw new Error('加载失败');
+          const rows = [...new Map(pages.flatMap(page => page.items).map(video => [video.platform_item_id, video])).values()];
+          setTaskVideos(rows); setTaskVideosTotal(pages[0].total);
+          setTaskVideosHasMore(taskVideoPages * 100 < pages[0].total);
+          setTaskVideosError(''); setTaskVideosUpdatedAt(new Date().toLocaleTimeString('zh-CN', {hour12: false}));
         }
-      } catch { if (active) setTaskVideosError('处理状态加载失败，请重新加载。'); }
-      finally { loading = false; if (active) setTaskVideosLoading(false); }
+      } catch { if (active) setTaskVideosError('视频状态暂时未能更新，已保留上次读取结果。'); }
+      finally {
+        loading = false;
+        if (active && generation === taskVideosRequestRef.current) { taskVideosBusyRef.current = false; setTaskVideosLoading(false); }
+      }
     };
     setTaskVideosLoading(true);
     void refresh();
-    const timer = setInterval(refresh, 2500);
-    return () => { active = false; clearInterval(timer); };
-  }, [view, statsRefreshKey, videosRefreshKey, fetchStats]);
+    const timer = setInterval(refresh, stats?.current_task_id ? 3000 : 15000);
+    return () => { active = false; taskVideosBusyRef.current = false; clearInterval(timer); };
+  }, [view, statsRefreshKey, videosRefreshKey, taskVideoPages, taskVideosRefreshKey, fetchStats, stats?.current_task_id]);
+  const loadMoreTaskVideos = () => {
+    if (taskVideosBusyRef.current || taskVideosLoading || !taskVideosHasMore) return;
+    taskVideosBusyRef.current = true;
+    setTaskVideoPages(pages => pages + 1);
+  };
 
   const removeFromBase = async (video: api.VideoItem) => {
     if (!selectedKnowledgeBase || removingVideoId) return;
@@ -169,11 +203,12 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
 
   const fetchCollections = useCallback(async () => {
     const requestId = ++collectionsRequestRef.current;
+    if (!loggedIn) { setCollections([]); return; }
     try {
       const r = await api.listCollections();
       if (r.success && requestId === collectionsRequestRef.current) setCollections(r.items);
     } catch {}
-  }, []);
+  }, [loggedIn]);
 
   const fetchSessions = useCallback(async () => {
     const requestId = ++historyRequestRef.current;
@@ -196,7 +231,7 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
   useEffect(() => { fetchSessions(); }, [fetchSessions, historyRefreshKey]);
 
   useEffect(() => {
-    if (!expandedId) return;
+    if (!expandedId || !loggedIn) return;
     let cancelled = false;
     setLoadingVideos(true);
     setVideoLoadError('');
@@ -220,9 +255,10 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
       if (!cancelled) setLoadingVideos(false);
     });
     return () => { cancelled = true; };
-  }, [expandedId, statsRefreshKey, videosRefreshKey]);
+  }, [expandedId, statsRefreshKey, videosRefreshKey, loggedIn]);
 
   const handleSync = async () => {
+    if (!loggedIn) { onConnectFavorites?.(); return; }
     setSyncing(true);
     try {
       const r = await api.syncFavorites();
@@ -241,12 +277,14 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
   };
 
   const handleBuild = async (selectedIds: string[], knowledgeBaseId: number, targetBase?: api.KnowledgeBaseItem) => {
+    if (!loggedIn) { onConnectFavorites?.(); return; }
     if (selectedIds?.length === 0 || building || startingBuildRef.current) return;
     startingBuildRef.current = true;
     setBuilding(true);
     setBuildProgress(0);
     setBuildTotal(0);
     setBuildMessage('准备中...');
+    setBuildProgressError('');
     try {
       const r = await api.syncKnowledge(selectedIds, knowledgeBaseId);
       if (r.success) {
@@ -335,6 +373,7 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
     return collection ? { collection_id: id, title: collection.title, video_ids: videos.map(video => video.platform_item_id) } : undefined;
   };
   const openBuildConfirm = (selection?: api.VideoItem[], source?: CollectionImportSource) => {
+    if (!loggedIn) { onConnectFavorites?.(); return; }
     setBuildSelection(selection);
     const loadedCollectionId = loadedCollectionIdRef.current;
     setBuildSource(source ?? (selection && loadedCollectionId && !loadingVideos && !videoLoadError
@@ -351,7 +390,15 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
     if (!confirm('确定要删除这个视频的全部文字稿和检索资料吗？\n\n它也会从所有知识库移除，需要时可重新识别入库。')) return;
     try {
       const result = await api.deleteVideo(platformItemId);
-      if (!result.success) throw new Error(result.message || '删除未完成，请稍后重试。');
+      if (!result.success) {
+        if (result.code === 'DELETION_INCOMPLETE') {
+          setDeletionFeedback(api.knowledgeRecoveryMessage(result, '删除尚未完成，原操作记录已保留，请核对后继续原操作。'));
+          void fetchStats(); setVideosRefreshKey(key => key + 1); setBasesRefreshKey(key => key + 1);
+          return;
+        }
+        throw new Error('删除尚未确认完成，请保留原资料并刷新核对。');
+      }
+      setDeletionFeedback('');
       fetchStats();
       setVideosRefreshKey(key => key + 1);
       setBasesRefreshKey(key => key + 1);
@@ -437,16 +484,26 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
     setBuilding(true);
     let cancelled = false;
     let polling = false;
-    const poll = setInterval(async () => {
+    let nextAttempt = 0;
+    const readProgress = async () => {
       if (polling) return;
+      if (Date.now() < nextAttempt) return;
       polling = true;
       try {
         const progress = await api.getSyncProgress(taskId);
         if (cancelled) return;
+        if (!progress.success) {
+          clearInterval(poll);
+          setBuilding(false); setSubmittedTaskId(null);
+          setBuildProgressError('这项任务的进度暂不可读，视频记录已保留。请刷新状态后核对原视频。');
+          void fetchStats();
+          return;
+        }
+        setBuildProgressError('');
         setBuildProgress(progress.progress || 0);
         setBuildTotal(progress.total || 0);
         setBuildMessage(progress.message || '正在处理视频…');
-        if (!progress.success || progress.status === 'done' || progress.status === 'failed') {
+        if (['done', 'failed', 'interrupted', 'needs_review'].includes(progress.status)) {
           clearInterval(poll);
           setBuilding(false);
           setSubmittedTaskId(null);
@@ -454,12 +511,19 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
           setVideosRefreshKey(key => key + 1);
           onBuildDone();
         }
-      } catch {} finally { polling = false; }
-    }, 800);
+      } catch {
+        if (!cancelled) {
+          setBuildProgressError('任务进度暂时无法更新，已保留上次状态；这不代表任务已停止。');
+          nextAttempt = Date.now() + 5000;
+        }
+      } finally { polling = false; }
+    };
+    const poll = setInterval(() => void readProgress(), 1000);
+    void readProgress();
     return () => { cancelled = true; clearInterval(poll); };
-  }, [activeTaskId, fetchStats, onBuildDone]);
+  }, [activeTaskId, fetchStats, onBuildDone, progressRetryKey]);
 
-  const statusLabel = (status: string) => ({done: '可提问', failed: '失败', pending: '待入库', downloading: '下载中', transcribing: '转写中', embedding: '保存中'} as Record<string, string>)[status] || '处理中';
+  const statusLabel = (status: string) => ({done: '可提问', failed: '失败', pending: '待入库', downloading: '下载中', transcribing: '转写中', embedding: '保存中', deleting: '删除待完成 · 需核对'} as Record<string, string>)[status] || '状态待核对';
   const videoActions = (video: api.VideoItem, inLibrary = false) => <ActionMenu label={`更多操作：${video.title}`}>
 
       {video.status === 'done' && <>
@@ -474,7 +538,7 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
     <div className="sources-sidebar h-full flex flex-col">
       <div className="flex-1 min-h-0 overflow-y-auto p-3 md:p-4">
         <KnowledgeBasesPanel selectedId={selectedKnowledgeBase?.id ?? null} refreshKey={statsRefreshKey + basesRefreshKey}
-          disabled={chatBusy || chatOnly} disabledReason={chatBusy ? '请等待当前回答完成' : '体验模式尚未连接抖音；登录后可选择和管理知识库。'} onListLoaded={setKnowledgeBases} onSelect={onSelectKnowledgeBase}
+          disabled={chatBusy} disabledReason={chatBusy ? '请等待当前回答完成' : undefined} onListLoaded={setKnowledgeBases} onSelect={onSelectKnowledgeBase}
           onRefresh={onBuildDone} onCreated={base => { baseCreated(base); onSelectKnowledgeBase(base); }}
           onBusyChange={onMutationBusyChange} onDeleted={id => {
             setBasesRefreshKey(key => key + 1);
@@ -507,6 +571,7 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
 
       {contentContainer && view !== 'chat' && view !== 'assistant' && createPortal(<div className="source-workspace">
         {view === 'materials' && <>
+          {deletionFeedback && <p role="alert" className="materials-bulk-feedback">{deletionFeedback} <button className="text-button" onClick={() => { setProgressSection('deletions'); onChangeView('progress'); }}>查看待完成删除</button></p>}
           {!baseVideosLoading && !baseVideosError && baseVideos.length > 0 && <div className="materials-bulk-toolbar" aria-label="批量管理视频资料">
             <label><input type="checkbox" checked={allMaterialsSelected} ref={element => { if (element) element.indeterminate = selectedMaterialIds.size > 0 && !allMaterialsSelected; }} onChange={toggleAllMaterials} disabled={mutationBlocked || !selectableMaterials.length} aria-label="全选可删除资料" />全选</label>
             <span>已选 {selectedMaterialIds.size} 项</span>
@@ -521,7 +586,8 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
           </div>)}</div>}
           <p className="mt-5 text-xs text-[var(--color-ink-muted)] leading-relaxed">“移出”仅调整当前知识库；“删除全部入库资料”会影响所有知识库。原始导出保留完整文字稿与时间，AI 整理导出会额外调用模型。</p>
         </>}
-        {view === 'collections' && <>
+        {view === 'collections' && !loggedIn && <div className="empty-resource"><Download size={28} /><h3>连接收藏，导入新视频</h3><p>本地已入库资料可继续查看和提问。同步与导入新收藏需要本人登录抖音。</p><button className="ui-button ui-button-primary" onClick={onConnectFavorites} disabled={loginBusy}>{loginBusy ? '正在连接…' : '连接抖音收藏'}</button></div>}
+        {view === 'collections' && loggedIn && <>
           <div className="page-section-heading"><div><h3>选择收藏的视频</h3><p>支持跨收藏夹选择，再统一指定目标知识库。</p></div><label className="collection-title-search"><span>搜索视频标题</span><input type="search" value={collectionSearch} onChange={event => setCollectionSearch(event.target.value)} placeholder="输入视频标题关键词" aria-label="搜索收藏视频标题" /></label><button className="ui-button" onClick={handleSync} disabled={syncing || building}><RefreshCw size={15} className={syncing ? 'animate-spin' : ''} />{syncing ? '同步中…' : '同步收藏夹'}</button></div>
           <div className="collection-workspace"><nav className="collection-navigation" aria-label="抖音收藏夹">{collections.map(col => <button key={col.collection_id} onClick={() => handleCollectionClick(col.collection_id)} disabled={chatBusy} aria-pressed={expandedId === col.collection_id} className={expandedId === col.collection_id ? 'active' : ''}><span>{col.title}</span><small>{col.video_count}</small></button>)}{collections.length === 0 && <p className="empty-hint">还没有收藏夹，点击同步后再查看。</p>}</nav>
           <div className="min-w-0">
@@ -541,15 +607,27 @@ export default function SourcesPanel({ view, onChangeView, contentContainer, cha
         </>}
         {view === 'progress' && <>
           <div className="page-section-heading processing-section-heading"><p>下载视频 → 识别转文字 → 建立索引</p><button className="ui-button" onClick={onBuildDone}><RefreshCw size={15} />刷新状态</button></div>
-          <div className="processing-summary"><span>{doneCount} 可提问</span><span>{processingCount} 处理中</span><span>{pendingCount} 待入库</span><span>{failedCount} 失败</span><small>{totalCount} 个视频总计</small></div>
+          <nav className="workspace-tabs mb-5" aria-label="处理记录分类">
+            <button className={progressSection === 'videos' ? 'active' : ''} onClick={() => setProgressSection('videos')} aria-current={progressSection === 'videos' ? 'page' : undefined}>视频状态</button>
+            <button className={progressSection === 'tasks' ? 'active' : ''} onClick={() => setProgressSection('tasks')} aria-current={progressSection === 'tasks' ? 'page' : undefined}>入库任务</button>
+            <button className={progressSection === 'deletions' ? 'active' : ''} onClick={() => setProgressSection('deletions')} aria-current={progressSection === 'deletions' ? 'page' : undefined}>待完成删除{stats?.video_cache?.deleting ? ` (${stats.video_cache.deleting})` : ''}</button>
+          </nav>
+          {progressSection !== 'videos' ? <Suspense fallback={<p role="status" className="empty-hint">正在加载任务记录…</p>}><KnowledgeRecoveryPanel kind={progressSection} refreshKey={statsRefreshKey + videosRefreshKey}
+            loggedIn={loggedIn} onConnectFavorites={onConnectFavorites}
+            onStateChanged={() => { setVideosRefreshKey(key => key + 1); setBasesRefreshKey(key => key + 1); onBuildDone(); }}
+            onSubmitted={taskId => { setSubmittedTaskId(taskId); onBuildDone(); }} /></Suspense> : <>
+          <div className="processing-summary"><span>{stats ? doneCount : '—'} 可提问</span><span>{stats ? processingCount : '—'} 处理中</span><span>{stats ? pendingCount : '—'} 待入库</span><span>{stats ? failedCount : '—'} 失败</span><small>{stats ? totalCount : '—'} 个视频总计</small></div>
           {building && <div className="processing-current"><div className="flex gap-3 items-start"><AudioLines size={22} /><div className="min-w-0"><strong>正在处理视频</strong><p className="mt-2 text-sm break-words">{buildMessage || '正在读取进度…'}</p></div></div><div className="processing-track"><div style={{width: `${buildTotal ? buildProgress / buildTotal * 100 : 0}%`}} /></div><p className="mt-2 text-xs text-[var(--color-ink-muted)]">已完成 {buildProgress} / {buildTotal} 个视频</p></div>}
           {taskVideosLoading && <p role="status" className="empty-hint">正在读取视频状态…</p>}
-          {taskVideosError && <p role="alert" className="text-sm text-red-600">{taskVideosError} <button className="underline" onClick={() => setVideosRefreshKey(key => key + 1)}>重新加载</button></p>}
+          {buildProgressError && <p role="alert" className="mt-3 text-sm text-[var(--color-ink)]">{buildProgressError} <button className="text-button" onClick={() => setProgressRetryKey(key => key + 1)}>重试读取进度</button></p>}
+          {taskVideosError && <p role="alert" className="text-sm text-[var(--color-ink)]">{taskVideosError} <button className="text-button" onClick={() => setTaskVideosRefreshKey(key => key + 1)}>重新加载</button></p>}
           <div className="resource-list">{taskVideos.filter(video => video.status !== 'done').map(video => <div key={video.platform_item_id} className="resource-row flex-wrap"><span className="resource-icon"><FileAudio size={19} /></span><button className="resource-title" onClick={() => setViewingItemId(video.platform_item_id)}><strong>{video.title || '未命名视频'}</strong><small>{statusLabel(video.status)}</small></button>{video.status === 'failed' && <><button className="ui-button" onClick={() => setViewingItemId(video.platform_item_id)}>查看原因</button><button className="ui-button" disabled={building || chatBusy} onClick={() => { setSelectedVideos(previous => new Map(previous).set(video.platform_item_id, video)); const col = collections.find(item => item.id === Number(video.collection_id)); setExpandedId(col?.collection_id ?? 'all'); onChangeView('collections'); }}>选择重试<RotateCcw size={14} /></button></>}</div>)}</div>
-          {taskVideosTotal > taskVideos.length && <p className="mt-3 text-xs text-[var(--color-ink-muted)]">此处展示最近 {taskVideos.length} 个视频的未完成项。其他视频也可以从收藏夹查看。</p>}
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3"><p className="text-xs text-[var(--color-ink-muted)]">{taskVideosUpdatedAt ? `已读取 ${taskVideos.length} / ${taskVideosTotal} 个视频，显示其中 ${taskVideos.filter(video => video.status !== 'done').length} 个未完成项。 更新于 ${taskVideosUpdatedAt}` : '尚未读取到视频清单。'}</p>{taskVideosHasMore && <button className="ui-button" onClick={loadMoreTaskVideos} disabled={taskVideosLoading} aria-busy={taskVideosLoading}>载入更多视频</button>}</div>
+          {!taskVideosLoading && !taskVideosError && !taskVideos.some(video => video.status !== 'done') && taskVideosHasMore && <p className="mt-3 text-sm text-[var(--color-ink-soft)]">已读取的视频均已完成；继续载入可查看更早的未完成记录。</p>}
           {(isStuck || failedCount > 0) && <div className="mt-6"><button onClick={handleResetInterrupted} disabled={resettingVideos || building} aria-busy={resettingVideos} className="ui-button"><RefreshCw size={15} />{resettingVideos ? '正在重置…' : '重置失败/卡住的视频'}</button><p className="mt-2 text-xs text-[var(--color-ink-muted)]">任务进行期间不能重置；重置后重新选择需要导入的视频。</p></div>}
           {buildMessage && !building && <p role="status" className="mt-4 text-sm text-[var(--color-ink-soft)]">{buildMessage}</p>}
-          {!building && !failedCount && !pendingCount && !taskVideosLoading && <div className="empty-resource"><Check size={28} /><h3>资料已准备好</h3><p>选择知识库，就可以开始提问。</p></div>}
+          {!building && stats && !failedCount && !pendingCount && !processingCount && !taskVideosLoading && !taskVideosError && <div className="empty-resource"><Check size={28} /><h3>资料已准备好</h3><p>选择知识库，就可以开始提问。</p></div>}
+          </>}
         </>}
       </div>, contentContainer)}
 

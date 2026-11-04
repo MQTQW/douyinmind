@@ -15,10 +15,21 @@ from typing import Optional
 
 from app.core.config import settings
 from app.models.entities import VideoCache
-from app.services.llm_service import llm_client
-from app.services.omni_service import timestamp
+from app.services.media_timestamps import timestamp
 
 logger = logging.getLogger(__name__)
+
+
+class _ExportLlmFacade:
+    @staticmethod
+    def chat(*args, **kwargs):
+        from app.services.llm_service import llm_client as actual
+        return actual.chat(*args, **kwargs)
+
+
+# Preserve the monkeypatchable public collaborator without loading the model
+# transport merely to export a saved transcript and its time information.
+llm_client = _ExportLlmFacade()
 
 # AI 整理提示词
 SUMMARY_PROMPT = """请输出以下 Markdown 小节，不要添加一级标题：

@@ -31,8 +31,11 @@ def context(monkeypatch):
             KnowledgeBaseVideo(knowledge_base_id=second.id, platform_item_id="second"),
         ])
         db.commit()
-        submissions, checks, prompts, retrievals = [], [], [], []
-        monkeypatch.setattr(knowledge_module.worker, "submit", lambda *args: submissions.append(args))
+        submissions, submission_metadata, checks, prompts, retrievals = [], [], [], [], []
+        def submit(*args, **kwargs):
+            submissions.append(args)
+            submission_metadata.append(kwargs['job_metadata'])
+        monkeypatch.setattr(knowledge_module.worker, "submit", submit)
         monkeypatch.setattr(knowledge_module.omni_service, "check_configuration", lambda: checks.append(True))
         def search(vector, **kwargs):
             retrievals.append(kwargs)
@@ -48,7 +51,7 @@ def context(monkeypatch):
         monkeypatch.setattr(rag_module.llm_client, "chat", answer)
         monkeypatch.setattr(rag_module.llm_client, "stream_chat", lambda **kwargs: iter([answer(**kwargs)]))
         yield SimpleNamespace(db=db, first=first, second=second, empty=empty,
-                              submissions=submissions, checks=checks, prompts=prompts,
+                              submissions=submissions, submission_metadata=submission_metadata, checks=checks, prompts=prompts,
                               retrievals=retrievals)
     engine.dispose()
 
@@ -90,6 +93,8 @@ def test_pending_and_failed_import_assigns_only_selection_and_schedules_analysis
     assert result["assigned_count"] == 3
     assert result["pending_count"] == 2
     assert context.submissions[0][2] == ["pending", "failed"]
+    assert context.submission_metadata[0] == {'platform_item_ids': ['pending', 'failed'],
+        'knowledge_base_id': context.second.id, 'analysis_mode': knowledge_module.settings.knowledge_analysis_mode}
     assert memberships(context.db, context.second.id) == ["failed", "first", "pending", "second"]
 
 

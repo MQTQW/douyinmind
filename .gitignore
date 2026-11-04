@@ -49,6 +49,8 @@ backend/scripts/*
 !backend/scripts/render_answer_report.py
 !backend/scripts/long_video_test.py
 !backend/scripts/observe_ingestion.py
+!backend/scripts/audit_materials.py
+!backend/scripts/benchmark_retrieval.py
 backend/tests/test_journal*.py
 
 # 原本机界面截图含实际收藏夹名称；原图留在本地

@@ -108,6 +108,8 @@ class Settings(BaseSettings):
     # ===== 数据库 =====
     database_url: str = "sqlite:///app/storage/douyinrag.db"
     """SQLite 数据库连接 URL"""
+    ingestion_job_db_path: str = "app/storage/ingestion-jobs.sqlite3"
+    """Durable web ingestion task metadata, independent of private model inputs."""
 
     chroma_persist_dir: str = "app/storage/chroma"
     """ChromaDB 向量库持久化目录"""

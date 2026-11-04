@@ -27,6 +27,14 @@ EXCLUDED = {
     "cache", ".pytest_cache", ".git", "logs", "tmp", "temp",
 }
 REPARSE = 0x400
+# Explicitly published tools only. Other backend/scripts files are local
+# experiments and may reference private acceptance data. Never copy those.
+PUBLIC_SCRIPTS = frozenset({
+    '__init__.py', 'evaluate_retrieval.py', 'evaluate_answers.py',
+    'evaluate_conversations.py', 'render_retrieval_report.py',
+    'render_answer_report.py', 'long_video_test.py', 'observe_ingestion.py',
+    'audit_materials.py', 'benchmark_retrieval.py',
+})
 
 
 def within(path, root):
@@ -59,16 +67,20 @@ def safe_file(path):
 
 
 def public_rel(path):
-    return (len(path.parts) >= 2 and path.parts[0] in {"app", "tests"}
+    return (len(path.parts) >= 2 and path.parts[0] in {"app", "tests", "scripts"}
             and path.suffix == ".py" and not path.is_absolute()
+            and not (path.parts[0] == 'tests' and path.name.startswith('test_journal'))
+            and (path.parts[0] != 'scripts' or (len(path.parts) == 2 and path.name in PUBLIC_SCRIPTS))
             and not any(part in EXCLUDED or part.startswith(".") for part in path.parts))
 
 
 def inventory(backend):
     safe_directory(backend)
     found = []
-    for prefix in ("app", "tests"):
+    for prefix in ("app", "tests", "scripts"):
         top = backend / prefix
+        if prefix == 'scripts' and not top.exists():
+            continue
         safe_directory(top)
         for current, directories, files in os.walk(top, followlinks=False):
             current = Path(current)
@@ -86,6 +98,8 @@ def inventory(backend):
                 absolute = current / name
                 relative = absolute.relative_to(backend)
                 if not public_rel(relative):
+                    if prefix == 'scripts' or (prefix == 'tests' and name.startswith('test_journal')):
+                        continue
                     raise ValueError("non_public_source_path")
                 safe_file(absolute)
                 found.append(relative)
@@ -163,13 +177,76 @@ def sqlite_path(value):
 
 
 class Guard:
-    def __init__(self, work, report, runtime, source_backend):
+    def __init__(self, work, report, runtime, source_backend, *, allow_stdlib_socketpair=False,
+                 allow_fixture_hardlinks=False):
         self.work, self.report = work, report
         self.runtime, self.source_backend = runtime, source_backend
         self.script = Path(__file__).resolve()
         self.verify = False
         self.denials = []
         self.denial_details = []
+        self._stdlib_socketpair_code = None
+        self._stdlib_socket_type = None
+        self._stdlib_socketpair_globals = None
+        self._stdlib_socket_frames = set()
+        self.stdlib_socketpair_events = 0
+        self.allow_fixture_hardlinks = allow_fixture_hardlinks
+        self.fixture_hardlink_events = 0
+        if allow_stdlib_socketpair:
+            import socket
+            expected = Path(sysconfig.get_path('stdlib')).resolve() / 'socket.py'
+            safe_file(expected)
+            function = socket.socketpair
+            code = getattr(function, '__code__', None)
+            if code is None or Path(code.co_filename).resolve() != expected:
+                raise RuntimeError('stdlib_socketpair_implementation_unverified')
+            self._stdlib_socketpair_code = code
+            self._stdlib_socket_type = socket.socket
+            self._stdlib_socketpair_globals = function.__globals__
+            self._native_getsockname = socket.SocketType.getsockname
+            self._socket_families = (socket.AF_INET, socket.AF_INET6)
+            self._socket_stream_type = socket.SOCK_STREAM
+            for method in (socket.socket.__init__, socket.socket.accept):
+                method_code = getattr(method, '__code__', None)
+                if method_code is not None:
+                    if Path(method_code.co_filename).resolve() != expected:
+                        raise RuntimeError('stdlib_socket_method_unverified')
+                    self._stdlib_socket_frames.add(method_code)
+
+    def stdlib_socketpair_event(self, event, args):
+        """Only CPython's own private pair, never an application connection."""
+        if self._stdlib_socketpair_code is None or event not in {'socket.__new__','socket.bind','socket.connect'}:
+            return False
+        frame = sys._getframe(1)
+        if frame.f_code is not Guard.__call__.__code__:
+            return False
+        frame = frame.f_back
+        while frame is not None and frame.f_code is not self._stdlib_socketpair_code:
+            if frame.f_code not in self._stdlib_socket_frames:
+                return False  # An application callback cannot borrow the scope.
+            frame = frame.f_back
+        if (frame is None or frame.f_globals is not self._stdlib_socketpair_globals
+                or frame.f_globals.get('socket') is not self._stdlib_socket_type):
+            return False
+        if event == 'socket.__new__':
+            allowed = (len(args) == 4 and type(args[0]) is self._stdlib_socket_type
+                       and args[1] in self._socket_families
+                       and args[2] == self._socket_stream_type and args[3] == 0)
+        else:
+            sock, address = args
+            values = frame.f_locals
+            if (type(sock) is not self._stdlib_socket_type or type(address) is not tuple
+                    or len(address) < 2 or address[0] not in {'127.0.0.1','::1'}):
+                return False
+            if event == 'socket.bind':
+                allowed = sock is values.get('lsock') and address[1] == 0
+            else:
+                listener = values.get('lsock')
+                allowed = (sock is values.get('csock') and type(listener) is self._stdlib_socket_type
+                           and address[:2] == self._native_getsockname(listener)[:2] and address[1] > 0)
+        if allowed:
+            self.stdlib_socketpair_events += 1
+        return allowed
 
     def deny(self, event, arguments=()):
         self.denials.append(event)
@@ -201,7 +278,7 @@ class Guard:
         if any(part in EXCLUDED or part.startswith(".") for part in relative.parts):
             return False
         if directory:
-            return not relative.parts or relative.parts[0] in ("app", "tests")
+            return not relative.parts or relative.parts[0] in ("app", "tests", "scripts")
         return public_rel(relative)
 
     def allowed(self, value, write=False, directory=False):
@@ -230,6 +307,8 @@ class Guard:
                 or self.verify and self.allowed_source(path, directory=directory))
 
     def __call__(self, event, args):
+        if event.startswith('socket.') and self.stdlib_socketpair_event(event, args):
+            return
         if ((event.startswith("socket.") and event != "socket.gethostname")
                 or event in {
                     "subprocess.Popen", "os.system", "os.posix_spawn", "os.posix_spawnp",
@@ -254,6 +333,24 @@ class Guard:
             self.deny("file_mutation")
         if event in {"os.listdir", "os.scandir"} and not self.allowed(args[0], directory=True):
             self.deny("directory_read")
+        if event == 'os.link' and self.allow_fixture_hardlinks:
+            # Both endpoints must already be writable test-owned locations.
+            # Runtime/source/private files remain read-only and cannot be
+            # linked into a writable fixture. Symbolic links stay prohibited.
+            try:
+                source, target = (Path(os.path.abspath(os.fspath(value))) for value in args[:2])
+                allowed = (len(args) == 4
+                    and all(value is None or type(value) is int and value == -1 for value in args[2:])
+                    and self.allowed(source, True) and self.allowed(target, True)
+                    and source.resolve() == source and source.parent.resolve() == source.parent
+                    and target.resolve() == target and target.parent.resolve() == target.parent
+                    and stat.S_ISREG(source.lstat().st_mode) and not source.is_symlink()
+                    and not target.exists() and not target.is_symlink())
+            except (TypeError, ValueError, OSError):
+                allowed = False
+            if allowed:
+                self.fixture_hardlink_events += 1
+                return
         if event in {"os.link", "os.symlink"}:
             self.deny("file_link")
         if event == "sqlite3.connect":
@@ -288,7 +385,11 @@ def preload_stdlib_ctypes(guard):
     def stdlib_frame():
         frame = sys._getframe(2)
         while frame is not None:
-            if frame.f_code.co_filename == str(expected):
+            # uv may spell the base interpreter through its version alias.
+            # Match the same canonical stdlib file, as the socketpair boundary
+            # does; the strict post-bootstrap FFI policy is unchanged.
+            if (frame.f_code.co_filename == str(expected)
+                    or Path(frame.f_code.co_filename).resolve() == expected):
                 return True
             frame = frame.f_back
         return False
@@ -343,6 +444,7 @@ def sanitize_environment(temporary):
         TEMP=str(temporary), TMP=str(temporary),
         PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTHONDONTWRITEBYTECODE="1", PY_COLORS="0",
         DATABASE_URL="sqlite:///" + (temporary / "runtime.sqlite3").as_posix(),
+        INGESTION_JOB_DB_PATH=str(temporary / "ingestion-jobs.sqlite3"),
     )
     for key in ("CHROMA_PERSIST_DIR", "AUDIO_CACHE_DIR", "VIDEO_CACHE_DIR",
                 "PLAYWRIGHT_USER_DATA_DIR", "PLAYWRIGHT_BROWSERS_PATH", "INGESTION_METRICS_DIR"):
@@ -356,6 +458,12 @@ def main():
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--tests", required=True, nargs="+")
     parser.add_argument("--label", required=True)
+    parser.add_argument('--allow-stdlib-socketpair', action='store_true',
+                        help='Allow only CPython socketpair internals for ASGI event loops; app networking remains denied')
+    parser.add_argument('--allow-fixture-hardlinks', action='store_true',
+                        help='Allow hardlinks only between writable test-owned temporary files; no source/runtime/symlinks')
+    parser.add_argument('--disable-optional-httpx-cli', action='store_true',
+                        help='Disable only httpx._main optional console entry point; keep actual HTTP client/SDK and native guard intact')
     parser.add_argument("--output", required=True, type=Path,
                         help="Existing/new private report directory outside the source checkout")
     args = parser.parse_args()
@@ -401,6 +509,8 @@ def main():
         "interpreter": {"executable": sys.executable, "implementation": sys.implementation.name,
                         "version": list(sys.version_info[:3])},
         "private_source_data_copied": False,
+        "optional_httpx_cli_disabled": args.disable_optional_httpx_cli,
+        "optional_httpx_cli_tested": False,
         "negative_canaries_passed": 0,
     }
     guard = None
@@ -432,7 +542,9 @@ def main():
         sys.path[:] = list(dict.fromkeys([str(copy), *(str(site) for site in sites), *kept]))
         configuration = work / "pytest.ini"
         configuration.write_text("[pytest]\n", encoding="utf-8")
-        guard = Guard(work, report, runtime, backend)
+        guard = Guard(work, report, runtime, backend,
+                      allow_stdlib_socketpair=args.allow_stdlib_socketpair,
+                      allow_fixture_hardlinks=args.allow_fixture_hardlinks)
         result["stdlib_ctypes_bootstrap"] = preload_stdlib_ctypes(guard)
         sys.addaudithook(guard)
         canaries = [
@@ -449,6 +561,24 @@ def main():
             ("ctypes.call_function", (0, ())),
             ("_winapi.CreateProcess", ("not-launched",)),
         ]
+        if args.allow_stdlib_socketpair:
+            # No application may allocate/bind/connect even on loopback. The
+            # stdlib-only positive probe below is a separate verified boundary.
+            import socket
+            canaries.extend([
+                ('socket.__new__', (None, socket.AF_INET, socket.SOCK_STREAM, 0)),
+                ('socket.bind', (None, ('127.0.0.1', 0))),
+                ('socket.connect', (None, ('203.0.113.1', 443))),
+            ])
+        if args.allow_fixture_hardlinks:
+            dirfd_source = temporary/'fixture-dirfd-canary-source'
+            dirfd_source.write_bytes(b'test-only-dirfd-canary')
+            canaries.extend([
+                ('os.link', (str(backend/'app/main.py'), str(temporary/'not-created-link'), -1, -1)),
+                ('os.link', (str(temporary/'not-created-source'), str(backend/'app/not-created-link'), -1, -1)),
+                ('os.link', (str(dirfd_source), str(temporary/'not-created-fd-source-link'), 123, -1)),
+                ('os.link', (str(dirfd_source), str(temporary/'not-created-fd-destination-link'), -1, 123)),
+            ])
         for event, arguments in canaries:
             try:
                 sys.audit(event, *arguments)
@@ -462,15 +592,50 @@ def main():
         result["negative_canaries_expected"] = len(canaries)
         result["original_seven_negative_canaries_passed"] = result["negative_canaries_passed"] >= 7
         result["post_bootstrap_ffi_negative_canaries_passed"] = result["negative_canaries_passed"] == len(canaries)
+        result['stdlib_socketpair_allowed'] = args.allow_stdlib_socketpair
+        result['fixture_hardlinks_allowed'] = args.allow_fixture_hardlinks
+        if args.allow_fixture_hardlinks:
+            dirfd_source.unlink()
+            first_path, second_path = temporary/'fixture-link-probe', temporary/'fixture-link-probe-copy'
+            first_path.write_bytes(b'test-fixture-only')
+            os.link(first_path, second_path)
+            if not os.path.samefile(first_path, second_path) or second_path.read_bytes() != b'test-fixture-only':
+                raise RuntimeError('fixture_hardlink_probe_failed')
+            second_path.unlink(); first_path.unlink()
+            result['fixture_hardlink_positive_probe_passed'] = True
+        if args.allow_stdlib_socketpair:
+            first, second = socket.socketpair()
+            try:
+                first.settimeout(2); second.settimeout(2)
+                first.sendall(b'isolated-internal-pair')
+                if second.recv(64) != b'isolated-internal-pair':
+                    raise RuntimeError('stdlib_socketpair_probe_failed')
+                result['stdlib_socketpair_positive_probe_passed'] = True
+            finally:
+                first.close(); second.close()
         guard.denials.clear()
         guard.denial_details.clear()
+        if args.disable_optional_httpx_cli:
+            # HTTPX catches this ImportError and keeps its real HTTP client,
+            # transports and API. Its optional CLI would otherwise initialize
+            # Click's native Windows console at import time. No application
+            # module or HTTP method is replaced; this is not a CLI test.
+            if 'httpx' in sys.modules or 'httpx._main' in sys.modules:
+                raise RuntimeError('httpx_imported_before_optional_cli_boundary')
+            sys.modules['httpx._main'] = None
         with (report / "terminal.txt").open("x", encoding="utf-8") as terminal:
             with contextlib.redirect_stdout(terminal), contextlib.redirect_stderr(terminal):
                 try:
                     import pytest
                     from _pytest import pathlib as pytest_paths
                     from _pytest import capture as pytest_capture
+                    from _pytest import tmpdir as pytest_tmpdir
                     pytest_paths._force_symlink = lambda *unused, **ignored: None
+                    # Pytest 9 imports this helper into tmpdir at module load;
+                    # disable both optional "current" aliases, never the
+                    # application's symlink syscall or its guard.
+                    if hasattr(pytest_tmpdir, '_force_symlink'):
+                        pytest_tmpdir._force_symlink = pytest_paths._force_symlink
                     # File-only, no-color, capture-disabled output needs no
                     # optional Windows console attachment. Keep the native DLL
                     # guard intact for every application/test ctypes attempt.
@@ -497,6 +662,8 @@ def main():
             guard_denials=list(guard.denials),
             guard_denial_details=list(guard.denial_details),
             runner_stable_after_run=result["runner_sha256"] == sha(Path(__file__).read_bytes()),
+            stdlib_socketpair_allowed_events=guard.stdlib_socketpair_events,
+            fixture_hardlink_allowed_events=guard.fixture_hardlink_events,
         )
         terminal_text = (report / "terminal.txt").read_text(encoding="utf-8")
         summaries = re.findall(r"^.*\b\d+ (?:passed|failed|error|errors|skipped)\b.*$", terminal_text, re.M)
@@ -520,7 +687,8 @@ def main():
         "snapshot_tests_passed": result["snapshot_tests_passed"],
         "pytest_exit_code": result["pytest_exit_code"], "original_summary": result.get("original_summary"),
         "negative_canaries_passed": result["negative_canaries_passed"],
-        "guard_denials": result["guard_denials"],
+        "guard_denials": list(dict.fromkeys(result["guard_denials"])),
+        "guard_denial_count": len(result["guard_denials"]),
     }, ensure_ascii=True))
     return 0 if result["validation_passed"] else 1
 

@@ -11,6 +11,11 @@ import math
 import re
 from collections import Counter
 
+from app.services.prepared_lexical import PreparedLexicalCache
+
+
+_PREPARED_LEXICAL_CACHE = PreparedLexicalCache()
+
 
 _CJK = re.compile(r"[\u3400-\u9fff]+")
 _LATIN = re.compile(r"[a-z][a-z0-9_+.-]*|\d+(?:\.\d+)?", re.I)
@@ -135,15 +140,22 @@ def rerank_chunks(
     query_terms = _terms(query, query=True)
     # Bound pathological queries without privileging their repeated words.
     query_keys = set(list(query_terms)[:_MAX_QUERY_FEATURES])
-    term_counts: dict[tuple[str, str], Counter[str]] = {}
-    doc_frequency: Counter[str] = Counter()
-    lengths: dict[tuple[str, str], int] = {}
-    for key, hit in docs_by_id.items():
-        terms = _terms(str(hit.get("text") or ""))
-        lengths[key] = max(1, sum(terms.values()))
-        matching = Counter({term: terms[term] for term in query_keys if terms[term]})
-        term_counts[key] = matching
-        doc_frequency.update(matching.keys())
+    try:
+        prepared = _PREPARED_LEXICAL_CACHE.features(documents, docs_by_id, query_keys, _terms)
+    except Exception:
+        prepared = None  # Cache failures never replace the original retrieval path.
+    if prepared is None:
+        term_counts: dict[tuple[str, str], Counter[str]] = {}
+        doc_frequency: Counter[str] = Counter()
+        lengths: dict[tuple[str, str], int] = {}
+        for key, hit in docs_by_id.items():
+            terms = _terms(str(hit.get("text") or ""))
+            lengths[key] = max(1, sum(terms.values()))
+            matching = Counter({term: terms[term] for term in query_keys if terms[term]})
+            term_counts[key] = matching
+            doc_frequency.update(matching.keys())
+    else:
+        term_counts, doc_frequency, lengths = prepared
     average_length = sum(lengths.values()) / len(lengths)
     n_docs = len(docs_by_id)
     idf = {term: math.log1p((n_docs - doc_frequency[term] + 0.5) /

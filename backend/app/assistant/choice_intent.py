@@ -180,3 +180,61 @@ def choice_prompt(options, *, catalog_count, catalog_scope='authorized_libraries
     if len(value) > max_chars:
         raise ValueError('library_choice_prompt_budget_exceeded')
     return value
+
+
+def choice_prompt_v2(options, *, catalog_count, catalog_scope='authorized_libraries', max_chars=160):
+    """Fit a new menu while keeping each visible option's original ordinal.
+
+    Ellipses are display only. The original options remain the sole input to
+    selection parsing/authorization; abbreviated labels are never aliases.
+    """
+    if type(catalog_count) is not int or catalog_count < 0 or catalog_scope not in {'all_local', 'authorized_libraries'}:
+        raise ValueError('invalid_library_catalog_scope')
+    if not isinstance(options, list) or len(options) > 128:
+        raise ValueError('invalid_library_catalog')
+    if type(max_chars) is not int or max_chars <= 0:
+        raise ValueError('library_choice_prompt_budget_exceeded')
+    available = [(index, item) for index, item in enumerate(options, 1)
+                 if item.get('can_import', item.get('authorization') is not None)]
+    if not available:
+        value = '现在还没有能保存的库，先去本机设置里授权一下吧，这个视频先不存。'
+        if len(value) > max_chars:
+            raise ValueError('library_choice_prompt_budget_exceeded')
+        return value
+    names, ordinals = [], set()
+    for index, item in available:
+        name = item.get('name')
+        if not isinstance(name, str) or not 1 <= len(name.strip()) <= 128:
+            raise ValueError('invalid_library_catalog_name')
+        ordinal = item.get('ordinal', index)
+        if type(ordinal) is not int or not 1 <= ordinal <= 128 or ordinal in ordinals:
+            raise ValueError('invalid_library_catalog_ordinal')
+        ordinals.add(ordinal)
+        display = re.sub(r'[\x00-\x1f\x7f]+', ' ', name).strip()
+        if not display or '@' in display or re.search(r'https?://', display, re.I):
+            display = '特殊名称库（完整名称见本机）'
+        names.append((ordinal, display))
+    count = len(names)
+    header = f'你有{count}个知识库能存：'
+    for visible in range(min(3, count), 0, -1):
+        omitted = count - visible
+        tail = (f'另有{omitted}个未列出。回上面序号或任一完整库名；本机可查看全部目录。' if omitted else
+                '回上面序号或完整库名；本机可查看全名。')
+        shown = names[:visible]
+        fixed = len(header + '；'.join(f'{ordinal}. ' for ordinal, _ in shown) + '。' + tail)
+        available_chars = max_chars - fixed
+        widths = [min(4, len(name)) for _, name in shown]
+        if sum(widths) > available_chars:
+            continue
+        remaining = available_chars - sum(widths)
+        while remaining and any(width < len(item[1]) for width, item in zip(widths, shown)):
+            for index, (_, name) in enumerate(shown):
+                if remaining and widths[index] < len(name):
+                    widths[index] += 1
+                    remaining -= 1
+        labels = [(name if len(name) <= width else name[:width - 1] + '…')
+                  for (_, name), width in zip(shown, widths)]
+        value = header + '；'.join(f'{ordinal}. {label}' for (ordinal, _), label in zip(shown, labels)) + '。' + tail
+        if len(value) <= max_chars:
+            return value
+    raise ValueError('library_choice_prompt_budget_exceeded')

@@ -5,7 +5,7 @@ API 路由聚合模块
 """
 from fastapi import APIRouter
 
-from app.api.routes import auth, chat, favorites, knowledge, knowledge_bases, mention_ingestion
+from app.api.routes import auth, chat, favorites, knowledge, knowledge_bases, maintenance, mention_ingestion
 from app.assistant.routes import router as assistant_router
 from app.assistant.registry_routes import router as assistant_registry_router
 from app.assistant.evidence_routes import router as assistant_evidence_router
@@ -19,6 +19,7 @@ api_router.include_router(knowledge.router)
 api_router.include_router(knowledge_bases.router)
 api_router.include_router(chat.router)
 api_router.include_router(mention_ingestion.router)
+api_router.include_router(maintenance.router)
 api_router.include_router(assistant_router)
 api_router.include_router(assistant_registry_router)
 api_router.include_router(assistant_evidence_router)

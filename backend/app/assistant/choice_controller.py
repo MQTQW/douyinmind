@@ -20,7 +20,7 @@ from app.mention_agent.contracts import Binding, canonical_json, validate_envelo
 from app.mention_agent.choice_evidence import (choice_ask_reference, choice_reference_id,
     make_choice_envelope, validate_choice_envelope)
 from app.mention_receiver.browser import ReceiverDetailError, ReceiverInterventionRequired, ReceiverPageError
-from .choice_intent import (choice_prompt, selection_forms, parse_library_selection,
+from .choice_intent import (choice_prompt, choice_prompt_v2, selection_forms, parse_library_selection,
     semantic_choice_catalog,semantic_choice_owner)
 from .commands import CommandResolver, Resolution, library_forms
 from .library_choice import LibraryChoiceError
@@ -99,17 +99,32 @@ class ChoiceController:
         except (ValueError,TypeError,KeyError,AttributeError):return False
 
     @staticmethod
-    def _menu(resolution, reply_prefix=''):
-        body = choice_prompt(resolution.choice_options,catalog_count=resolution.catalog_count,
+    def _menu(resolution, reply_prefix='', *, version=1):
+        if type(version) is not int or version not in {1, 2}:
+            raise ValueError('invalid_choice_menu_version')
+        render = choice_prompt if version == 1 else choice_prompt_v2
+        body = render(resolution.choice_options,catalog_count=resolution.catalog_count,
             catalog_scope=resolution.catalog_scope,max_chars=reply_body_budget(CHOICE_MAX_CHARS, reply_prefix))
         return style_reply_text(body, reply_prefix, maximum=CHOICE_MAX_CHARS)
 
     @staticmethod
-    def _ask_ref(task,resolution,ask_text):
-        return 'choice-ask-intent:'+_digest({'task_id':task['id'],'binding':task['binding'],
+    def _ask_ref(task,resolution,ask_text, *, version=1):
+        if type(version) is not int or version not in {1, 2}:
+            raise ValueError('invalid_choice_menu_version')
+        prefix = 'choice-ask-intent:' if version == 1 else 'choice-ask-intent-v2:'
+        return prefix+_digest({'task_id':task['id'],'binding':task['binding'],
             'authorization':task['authorization'],'reference_id':task['envelope']['reference_id'],
             'comment_text':task['envelope']['comment_text'],'ask_text':ask_text,
             'catalog':resolution.choice_intent})
+
+    @staticmethod
+    def _ask_version(reference):
+        if type(reference) is not str:
+            return None
+        for version, prefix in ((1, 'choice-ask-intent:'), (2, 'choice-ask-intent-v2:')):
+            if reference.startswith(prefix) and re.fullmatch(r'[a-f0-9]{64}', reference[len(prefix):]):
+                return version
+        return None
 
     def _eligible_options(self,resolution):
         result=[]
@@ -142,11 +157,12 @@ class ChoiceController:
         try:
             resolution=self._root_resolution(task)
             prefix = self.agent.reply_prefix('assistant:' + task['id']) or ''
-            if (resolution.reason_code!='save_library_required' or resolution.action!='clarify'
+            version = self._ask_version(session['ask_ref'])
+            if (version is None or resolution.reason_code!='save_library_required' or resolution.action!='clarify'
                     or resolution.binding!=self._binding(task) or resolution.authorization!=task['authorization']
                     or not resolution.choice_intent or resolution.choice_intent.get('catalog_public_reply_allowed') is not True
-                    or self._menu(resolution, prefix)!=session['ask_text']
-                    or self._ask_ref(task,resolution,session['ask_text'])!=session['ask_ref']
+                    or self._menu(resolution, prefix, version=version)!=session['ask_text']
+                    or self._ask_ref(task,resolution,session['ask_text'],version=version)!=session['ask_ref']
                     or self._eligible_options(resolution)!=session['options']):return None
         except (ValueError,TypeError,KeyError,AttributeError):return None
         return task,resolution
@@ -168,9 +184,9 @@ class ChoiceController:
             options=self._eligible_options(current)
             if not options:return None
             prefix = self.agent.freeze_reply_prefix('assistant:' + task['id'], reply_prefix)
-            ask=self._menu(current, prefix)
+            ask=self._menu(current, prefix, version=2)
             return self.store.create(root_task_id=task['id'],root_binding=task['binding'],root_envelope=self._origin_envelope(task),
-                ask_ref=self._ask_ref(task,current,ask),ask_text=ask,options=options,authorization=task['authorization'])
+                ask_ref=self._ask_ref(task,current,ask,version=2),ask_text=ask,options=options,authorization=task['authorization'])
         except (ValueError,TypeError,KeyError,AttributeError):
             self.last_issue_code='choice_prepare_not_authorized';return None
 

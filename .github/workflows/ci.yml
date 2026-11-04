@@ -1,0 +1,180 @@
+name: Public synthetic checks
+
+# A workflow definition is not execution evidence; inspect its hosted run.
+"on":
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend / Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "24"]
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      # https://github.com/actions/checkout/releases/tag/v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # https://github.com/actions/setup-node/releases/tag/v7.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+  backend:
+    name: Backend / Windows Python 3.12
+    runs-on: windows-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # Installation may download locked public dependencies. Test processes
+      # then sanitize their environment and deny application network/processes.
+      UV_PYTHON_DOWNLOADS: never
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # https://github.com/actions/setup-python/releases/tag/v7.1.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        id: python
+        with:
+          python-version: "3.12"
+      # https://github.com/astral-sh/setup-uv/releases/tag/v10.3.3
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          # https://github.com/astral-sh/uv/releases/tag/0.13.7
+          version: "0.13.7"
+          enable-cache: false
+      - name: Install locked runtime and dev extra
+        run: uv sync --project backend --locked --extra dev --python "${{ steps.python.outputs.python-path }}"
+
+      - name: Freeze public Python sources and launcher AST fixture
+        id: public_snapshot
+        run: |
+          $sourceRoot = (Resolve-Path -LiteralPath '.').Path
+          $snapshotRoot = Join-Path $env:RUNNER_TEMP 'douyinmind-ci-snapshots'
+          $backendPython = Join-Path $sourceRoot 'backend/.venv/Scripts/python.exe'
+          $snapshotArgs = @(
+            '-I', '-B', './tools/public_code_snapshot.py',
+            '--source', $sourceRoot, '--output', $snapshotRoot,
+            '--label', 'ci-public', '--include-launcher-source'
+          )
+          $snapshotJson = & $backendPython @snapshotArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $snapshot = $snapshotJson | ConvertFrom-Json
+          if (-not $snapshot.snapshot) { throw 'Public snapshot path was not returned' }
+          "source=$($snapshot.snapshot)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Strict public-code snapshot regressions
+        env:
+          PUBLIC_SOURCE_SNAPSHOT: ${{ steps.public_snapshot.outputs.source }}
+        run: |
+          $checkoutRoot = (Resolve-Path -LiteralPath '.').Path
+          $sourceRoot = (Resolve-Path -LiteralPath $env:PUBLIC_SOURCE_SNAPSHOT).Path
+          $reportRoot = Join-Path $env:RUNNER_TEMP 'douyinmind-ci-reports'
+          $backendPython = Join-Path $checkoutRoot 'backend/.venv/Scripts/python.exe'
+          $guardScript = Join-Path $sourceRoot 'tools/portable_guarded_tests.py'
+          $runnerArgs = @(
+            '-I', '-B', $guardScript,
+            '--source', $sourceRoot, '--output', $reportRoot, '--label', 'ci-core',
+            '--disable-optional-httpx-cli',
+            '--tests',
+            'tests/test_llm_retry_accounting.py',
+            'tests/test_query_embedding.py',
+            'tests/test_embedding_batches.py',
+            'tests/test_prepared_lexical.py',
+            'tests/test_material_deletion.py',
+            'tests/test_material_audit.py',
+            'tests/test_retrieval_pipeline.py',
+            'tests/test_persistent_ingestion_jobs.py',
+            'tests/test_ingestion_shutdown_boundaries.py',
+            'tests/test_runtime_identity.py',
+            'tests/test_local_service_identity.py',
+            'tests/test_chat_modes.py',
+            'tests/test_intent_clarification_sessions.py',
+            'tests/test_clarification_recovery_safety.py',
+            'tests/test_choice_menu_versions.py'
+          )
+          & $backendPython @runnerArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: ASGI checks with only CPython internal socketpair support
+        env:
+          PUBLIC_SOURCE_SNAPSHOT: ${{ steps.public_snapshot.outputs.source }}
+        run: |
+          $checkoutRoot = (Resolve-Path -LiteralPath '.').Path
+          $sourceRoot = (Resolve-Path -LiteralPath $env:PUBLIC_SOURCE_SNAPSHOT).Path
+          $reportRoot = Join-Path $env:RUNNER_TEMP 'douyinmind-ci-reports'
+          $backendPython = Join-Path $checkoutRoot 'backend/.venv/Scripts/python.exe'
+          $guardScript = Join-Path $sourceRoot 'tools/portable_guarded_tests.py'
+          $runnerArgs = @(
+            '-I', '-B', $guardScript,
+            '--source', $sourceRoot, '--output', $reportRoot, '--label', 'ci-asgi',
+            '--allow-stdlib-socketpair', '--disable-optional-httpx-cli', '--tests',
+            'tests/test_ingestion_recovery_api.py',
+            'tests/test_ingestion_maintenance.py',
+            'tests/test_knowledge_base_deletion.py',
+            'tests/test_maintenance_api.py'
+          )
+          & $backendPython @runnerArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Hardlink rejection checks on writable temporary fixtures only
+        env:
+          PUBLIC_SOURCE_SNAPSHOT: ${{ steps.public_snapshot.outputs.source }}
+        run: |
+          $checkoutRoot = (Resolve-Path -LiteralPath '.').Path
+          $sourceRoot = (Resolve-Path -LiteralPath $env:PUBLIC_SOURCE_SNAPSHOT).Path
+          $reportRoot = Join-Path $env:RUNNER_TEMP 'douyinmind-ci-reports'
+          $backendPython = Join-Path $checkoutRoot 'backend/.venv/Scripts/python.exe'
+          $guardScript = Join-Path $sourceRoot 'tools/portable_guarded_tests.py'
+          $runnerArgs = @(
+            '-I', '-B', $guardScript,
+            '--source', $sourceRoot, '--output', $reportRoot, '--label', 'ci-fixture-hardlinks',
+            '--allow-fixture-hardlinks', '--disable-optional-httpx-cli', '--tests',
+            'tests/test_mention_agent_store.py::AgentStoreTests::test_hardlink_to_foreign_database_is_rejected',
+            'tests/test_mention_agent_store.py::AgentStoreTests::test_redirected_journal_sidecar_is_rejected_before_write',
+            'tests/test_operator_query_draft_service.py::test_bundle_revalidates_candidate_instead_of_trusting_file_flags[hardlink]'
+          )
+          & $backendPython @runnerArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Show guarded report summaries and failure details
+        if: always()
+        run: |
+          $reportRoot = Join-Path $env:RUNNER_TEMP 'douyinmind-ci-reports'
+          if (Test-Path -LiteralPath $reportRoot) {
+            $reports = Get-ChildItem -LiteralPath $reportRoot -Recurse -File -Filter 'report.json'
+            foreach ($reportFile in $reports) {
+              $report = Get-Content -Raw -LiteralPath $reportFile.FullName | ConvertFrom-Json
+              $report | Select-Object label, validation_passed, snapshot_tests_passed, original_summary, negative_canaries_passed, negative_canaries_expected, guard_denials, source_stable_after_run, copy_stable_after_run, runner_stable_after_run, runner_sha256, optional_httpx_cli_disabled, optional_httpx_cli_tested | ConvertTo-Json -Depth 5
+              if ($report.validation_passed -ne $true) {
+                foreach ($filename in @('terminal.txt', 'runner-error.txt')) {
+                  $details = Join-Path $reportFile.DirectoryName $filename
+                  if (Test-Path -LiteralPath $details) { Get-Content -LiteralPath $details -Tail 120 }
+                }
+              }
+            }
+          }

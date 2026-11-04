@@ -241,11 +241,12 @@ def test_global_video_delete_keeps_admission_through_commit_or_rollback(context,
     monkeypatch.setattr(context.db, "rollback", rollback)
     monkeypatch.setattr(video_routes.knowledge_service, "delete_video", delete_video)
     if outcome == "unknown":
-        with pytest.raises(RuntimeError, match="synthetic unknown deletion result"):
-            context.client.delete("/api/knowledge/videos/shared")
+        response = context.client.delete("/api/knowledge/videos/shared").json()
+        assert response['success'] is False and response['code'] == 'DELETION_UNAVAILABLE'
+        assert 'synthetic unknown deletion result' not in str(response)
     else:
         assert context.client.delete("/api/knowledge/videos/shared").json()["success"] is (outcome == "success")
-    assert bool(rolled_back) is (outcome != "success")
+    assert len(rolled_back) == (0 if outcome == 'success' else 1)
     monkeypatch.setattr(context.db, "rollback", original_rollback)
     with context.worker.submission_guard():
         pass

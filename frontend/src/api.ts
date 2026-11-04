@@ -422,12 +422,82 @@ export async function resetFailedVideos(): Promise<{ success: boolean; reset_cou
   return request('/knowledge/reset-failed', { method: 'POST' });
 }
 
-export async function deleteVideo(platformItemId: string): Promise<{ success: boolean; message?: string }> {
+export async function deleteVideo(platformItemId: string): Promise<{ success: boolean; message?: string; code?: string; operation_id?: string | null; status?: string }> {
   return request(`/knowledge/videos/${platformItemId}`, { method: 'DELETE' });
 }
 
 export async function getSyncProgress(taskId: string): Promise<any> {
   return request(`/knowledge/sync/${taskId}`);
+}
+
+export interface IngestionTaskItem {
+  task_id: string; status: string; stage?: string; progress?: number; total?: number; message?: string;
+  metadata?: { platform_item_ids?: string[]; knowledge_base_id?: number | null; analysis_mode?: string; recovery_of?: string };
+  reason_code?: string | null; current_item_id?: string | null; created_at?: number | null; updated_at?: number | null;
+  started_at?: number | null; finished_at?: number | null; needs_review?: boolean; usage_state?: string; can_retry?: boolean;
+  shutdown_timed_out?: boolean; persistence_error?: boolean;
+}
+export interface DeletionOperationItem {
+  operation_id: string; platform_item_id: string; deletion_state: string; last_error_code?: string;
+  active: boolean; can_resume?: boolean; created_at?: string | null; updated_at?: string | null;
+}
+export interface KnowledgeRecoveryResult {
+  success: boolean; found?: boolean; task_id?: string | null; task?: IngestionTaskItem; recovery_of?: string;
+  duplicate?: boolean; reset_count?: number; needs_review?: boolean; code?: string; message?: string;
+  operation_id?: string | null; deletion_state?: string; already_completed?: boolean;
+}
+const KNOWLEDGE_RECOVERY_MESSAGES: Record<string, string> = {
+  INGESTION_RETRY_NOT_ALLOWED: '这项任务没有可安全重新提交的已记录范围，请先核对原记录。',
+  INGESTION_TASK_MISSING: '原任务记录不存在，未重新提交。',
+  INGESTION_TARGET_MISSING: '原任务中的部分视频已不存在，未重新提交。',
+  INGESTION_LIBRARY_UNAVAILABLE: '原任务的目标知识库已不可用，未重新提交。请保留原记录并重新选择目标。',
+  INGESTION_TARGET_DELETING: '原任务中有删除待完成的资料，请先核对原删除操作。',
+  INGESTION_TARGET_UNCONFIRMED: '原任务中的视频状态需要核对，未重新提交。',
+  INGESTION_RETRY_ID_CONFLICT: '这次提交标识与原任务不一致，未继续处理。',
+  INGESTION_BUSY: '有任务正在处理或排队，尚未重新提交。请先核对现有任务。',
+  INGESTION_RETRY_ALREADY_ACTIVE: '原视频已由其他处理接手或状态变化，本次没有另建任务。请先核对现有任务。',
+  INGESTION_RETRY_PARTIAL_RESET: '这批视频的中断状态已重置，但未确认新任务提交。请先核查同一次请求，原记录与未知费用保留。',
+  INGESTION_RETRY_RESET_UNCONFIRMED: '视频状态重置结果尚未确认，尚未提交新任务。请保留原记录并刷新核对。',
+  INGESTION_PUBLICATION_UNCONFIRMED: '当前资料和归类状态已保留，但未确认新任务提交。请先核查同一次请求。',
+  INGESTION_RETRY_UNAVAILABLE: '这次重新提交未完成，请先核对原任务、知识库和服务状态。',
+  INGESTION_RETRY_LOOKUP_UNAVAILABLE: '这次提交的结果暂不可读。当前没有再次提交，请保留原请求后刷新核对。',
+  INGESTION_HISTORY_UNAVAILABLE: '入库任务记录暂时无法读取，原任务未被重新执行。',
+  INGESTION_CONFIRMATION_REQUIRED: '请先确认重新处理可能再次产生费用。',
+  DELETION_CONFIRMATION_REQUIRED: '请先确认继续完成这一次删除。',
+  DELETION_BUSY: '有资料正在处理或排队，尚未继续删除。',
+  DELETION_INCOMPLETE: '删除尚未完成，原文和原操作记录保留。请刷新核对后显式继续原操作。',
+  DELETION_HISTORY_UNAVAILABLE: '删除记录暂时无法读取，请保留原资料并稍后刷新。',
+  DELETION_RESUME_UNAVAILABLE: '删除结果尚未确认，请保留原操作记录并刷新核对。',
+};
+export function knowledgeRecoveryMessage(result: { code?: string; message?: string }, fallback: string): string {
+  return result.code && KNOWLEDGE_RECOVERY_MESSAGES[result.code] || fallback;
+}
+function recoveryTaskPath(identity: string): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(identity)) throw new Error('任务编号无效，请重新读取原记录。');
+  return encodeURIComponent(identity);
+}
+function recoveryUUID(identity: string): string {
+  if (!/^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i.test(identity)) throw new Error('操作编号无效，请保留原记录并重新读取。');
+  return identity;
+}
+export async function listIngestionTasks(limit = 10, offset = 0): Promise<{ success: boolean; items: IngestionTaskItem[]; total: number; code?: string; message?: string }> {
+  return request(`/knowledge/tasks?limit=${limit}&offset=${offset}`);
+}
+export async function retryIngestionTask(taskId: string, requestId: string): Promise<KnowledgeRecoveryResult> {
+  return request(`/knowledge/tasks/${recoveryTaskPath(taskId)}/retry`, {
+    method: 'POST', body: JSON.stringify({ confirm_reprocess: true, request_id: recoveryUUID(requestId) }),
+  });
+}
+export async function getIngestionRetryResult(taskId: string, requestId: string): Promise<KnowledgeRecoveryResult> {
+  return request(`/knowledge/tasks/${recoveryTaskPath(taskId)}/retry-result?request_id=${encodeURIComponent(recoveryUUID(requestId))}`);
+}
+export async function listDeletionOperations(limit = 10, offset = 0, activeOnly = true): Promise<{ success: boolean; items: DeletionOperationItem[]; total: number; code?: string; message?: string }> {
+  return request(`/knowledge/deletions?limit=${limit}&offset=${offset}&active_only=${activeOnly}`);
+}
+export async function resumeDeletionOperation(operationId: string): Promise<KnowledgeRecoveryResult> {
+  return request(`/knowledge/deletions/${encodeURIComponent(recoveryUUID(operationId))}/resume`, {
+    method: 'POST', body: JSON.stringify({ confirm: true }),
+  });
 }
 
 export async function getKnowledgeStats(): Promise<any> {
@@ -563,7 +633,30 @@ async function chatRequestError(response: Response): Promise<string> {
   }
 }
 
-export async function chatAsk(query: string, sessionId?: number | null, collectionId?: string | null, knowledgeBaseId?: number | null): Promise<{
+let chatOnlyCapabilityCheck: Promise<void> | null = null;
+async function requireChatOnlyCapability(signal?: AbortSignal): Promise<void> {
+  if (!chatOnlyCapabilityCheck) {
+    // Share concurrent checks, but recheck each new request so a restarted old
+    // backend cannot silently reinterpret a previously approved AI-only mode.
+    chatOnlyCapabilityCheck = (async () => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      try {
+        const response = await fetch(`${BASE}/chat/capabilities`, { signal: controller.signal });
+        if (!response.ok) throw new Error();
+        const value = await response.json();
+        if (value?.success !== true || value.chat_only_sessions !== true || value.session_mode_persistent !== true
+          || !Array.isArray(value.modes) || !value.modes.includes('chat_only')) throw new Error();
+      } catch {
+        throw new Error('当前后台尚未确认支持纯 AI 对话，请更新并重新启动后台后重试。本次没有发送问题或读取本地资料。');
+      } finally { clearTimeout(timer); }
+    })().finally(() => { chatOnlyCapabilityCheck = null; });
+  }
+  await chatOnlyCapabilityCheck;
+  if (signal?.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
+}
+
+export async function chatAsk(query: string, sessionId?: number | null, collectionId?: string | null, knowledgeBaseId?: number | null, chatOnly?: boolean): Promise<{
   success: boolean;
   answer?: string;
   sources?: SourceItem[];
@@ -574,10 +667,11 @@ export async function chatAsk(query: string, sessionId?: number | null, collecti
   code?: string;
 }> {
   query = checkedQuestion(query);
+  if (chatOnly === true) await requireChatOnlyCapability();
   const response = await fetch(`${BASE}/chat/ask`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query, session_id: sessionId ?? null, collection_id: collectionId ?? null, ...(knowledgeBaseId != null ? {knowledge_base_id: knowledgeBaseId} : {}) }),
+    body: JSON.stringify({ query, session_id: sessionId ?? null, collection_id: collectionId ?? null, ...(knowledgeBaseId != null ? {knowledge_base_id: knowledgeBaseId} : {}), ...(chatOnly != null ? {chat_only: chatOnly} : {}) }),
   });
   if (!response.ok) throw new Error(await chatRequestError(response));
   const result = await response.json();
@@ -613,12 +707,14 @@ export async function* chatAskStream(
   collectionId?: string | null,
   signal?: AbortSignal,
   knowledgeBaseId?: number | null,
+  chatOnly?: boolean,
 ): AsyncGenerator<ChatStreamEvent> {
   query = checkedQuestion(query);
+  if (chatOnly === true) await requireChatOnlyCapability(signal);
   const res = await fetch(`${BASE}/chat/ask/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-    body: JSON.stringify({ query, session_id: sessionId ?? null, collection_id: collectionId ?? null, ...(knowledgeBaseId != null ? {knowledge_base_id: knowledgeBaseId} : {}) }),
+    body: JSON.stringify({ query, session_id: sessionId ?? null, collection_id: collectionId ?? null, ...(knowledgeBaseId != null ? {knowledge_base_id: knowledgeBaseId} : {}), ...(chatOnly != null ? {chat_only: chatOnly} : {}) }),
     signal,
   });
   if (!res.ok) throw new Error(await chatRequestError(res));
@@ -653,7 +749,7 @@ export async function listSessions(): Promise<{ success: boolean; items: Session
   return request('/chat/sessions?limit=100');
 }
 
-export async function getSessionMessages(sessionId: number, signal?: AbortSignal): Promise<{ success: boolean; message?: string; title?: string; items: MessageItem[] }> {
+export async function getSessionMessages(sessionId: number, signal?: AbortSignal): Promise<{ success: boolean; message?: string; title?: string; chat_only?: boolean; collection_id?: string | null; items: MessageItem[] }> {
   return request(`/chat/sessions/${sessionId}/messages`, { signal });
 }
 
@@ -705,6 +801,8 @@ export interface SessionItem {
   last_message_at: string | null;
   created_at: string;
   knowledge_base_id?: number | null;
+  chat_only?: boolean;
+  collection_id?: string | null;
 }
 
 export interface MessageItem {

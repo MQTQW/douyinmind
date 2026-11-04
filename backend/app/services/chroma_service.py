@@ -10,7 +10,14 @@ ChromaDB 向量库操作模块
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
+import hashlib
+import json
+import math
+from numbers import Real
+import re
 import sys
+import threading
 import time
 from typing import Iterable
 
@@ -21,6 +28,104 @@ logger = logging.getLogger(__name__)
 # ChromaDB 相关配置常量
 COLLECTION_NAME = "douyinrag_videos"
 DISTANCE_METRIC = "cosine"
+_MUTATION_LOCK = threading.RLock()
+
+
+class IndexAuditUnavailable(RuntimeError):
+    REASONS = frozenset({'index_read_unavailable', 'index_metadata_invalid',
+                         'index_snapshot_changed', 'index_scan_limit', 'index_text_read_unavailable'})
+
+    def __init__(self, reason='index_read_unavailable'):
+        self.reason = reason if reason in self.REASONS else 'index_read_unavailable'
+        super().__init__('索引核查未能完整读取，未把未知内容或读取失败记为零。')
+
+
+def _content_role(text, title):
+    """New-writer evidence marker only; never infer body from chunk ordinal."""
+    body = text.strip()
+    header = re.match(r'^(?:语音文字稿(?:（来自视频声音）)?|画面分析(?:（来自视频画面）)?)[：:]\s*\n([\s\S]*)$', body)
+    if header:
+        speech = re.sub(r'\[?\d{1,3}:\d{2}(?::\d{2})?(?:\.\d+)?[–—~\-\d:. ]*\]?', '', header[1])
+        return 'source' if any(character.isalnum() for character in speech) else 'unverified'
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    if lines and all(line.startswith(('视频标题：', '视频标题:', '作者：', '作者:')) for line in lines):
+        return 'metadata'
+    for prefix in ('视频标题：', '视频标题:'):
+        if body.startswith(prefix):
+            declared, separator, author = body[len(prefix):].rpartition('\n作者：')
+            if not separator:
+                declared = body[len(prefix):]
+            if declared.strip() == title.strip() and (not separator or '\n' not in author.strip()):
+                return 'metadata'
+    return 'unverified'
+
+
+def _vectors(values, expected):
+    if not isinstance(values, (list, tuple)) or len(values) != expected:
+        raise ValueError('invalid_vector_batch')
+    normalized, dimension = [], None
+    for vector in values:
+        try:
+            if isinstance(vector, (str, bytes, dict)):
+                raise ValueError()
+            row = list(vector)
+            if not row or any(not isinstance(value, Real) or isinstance(value, bool)
+                              or not math.isfinite(value) for value in row):
+                raise ValueError()
+            if dimension is not None and len(row) != dimension:
+                raise ValueError()
+            dimension = len(row)
+            normalized.append([float(value) for value in row])
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError('invalid_vector_batch') from None
+    return normalized
+
+
+def _snapshot(collection, video_id, *, ids=None):
+    arguments = {'include': ['metadatas', 'documents', 'embeddings']}
+    if ids is None:
+        arguments['where'] = {'platform_item_id': video_id}
+    else:
+        arguments['ids'] = ids
+    value = collection.get(**arguments)
+    identifiers = list(value.get('ids')) if value.get('ids') is not None else []
+    if not identifiers:
+        if any(value.get(key) is not None and len(value[key]) for key in ('metadatas', 'documents', 'embeddings')):
+            raise ValueError('invalid_vector_snapshot')
+        return {}
+    metadata = list(value.get('metadatas')) if value.get('metadatas') is not None else []
+    documents = list(value.get('documents')) if value.get('documents') is not None else []
+    embeddings = list(value.get('embeddings')) if value.get('embeddings') is not None else []
+    if (len(set(identifiers)) != len(identifiers) or any(type(key) is not str or not key for key in identifiers)
+            or ids is not None and not set(identifiers).issubset(ids)
+            or len(metadata) != len(identifiers) or len(documents) != len(identifiers)
+            or any(type(item) is not dict or item.get('platform_item_id') != video_id for item in metadata)
+            or any(type(document) is not str for document in documents)):
+        raise ValueError('invalid_vector_snapshot')
+    embeddings = _vectors(embeddings, len(identifiers))
+    return {key: {'metadata': deepcopy(meta), 'document': document, 'embedding': vector}
+            for key, meta, document, vector in zip(identifiers, metadata, documents, embeddings)}
+
+
+def _write_snapshot(collection, rows):
+    if rows:
+        collection.upsert(ids=list(rows), embeddings=[row['embedding'] for row in rows.values()],
+                          metadatas=[row['metadata'] for row in rows.values()],
+                          documents=[row['document'] for row in rows.values()])
+
+
+def _same_snapshot(actual, expected):
+    if set(actual) != set(expected):
+        return False
+    for key, row in expected.items():
+        got = actual[key]
+        if got['metadata'] != row['metadata'] or got['document'] != row['document']:
+            return False
+        if len(got['embedding']) != len(row['embedding']) or not all(
+                math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-8)
+                for a, b in zip(got['embedding'], row['embedding'])):
+            return False
+    return True
 
 
 class ChromaService:
@@ -42,13 +147,16 @@ class ChromaService:
             )
 
         import chromadb
+        from chromadb.config import Settings as ChromaSettings
 
         self._client = chromadb.PersistentClient(
-            path=settings.chroma_persist_dir
+            path=settings.chroma_persist_dir,
+            settings=ChromaSettings(anonymized_telemetry=False),
         )
         self._collection = self._client.get_or_create_collection(
             name=COLLECTION_NAME,
             metadata={"hnsw:space": DISTANCE_METRIC},
+            embedding_function=None,
         )
         logger.info(
             "ChromaDB 初始化完成: %s (collection=%s, count=%d)",
@@ -67,7 +175,8 @@ class ChromaService:
         """
         将一个视频的所有文本块写入向量库
 
-        先删除该视频已有的旧数据，再批量插入新数据。
+        先校验并保存旧快照，再写新块；只有写入成功才删除旧的多余块。
+        失败时尝试恢复旧快照，无法确认补偿结果时明确抛错。
 
         :param platform_item_id: 抖音视频 ID
         :param title: 视频标题
@@ -75,38 +184,50 @@ class ChromaService:
         :param embeddings: 对应的向量列表（与 chunks 一一对应）
         :return: chunk ID 列表
         """
+        if (type(platform_item_id) is not str or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', platform_item_id)
+                or type(title) is not str or not isinstance(chunks, list)
+                or any(type(text) is not str or not text.strip() for text in chunks)):
+            raise ValueError('invalid_video_chunks')
+        vectors = _vectors(embeddings, len(chunks))
         if not chunks:
             return []
-
-        # 先删旧数据
-        self.delete_by_video(platform_item_id)
-
-        now_ts = int(time.time())
-        chunk_ids = [
-            f"{platform_item_id}:{idx}" for idx in range(len(chunks))
-        ]
-        metadatas = [
-            {
-                "chunk_id": chunk_ids[idx],
-                "platform_item_id": platform_item_id,
-                "chunk_index": idx,
-                "title": title[:500],
-                "created_at": now_ts,
-            }
-            for idx in range(len(chunks))
-        ]
-
-        self._collection.upsert(
-            ids=chunk_ids,
-            embeddings=embeddings,
-            metadatas=metadatas,
-            documents=chunks,
-        )
-
-        logger.info(
-            "向量入库完成: %s, %d chunks", platform_item_id, len(chunks)
-        )
-        return chunk_ids
+        with _MUTATION_LOCK:
+            now_ts = int(time.time())
+            chunk_ids = [f'{platform_item_id}:{index}' for index in range(len(chunks))]
+            replacement = {key: {'embedding': vectors[index], 'document': chunks[index],
+                'metadata': {'chunk_id': key, 'platform_item_id': platform_item_id,
+                             'chunk_index': index, 'title': title[:500], 'created_at': now_ts,
+                             'dm_content_role_version': 1, 'dm_content_role': _content_role(chunks[index], title)}}
+                for index, key in enumerate(chunk_ids)}
+            try:
+                previous = _snapshot(self._collection, platform_item_id)
+                # Even a corrupt foreign row cannot be overwritten through a
+                # generated ID collision and then hidden by compensation.
+                _snapshot(self._collection, platform_item_id, ids=chunk_ids)
+                if previous and len(next(iter(previous.values()))['embedding']) != len(vectors[0]):
+                    raise ValueError('vector_dimension_changed')
+            except Exception:
+                raise RuntimeError('无法完整读取旧索引快照，未写入或删除任何向量。') from None
+            try:
+                _write_snapshot(self._collection, replacement)
+                stale = sorted(set(previous) - set(replacement))
+                if stale:
+                    self._collection.delete(ids=stale)
+                if not _same_snapshot(_snapshot(self._collection, platform_item_id), replacement):
+                    raise ValueError('vector_write_not_confirmed')
+            except Exception:
+                try:
+                    _write_snapshot(self._collection, previous)
+                    added = sorted(set(replacement) - set(previous))
+                    if added:
+                        self._collection.delete(ids=added)
+                    if not _same_snapshot(_snapshot(self._collection, platform_item_id), previous):
+                        raise ValueError('vector_restore_not_confirmed')
+                except Exception:
+                    raise RuntimeError('向量更新失败，旧索引恢复结果无法确认；原文保留，未标记入库成功。') from None
+                raise RuntimeError('向量更新失败，已核对恢复旧索引；原文保留，未标记入库成功。') from None
+            logger.info('向量入库完成: %s, %d chunks', platform_item_id, len(chunks))
+            return chunk_ids
 
     def search(
         self, query_vector: list[float], top_k: int = 20,
@@ -234,9 +355,79 @@ class ChromaService:
 
         :param platform_item_id: 抖音视频 ID
         """
-        self._collection.delete(
-            where={"platform_item_id": platform_item_id}
-        )
+        with _MUTATION_LOCK:
+            self._collection.delete(where={"platform_item_id": platform_item_id})
+
+    def list_indexed_video_counts(self, page_size=500, *, verify_legacy_text=False, max_records=1_000_000):
+        """Read a bounded metadata census without embeddings or model calls.
+
+        Legacy ordinals are not content evidence. Only an explicit opt-in reads
+        local documents to classify legacy text with the existing source rule.
+        Hashes cover the observed identities/roles (and opted-in text hashes),
+        not a cross-storage atomic snapshot or a claim of answer correctness.
+        """
+        if (type(page_size) is not int or not 1 <= page_size <= 1000
+                or type(verify_legacy_text) is not bool or type(max_records) is not int or max_records < 1):
+            raise ValueError('invalid_index_audit_options')
+        try:
+            before = self._collection.count()
+            if type(before) is not int or before < 0:
+                raise IndexAuditUnavailable('index_metadata_invalid')
+            if before > max_records:
+                raise IndexAuditUnavailable('index_scan_limit')
+            counts, seen, records = {}, set(), []
+            offset = 0
+            include = ['metadatas', 'documents'] if verify_legacy_text else ['metadatas']
+            while offset < before:
+                result = self._collection.get(limit=page_size, offset=offset, include=include)
+                identifiers, metadata = result.get('ids'), result.get('metadatas')
+                if (not isinstance(identifiers, list) or not isinstance(metadata, list)
+                        or not identifiers or len(identifiers) > page_size or len(metadata) != len(identifiers)):
+                    raise IndexAuditUnavailable('index_metadata_invalid')
+                documents = result.get('documents') if verify_legacy_text else None
+                if verify_legacy_text and (not isinstance(documents, list) or len(documents) != len(identifiers)
+                                           or any(type(document) is not str for document in documents)):
+                    raise IndexAuditUnavailable('index_text_read_unavailable')
+                for index, (identifier, meta) in enumerate(zip(identifiers, metadata)):
+                    if type(identifier) is not str or not identifier or len(identifier) > 512 or type(meta) is not dict:
+                        raise IndexAuditUnavailable('index_metadata_invalid')
+                    if identifier in seen:
+                        raise IndexAuditUnavailable('index_snapshot_changed')
+                    seen.add(identifier)
+                    video_id = meta.get('platform_item_id')
+                    if type(video_id) is not str or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', video_id):
+                        raise IndexAuditUnavailable('index_metadata_invalid')
+                    role = meta.get('dm_content_role') if type(meta.get('dm_content_role_version')) is int and meta.get('dm_content_role_version') == 1 else 'unverified'
+                    if role not in {'source', 'metadata'}:
+                        role = 'unverified'
+                    if role == 'unverified' and verify_legacy_text:
+                        from app.services.retrieval_fusion import _source_text
+                        role = 'source' if _source_text({'text': documents[index], 'title': meta.get('title', '')}) else 'metadata'
+                    row = counts.setdefault(video_id, {'platform_item_id': video_id, 'total_chunks': 0,
+                        'verified_content_chunks': 0, 'metadata_chunks': 0, 'unverified_chunks': 0})
+                    row['total_chunks'] += 1
+                    row[{'source': 'verified_content_chunks', 'metadata': 'metadata_chunks', 'unverified': 'unverified_chunks'}[role]] += 1
+                    text_hash = hashlib.sha256(documents[index].encode()).hexdigest() if verify_legacy_text else None
+                    records.append((identifier, video_id, role, text_hash))
+                offset += len(identifiers)
+            after = self._collection.count()
+            if type(after) is not int or before != after or offset != before:
+                raise IndexAuditUnavailable('index_snapshot_changed')
+            rows = []
+            for key in sorted(counts):
+                row = counts[key]
+                row['content_verified'] = row['unverified_chunks'] == 0
+                row['content_chunks'] = row['verified_content_chunks'] if row['content_verified'] else None
+                rows.append(row)
+            return {'read_complete': True, 'content_verified': all(row['content_verified'] for row in rows),
+                    'counts': rows, 'index_records': before,
+                    'index_hash': hashlib.sha256(json.dumps(sorted(records), separators=(',', ':')).encode()).hexdigest(),
+                    'verification_mode': 'local_legacy_text' if verify_legacy_text else 'metadata_only',
+                    'source_kind': 'live_index_metadata'}
+        except IndexAuditUnavailable:
+            raise
+        except Exception:
+            raise IndexAuditUnavailable() from None
 
     def delete_videos(self, platform_item_ids: Iterable[str]) -> None:
         """
@@ -247,9 +438,8 @@ class ChromaService:
         ids = [item for item in platform_item_ids if item]
         if not ids:
             return
-        self._collection.delete(
-            where={"platform_item_id": {"$in": ids}}
-        )
+        with _MUTATION_LOCK:
+            self._collection.delete(where={"platform_item_id": {"$in": ids}})
 
     def count(self) -> int:
         """

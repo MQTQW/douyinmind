@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["对话"])
 
 
+@router.get('/capabilities')
+def chat_capabilities():
+    return {'success': True, 'chat_only_sessions': True,
+            'session_mode_persistent': True, 'modes': ['knowledge', 'chat_only']}
+
+
 class AskRequest(BaseModel):
     """
     问答请求体
@@ -31,8 +37,9 @@ class AskRequest(BaseModel):
     """
     query: str = Field(min_length=1, max_length=2000)
     session_id: int | None = Field(default=None, gt=0)
-    collection_id: str | None = None
+    collection_id: str | None = Field(default=None, max_length=128)
     knowledge_base_id: int | None = Field(default=None, gt=0)
+    chat_only: bool | None = Field(default=None, strict=True)
 
     @field_validator("query", mode="before")
     @classmethod
@@ -70,6 +77,8 @@ def chat_ask(
         raise HTTPException(status_code=404, detail="该历史对话已不存在，请新建对话。")
     try:
         kwargs = {"knowledge_base_id": body.knowledge_base_id} if body.knowledge_base_id is not None else {}
+        if body.chat_only is not None:
+            kwargs['chat_only'] = body.chat_only
         result = rag_service.answer(db, body.query, body.session_id, body.collection_id, **kwargs)
         return {"success": True, **result}
     except Exception as exc:
@@ -109,6 +118,8 @@ async def chat_ask_stream(
             # request dependency cleanup and FastAPI version differences.
             with session_factory() as db:
                 kwargs = {"knowledge_base_id": body.knowledge_base_id} if body.knowledge_base_id is not None else {}
+                if body.chat_only is not None:
+                    kwargs['chat_only'] = body.chat_only
                 for event_name, payload in rag_service.answer_stream(
                     db, body.query, body.session_id, body.collection_id, **kwargs
                 ):
@@ -172,6 +183,8 @@ async def get_session_messages(
         "session_id": session_id,
         "title": db.get(ChatSession, session_id).title,
         "knowledge_base_id": db.get(ChatSession, session_id).knowledge_base_id,
+        "chat_only": bool(db.get(ChatSession, session_id).chat_only),
+        "collection_id": db.get(ChatSession, session_id).collection_id,
         "items": messages,
     }
 
