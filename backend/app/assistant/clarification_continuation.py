@@ -12,6 +12,7 @@ from app.mention_agent.contracts import Binding, canonical_json
 from app.mention_agent.clarification_evidence import (SOURCE_KIND, make_clarification_envelope,
     validate_clarification_envelope)
 from app.mention_agent.store import _verified_target
+from app.mention_receiver.browser import ReceiverInterventionRequired
 from .clarification_sessions import ClarificationError, digest, immutable_envelope
 from .semantic_resolution import owner_scope_from_envelope, catalog_snapshot_from_grants, semantic_source_key
 from .semantic_plan_store import ui_semantic_digest, verify_semantic_decision, RecordedSemanticDecision
@@ -22,6 +23,8 @@ class ClarificationContinuation:
     def __init__(self, store, bridge, lane, interpreter, *, clock=None):
         self.store, self.bridge, self.lane, self.interpreter = store, bridge, lane, interpreter
         self.clock = clock or time.time
+        self._recovery_cursor = None
+        self.last_recovery_diagnostic = None
 
     def _admit_existing(self,session_id,source_id,task):
         try:return self.store.admitted(session_id,source_id,task)
@@ -62,13 +65,22 @@ class ClarificationContinuation:
 
     def recover_links(self, tasks):
         """Repair only an already planned new-type handoff; never arm old roots."""
-        if self.store.enabled is not True:return
+        result = self._recovery_result()
+        if not self._recovery_active() or self.store.enabled is not True:return result
         for task in tasks:
-            proof=task.get('envelope',{}).get('evidence',{})
-            if proof.get('source_kind')!=SOURCE_KIND:continue
-            session=self.store.get(proof['clarification_session_id'])
-            if session is not None:
-                self._admit_existing(session['session_id'],session['response_source_id'],task)
+            if not self._recovery_active():break
+            session = None
+            try:
+                proof=task.get('envelope',{}).get('evidence',{})
+                if proof.get('source_kind')!=SOURCE_KIND:continue
+                session=self.store.get(proof['clarification_session_id'])
+                if session is not None:
+                    self._reconcile_planned(session, result, expected_task=task)
+            except ReceiverInterventionRequired:
+                raise
+            except Exception:
+                self._recovery_error(session, result)
+        return result
 
     def after_publish(self, task):
         session = self.store.for_root(task['id'])
@@ -236,6 +248,7 @@ class ClarificationContinuation:
 
     def _review(self, session, reason):
         """A CAS on new session metadata only; never touch task/effect ledgers."""
+        if not self._recovery_active():return False
         with self.store._db(write=True) as db:
             row=db.execute('SELECT * FROM clarification_sessions WHERE session_id=?',(session['session_id'],)).fetchone()
             if row is None or row['revision']!=session['revision'] or row['state']!=session['state']:return False
@@ -244,79 +257,143 @@ class ClarificationContinuation:
             self.store._event(db,session['session_id'],'existing_ledgers_need_review',{'reason_code':reason})
             return True
 
-    def reconcile_existing(self, *, limit=20):
-        """Observe only already armed V1 records; no claim/plan/queue/send action."""
-        if type(limit) is not int or not 1<=limit<=100:raise ClarificationError('clarification_recovery_limit')
-        with self.store._db() as db:
-            rows=db.execute("SELECT * FROM clarification_sessions WHERE state IN ('awaiting_publication','planned') ORDER BY created_at,session_id LIMIT ?",(limit,)).fetchall()
-            sessions=[self.store._view(row) for row in rows]
-        result={'links_repaired':0,'publications_observed':0,'needs_review':0}
-        for session in sessions:
-            if self.bridge.should_stop():break
-            root=session['root']
-            if (root.get('capability')!='intent_clarification_v1' or root.get('activated_at')!=self.store.activated_at
-                    or root.get('created_at',0)<self.store.activated_at):continue
-            if session['state']=='awaiting_publication':
-                task=self.bridge.queue.get_task(root['id'])
-                if task is None:
-                    result['needs_review']+=self._review(session,'clarification_recovery_root_missing');continue
-                if any(task.get(key)!=root.get(key) for key in ('binding','envelope','authorization','user_id','device_id')):
-                    result['needs_review']+=self._review(session,'clarification_recovery_root_changed');continue
-                source=self._source(root['source_id'])
-                if (source is None or source['state']!='admitted' or source['task_id']!=task['id'] or source['historical']):
-                    result['needs_review']+=self._review(session,'clarification_recovery_source_changed');continue
-                old=self.bridge._find(task)
-                reply=self.bridge.agent.get_reply(old['task_id']) if old else None
-                if reply and old['state']=='b_view_visible' and reply.get('state')=='b_view_visible':
-                    # An already visible effect may be recorded while disabled;
-                    # enabled/current permissions are still required to use it.
-                    self.after_publish(task)
-                    if self.store.get(session['session_id'])['state']=='awaiting_reply':
-                        result['publications_observed']+=1
-                elif reply and reply.get('send_token') and reply.get('state') in {'reserved','delivery_unknown','verification_required'}:
-                    result['needs_review']+=self._review(session,'clarification_recovery_publication_unconfirmed')
-                continue
-            if self.store.enabled is not True:continue
-            item=session['queue_item'];env=item['envelope'] if isinstance(item,dict) else None
-            if not env:
-                result['needs_review']+=self._review(session,'clarification_recovery_plan_missing');continue
-            task=self.bridge.queue.lookup_by_source_reference(env['sender_profile_url'],env['receiver_profile_url'],env['source_mode'],env['reference_id'])
-            source=self._source(session['response_source_id'])
-            if source and source['state']=='planned':continue  # Normal Source recovery owns that link.
+    @staticmethod
+    def _recovery_result():
+        return {'links_repaired':0,'publications_observed':0,'needs_review':0,'errors':0}
+
+    def _recovery_active(self):
+        if self.bridge.should_stop():return False
+        control = getattr(self.bridge, 'control', None)
+        return control is None or control.snapshot().get('desired_state') == 'running'
+
+    def _recovery_error(self, session, result):
+        result['errors'] += 1
+        recorded = False
+        if session is not None and session.get('state') in {'awaiting_publication','planned'}:
             try:
-                source_plan=json.loads(source['plan']) if source and isinstance(source.get('plan'),str) else source.get('plan') if source else None
-                source_item=source_plan['queue_item'] if isinstance(source_plan,dict) else None
-                source_exact=bool(source_item and source_plan.get('reference_id')==env['reference_id']
-                    and immutable_envelope(source_plan['envelope'])==immutable_envelope(env)
-                    and any(source_item.get(key)!=item.get(key) for key in
-                        ('kind','binding','authorization','user_id','device_id')) is False
-                    and self.lane.source_store.admitted_source_current(source['source_id']) is True)
-            except Exception:source_exact=False
-            if (task is None or source is None or source['state']!='admitted' or source['historical']
-                    or source['task_id']!=task['id'] or source['reference_id']!=env['reference_id']
-                    or not source_exact
-                    or any(task.get(key)!=item.get(key) for key in ('kind','binding','authorization','user_id','device_id'))
-                    or immutable_envelope(task['envelope'])!=immutable_envelope(env)
+                recorded = self._review(session, 'clarification_recovery_record_unavailable')
+            except ReceiverInterventionRequired:
+                raise
+            except Exception:
+                pass  # An unreadable store is not a successful review write.
+        result['needs_review'] += bool(recorded)
+        self.last_recovery_diagnostic = {'code':'clarification_recovery_record_unavailable',
+                                        'review_recorded':bool(recorded)}
+
+    def _reconcile_planned(self, session, result, *, expected_task=None):
+        """Both recovery entries use the same pre-execution handoff gate."""
+        if (session['state'] != 'planned' or not self._recovery_active()
+                or self.store.enabled is not True):return
+        root=session['root']
+        if (root.get('capability')!='intent_clarification_v1' or root.get('activated_at')!=self.store.activated_at
+                or root.get('created_at',0)<self.store.activated_at):return
+        item=session['queue_item'];env=item.get('envelope') if isinstance(item,dict) else None
+        if not env:
+            result['needs_review']+=self._review(session,'clarification_recovery_plan_missing');return
+        task=self.bridge.queue.lookup_by_source_reference(env['sender_profile_url'],env['receiver_profile_url'],env['source_mode'],env['reference_id'])
+        source=self._source(session['response_source_id'])
+        if source and source['state']=='planned':return  # Native Source recovery owns this window.
+        source_plan=json.loads(source['plan']) if source and isinstance(source.get('plan'),str) else source.get('plan') if source else None
+        source_item=source_plan.get('queue_item') if isinstance(source_plan,dict) else None
+        source_exact=bool(source_item and source_plan.get('reference_id')==env['reference_id']
+            and immutable_envelope(source_plan['envelope'])==immutable_envelope(env)
+            and immutable_envelope(source_item['envelope'])==immutable_envelope(env)
+            and not any(source_item.get(key)!=item.get(key) for key in
+                ('kind','binding','authorization','user_id','device_id'))
+            and self.lane.source_store.admitted_source_current(source['source_id']) is True)
+        if (task is None or source is None or source['state']!='admitted' or source['historical']
+                or source['first_seen']<self.store.activated_at
+                or source['task_id']!=task['id'] or source['reference_id']!=env['reference_id']
+                or not source_exact
+                or any(task.get(key)!=item.get(key) for key in ('kind','binding','authorization','user_id','device_id'))
+                or immutable_envelope(task['envelope'])!=immutable_envelope(env)
+                or expected_task is not None and (expected_task.get('id')!=task['id']
+                    or any(expected_task.get(key)!=task.get(key) for key in
+                        ('kind','binding','authorization','user_id','device_id'))
+                    or immutable_envelope(expected_task['envelope'])!=immutable_envelope(env))
+                or not self._root_current(session)):
+            result['needs_review']+=self._review(session,'clarification_recovery_link_unconfirmed');return
+        if task.get('state') in {'executing','publishing'}:return
+        if (task.get('state')!='queued'
+                or any(task.get(key) for key in ('execution_token','publication_token','lease_until','owner_run_id'))
+                or task.get('execution_attempts',0)!=0 or task.get('publish_attempts',0)!=0):
+            result['needs_review']+=self._review(session,'clarification_recovery_effect_unconfirmed');return
+        if task.get('agent_task_id') or self.bridge._find(task) is not None:
+            result['needs_review']+=self._review(session,'clarification_recovery_agent_effect_present');return
+        binding=Binding.from_dict(task['binding'])
+        receipt=self.bridge._semantic_receipt(task)
+        if (self.bridge.registry.authorize_snapshot(task.get('authorization'))!=binding
+                or type(receipt) is not RecordedSemanticDecision or receipt.plan_id!=session['semantic_plan_id']):
+            result['needs_review']+=self._review(session,'clarification_recovery_permission_changed');return
+        metadata=verify_semantic_decision(receipt,mode='root',original_text=env['comment_text'],
+            frozen_ui_digest=ui_semantic_digest(env),owner_scope=self.bridge._semantic_owner_scope(task))
+        if metadata!=session['decision']:
+            result['needs_review']+=self._review(session,'clarification_recovery_meaning_changed');return
+        if self._recovery_active() and self.store.enabled is True:
+            # Receipt/permission checks can block. Fence a concurrently claimed
+            # task or changed source again before repairing the session link.
+            if (self.bridge.queue.get_task(task['id'])!=task
+                    or self._source(session['response_source_id'])!=source
+                    or self.bridge._find(task) is not None
+                    or self.bridge.registry.authorize_snapshot(task.get('authorization'))!=binding
                     or not self._root_current(session)):
-                result['needs_review']+=self._review(session,'clarification_recovery_link_unconfirmed');continue
-            if task.get('state') in {'executing','publishing'}:continue
-            if task.get('state') in {'delivery_unknown','verification_required'}:
-                result['needs_review']+=self._review(session,'clarification_recovery_effect_unconfirmed');continue
-            # The true crash window precedes all Agent work. Anything already
-            # executed/reserved/unknown must retain explicit review, never gain
-            # permission merely from a repaired Source/Queue projection.
-            if task.get('agent_task_id') or self.bridge._find(task) is not None:
-                result['needs_review']+=self._review(session,'clarification_recovery_agent_effect_present');continue
-            binding=Binding.from_dict(task['binding'])
-            receipt=self.bridge._semantic_receipt(task)
-            if (self.bridge.registry.authorize_snapshot(task.get('authorization'))!=binding
-                    or type(receipt) is not RecordedSemanticDecision or receipt.plan_id!=session['semantic_plan_id']):
-                result['needs_review']+=self._review(session,'clarification_recovery_permission_changed');continue
-            metadata=verify_semantic_decision(receipt,mode='root',original_text=env['comment_text'],
-                frozen_ui_digest=ui_semantic_digest(env),owner_scope=self.bridge._semantic_owner_scope(task))
-            if metadata!=session['decision']:
-                result['needs_review']+=self._review(session,'clarification_recovery_meaning_changed');continue
-            if self.store.enabled is True:
-                if self._admit_existing(session['session_id'],session['response_source_id'],task) is not None:
-                    result['links_repaired']+=1
+                result['needs_review']+=self._review(session,'clarification_recovery_link_changed');return
+            if not self._recovery_active():return
+            if self._admit_existing(session['session_id'],session['response_source_id'],task) is not None:
+                result['links_repaired']+=1
+
+    def _reconcile_session(self, session, result):
+        root=session['root']
+        if (root.get('capability')!='intent_clarification_v1' or root.get('activated_at')!=self.store.activated_at
+                or root.get('created_at',0)<self.store.activated_at):return
+        if session['state']=='planned':
+            self._reconcile_planned(session, result);return
+        task=self.bridge.queue.get_task(root['id'])
+        if task is None:
+            result['needs_review']+=self._review(session,'clarification_recovery_root_missing');return
+        if any(task.get(key)!=root.get(key) for key in ('binding','envelope','authorization','user_id','device_id')):
+            result['needs_review']+=self._review(session,'clarification_recovery_root_changed');return
+        source=self._source(root['source_id'])
+        if (source is None or source['state']!='admitted' or source['task_id']!=task['id'] or source['historical']):
+            result['needs_review']+=self._review(session,'clarification_recovery_source_changed');return
+        old=self.bridge._find(task)
+        reply=self.bridge.agent.get_reply(old['task_id']) if old else None
+        if reply and old['state']=='b_view_visible' and reply.get('state')=='b_view_visible':
+            # Only record an existing exact effect, including while disabled.
+            # Using this record later still requires current authorization.
+            if not self._recovery_active():return
+            self.after_publish(task)
+            if self.store.get(session['session_id'])['state']=='awaiting_reply':
+                result['publications_observed']+=1
+        elif reply and reply.get('send_token') and reply.get('state') in {'reserved','delivery_unknown','verification_required'}:
+            result['needs_review']+=self._review(session,'clarification_recovery_publication_unconfirmed')
+
+    def reconcile_existing(self, *, limit=20):
+        """Fair, bounded observation of existing records; never replay effects."""
+        if type(limit) is not int or not 1<=limit<=100:raise ClarificationError('clarification_recovery_limit')
+        result=self._recovery_result()
+        if not self._recovery_active():return result
+        with self.store._db() as db:
+            sql="SELECT * FROM clarification_sessions WHERE state IN ('awaiting_publication','planned')"
+            cursor=getattr(self,'_recovery_cursor',None)
+            rows=[]
+            if cursor is not None:
+                rows=db.execute(sql+' AND (created_at>? OR (created_at=? AND session_id>?)) ORDER BY created_at,session_id LIMIT ?',
+                    (cursor[0],cursor[0],cursor[1],limit)).fetchall()
+            if not rows:
+                self._recovery_cursor=None
+                rows=db.execute(sql+' ORDER BY created_at,session_id LIMIT ?',(limit,)).fetchall()
+        for row in rows:
+            if not self._recovery_active():break
+            # Advance before decoding, so one malformed record cannot starve
+            # every later record. No durable session/effect is reset to fresh.
+            self._recovery_cursor=(row['created_at'],row['session_id'])
+            session={key:row[key] for key in ('session_id','revision','state')}
+            try:
+                session=self.store._view(row)
+                self._reconcile_session(session, result)
+            except ReceiverInterventionRequired:
+                raise
+            except Exception:
+                self._recovery_error(session, result)
         return result

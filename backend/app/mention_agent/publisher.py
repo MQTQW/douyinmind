@@ -50,7 +50,8 @@ class ReplyPreflightError(RuntimeError):
 
 class ReplyPublisher:
     def __init__(self, store, binding: Binding, adapter, evidence_root: Path, *, should_stop=None,
-                 scope_authorizer=None, publication_allowed=None, content_gate=None):
+                 scope_authorizer=None, publication_allowed=None, content_gate=None,
+                 require_exact_text=True):
         self.store, self.binding, self.adapter = store, binding, adapter
         self.evidence_root = Path(evidence_root).absolute()
         self.should_stop = should_stop or (lambda: False)
@@ -61,8 +62,13 @@ class ReplyPublisher:
             raise ValueError("invalid_publication_gate")
         if content_gate is not None and not callable(content_gate):
             raise ValueError("invalid_content_gate")
+        if type(require_exact_text) is not bool:
+            raise ValueError("invalid_content_gate")
+        if not require_exact_text:
+            raise ValueError("immutable_reply_required")
         self.publication_allowed = (lambda: True) if publication_allowed is None else publication_allowed
         self.content_gate = content_gate
+        self.require_exact_text = require_exact_text
 
     def _authorized(self):
         current = self.store.get_binding(self.binding.binding_id)
@@ -119,11 +125,16 @@ class ReplyPublisher:
                 self._hold(task_id, reason)
                 return {"state": "preflight_blocked", "task_id": task_id,
                         "attempted": False, "reason_code": reason}
-            text = decision.get("text")
-            if not isinstance(text, str) or not text.strip():
+            checked_text = decision.get("text")
+            if not isinstance(checked_text, str) or not checked_text.strip():
                 self._hold(task_id, "reply_content_invalid")
                 return {"state": "preflight_blocked", "task_id": task_id,
                         "attempted": False, "reason_code": "reply_content_invalid"}
+            if self.require_exact_text and checked_text != text:
+                self._hold(task_id, "reply_content_changed_after_freeze")
+                return {"state": "preflight_blocked", "task_id": task_id,
+                        "attempted": False, "reason_code": "reply_content_changed_after_freeze"}
+            text = checked_text
         if target["source_mode"] != "live_ui" or not self._authorized():
             self._hold(task_id, "public_send_not_authorized")
             return {"state": "preflight_blocked", "task_id": task_id, "attempted": False,

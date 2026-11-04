@@ -143,6 +143,19 @@ def test_temp_ledgers_success_creates_first_ready_only_and_preserves_all_old_rec
     assert draft.counts['fetch']==2
 
 
+def test_owner_rejects_reviewed_candidate_that_would_change_during_final_validation(draft):
+    draft.bundle['proposal']['text'] = '首先，' + draft.bundle['proposal']['text']
+    original = deepcopy(draft.bundle)
+    before_budget = draft.c.c.budget.path.read_bytes()
+    with pytest.raises(QueryDraftOwnerError, match='candidate_changed'):
+        draft.finalize()
+    assert draft.bundle == original and draft.counts['fetch'] == 1
+    assert draft.events == ['identity']
+    assert draft.c.c.budget.path.read_bytes() == before_budget
+    assert draft.task['state'] == 'needs_review' and draft.state['desired_state'] == 'paused'
+    unchanged(draft)
+
+
 @pytest.mark.parametrize('change',['pid','running','worker','manual','publication','publication_empty',
     'publication_attempts','publication_attempts_bool','kind','reason','permission','stop'])
 def test_owner_scope_and_current_permission_refusals_never_read_or_commit(draft,change):

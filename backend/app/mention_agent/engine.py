@@ -17,7 +17,8 @@ from typing import Callable
 from .contracts import Binding, canonical_json, parse_tool_arguments, validate_envelope
 from .answer_requirements import (AnswerRequirementError, QUOTE_CODES, parse_answer_requirements,
     tools_for_requirements, requirement_instruction, quote_error_hint, validate_quotes)
-from app.assistant.reply_style import normalize_reply_prefix, reply_body_budget
+from app.assistant.reply_style import normalize_reply_prefix, reply_body_budget, style_reply_text
+from app.assistant.reply_humanize import prepare_public_body
 
 
 MAX_REPLY_SOURCES = 8  # Existing retrieval and product task-source bound.
@@ -408,7 +409,12 @@ class AgentEngine:
         if requirement is not None and requirement.issue:
             if not scope_active():
                 return Decision(review_code='binding_changed')
-            proposal={'kind':'clarification','text':requirement.clarification(),'source_ids':[],'sources':[]}
+            try:
+                body = prepare_public_body(requirement.clarification(), 'clarification',
+                    prefix=self.reply_prefix, maximum=self.public_reply_chars)
+            except ValueError:
+                return Decision(review_code='invalid_public_reply')
+            proposal={'kind':'clarification','text':body,'source_ids':[],'sources':[]}
             record('decision',{'status':'answer_ready','kind':'clarification','source_count':0})
             return Decision(proposal)
 
@@ -565,6 +571,8 @@ class AgentEngine:
                                         or not isinstance(proposal.get('text'),str) or not proposal['text'].strip()
                                         or len(proposal['text'])>self.max_reply_chars):
                                     raise ValueError('invalid_import_status')
+                                proposal = {**proposal, 'text': prepare_public_body(proposal['text'], 'import_status',
+                                    prefix=self.reply_prefix, maximum=self.public_reply_chars)}
                         elif name == "get_import_status":
                             parse_tool_arguments(raw, set(), set())
                             result = self.ingestion.get_import_status()
@@ -576,6 +584,8 @@ class AgentEngine:
                                     or not isinstance(proposal.get("text"), str)
                                     or not proposal["text"].strip() or len(proposal["text"]) > self.max_reply_chars):
                                 raise ValueError("invalid_import_status")
+                            proposal = {**proposal, 'text': prepare_public_body(proposal['text'], 'import_status',
+                                prefix=self.reply_prefix, maximum=self.public_reply_chars)}
                             result = {"status": "import_status_proposed", "import_state": proposal["import_state"]}
                     elif name == "propose_reply":
                         allowed={'text','source_ids'} | ({'evidence_quotes'} if requirement is not None else set())
@@ -595,13 +605,21 @@ class AgentEngine:
                             raise ValueError("undeclared_source_reference")
                         text = self._public_text(re.sub(r"\[来源\s*[:：][^\]]*\]", "", text),
                             maximum=reply_text_limit, check_write_claims=False)
+                        text = self._public_text(prepare_public_body(text, 'answer', prefix=self.reply_prefix,
+                            maximum=reply_text_limit + len(self.reply_prefix)),
+                            maximum=reply_text_limit, check_write_claims=False)
+                        final_text = style_reply_text(text, self.reply_prefix,
+                            maximum=reply_text_limit + len(self.reply_prefix))
+                        mentioned = {"资料" + number for number in re.findall(r"资料\s*(\d+)", unicodedata.normalize("NFKC", final_text))}
+                        if not mentioned.issubset(set(ids)):
+                            raise ValueError("undeclared_source_reference")
                         if requirement is not None:
-                            validated_quotes=validate_quotes(requirement,args.get('evidence_quotes'),text,ids,provided_texts,
+                            validated_quotes=validate_quotes(requirement,args.get('evidence_quotes'),final_text,ids,provided_texts,
                                 non_evidence_labels=(library['name'],*self.allowed_library_names))
                         attributed_spans = []
-                        literal_support = _literal_quote_support(text, ids, provided_texts,
+                        literal_support = _literal_quote_support(final_text, ids, provided_texts,
                             labels=(library['name'], *self.allowed_library_names), attributed_spans=attributed_spans)
-                        self._check_write_claims(text, attributed_spans)
+                        self._check_write_claims(final_text, attributed_spans)
                         if len(text) > self.max_reply_chars:
                             raise ValueError("reply_too_long")
                         proposal = {"text": text, "source_ids": ids, "kind": "answer",
@@ -631,11 +649,16 @@ class AgentEngine:
                             texts['quote_requirement_unmet']=requirement.clarification()
                         if code not in texts:
                             raise ValueError("invalid_clarification_reason")
-                        proposal = {"text": texts[code], "source_ids": [], "kind": "clarification", "sources": []}
+                        body = prepare_public_body(texts[code], 'clarification',
+                            prefix=self.reply_prefix, maximum=self.public_reply_chars)
+                        proposal = {"text": body, "source_ids": [], "kind": "clarification", "sources": []}
                         result = {"status": "clarification_proposed", "reason_code": code}
                     else:
                         raise ValueError("tool_not_allowed")
                 except (ValueError, TypeError, KeyError) as error:
+                    # A rejected tool result must never leave its provisional
+                    # import draft available to the successful-decision path.
+                    proposal = None
                     # Fixed codes only: no raw provider/DB errors or credentials.
                     code = error.code if isinstance(error,AnswerRequirementError) else str(error) if str(error) in {
                         "library_not_allowed", "invalid_question", "invalid_evidence_scope", "invalid_evidence",

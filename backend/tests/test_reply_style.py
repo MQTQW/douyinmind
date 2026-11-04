@@ -150,14 +150,19 @@ def test_import_completion_uses_frozen_style_without_model_or_post_replay(tmp_pa
                 indexed_content_chunks=2 if state=='succeeded' else 0)
     backend=Pending(); model=Model([('save_current_video',{'knowledge_base_id':7})])
     e,r,m,q,h,bridge,runtime = bridge_case(tmp_path,backend=backend,model=model)
+    library_name=r.get_grant(m['grant_id'])['name']
     receive(q,h,r,{**e,'comment_text':'@助手 存到编程库'})
     waiting=runtime.execute_once(); assert waiting['state']=='waiting_ingestion'
-    assert waiting['details']['reply_text'].startswith('少爷，') and '已加入' not in waiting['details']['reply_text']
+    assert waiting['import_state']=='processing'
+    assert waiting['details']['reply_text']=='少爷，还在入库，好了我再回你。'
     r.set_reply_prefix(m['user_id'],'大人，'); backend.done=True
     now=time.time(); monkeypatch.setattr('app.assistant.queue.time.time',lambda:now+20)
     ready=runtime.poll_waiting_once()
     assert ready['details']['reply_text'].startswith('少爷，') and not ready['details']['reply_text'].startswith('大人，')
-    assert ('已加入' in ready['details']['reply_text']) is (terminal=='succeeded')
+    assert ready['import_state']==terminal
+    expected=(f'存好啦，在「{library_name}」里，想问啥直接问我就行。' if terminal=='succeeded'
+              else '这次没存成，记录我先留着了。')
+    assert ready['details']['reply_text']=='少爷，'+expected
     assert backend.posts==1 and model.count==1
     assert runtime.publish_once()['state']=='b_view_visible'
     assert runtime.publish_once() is None
@@ -177,7 +182,32 @@ def test_choice_ask_is_styled_before_hash_and_ignores_later_preference_changes(t
     current=bridge.choices.store.get_for_root_task(task['id'])
     assert current['ask_ref']==original['ask_ref'] and current['ask_text']==original['ask_text']
     reply=bridge.agent.get_reply(ready['agent_task_id'])
+    assert reply['text']==original['ask_text']
     assert reply['evidence']['reply_sha256']==sha256(original['ask_text'].encode()).hexdigest()
+
+
+def test_long_structured_menu_preserves_frozen_names_and_exact_public_body(tmp_path):
+    e,r,m,q,h,bridge,runtime = bridge_case(tmp_path,choice=True)
+    r.set_local_owner_access(m['user_id'],m['device_id'],query_all_local=True,catalog_read_allowed=True,
+        public_reply_allowed=True,grant_current_libraries=True,verified_by='synthetic-owner')
+    # These authorized display names contain answer-formatting markers and
+    # exceed the ordinary 150-character answer budget when combined.
+    names = ['首先_Git#' + '编程' * 32, '最后_复习#' + '笔记' * 32]
+    original_catalog = r.catalog_reader
+    r.catalog_reader = lambda: [{'id':7,'name':names[0]}, {'id':8,'name':names[1]}]
+    try:
+        task=receive(q,h,r,{**e,'comment_text':'@助手 请保存这个视频。'})
+        ready=runtime.execute_once()
+        session=bridge.choices.store.get_for_root_task(task['id'])
+        assert session is not None and 150 < len(session['ask_text']) <= 280
+        assert all(name in session['ask_text'] for name in names)
+        assert runtime.publish_once()['state']=='waiting_library'
+        reply=bridge.agent.get_reply(ready['agent_task_id'])
+        assert reply['text']==session['ask_text']
+        assert reply['evidence']['reply_sha256']==sha256(session['ask_text'].encode()).hexdigest()
+        assert runtime.publish_once() is None
+    finally:
+        r.catalog_reader = original_catalog
 
 
 def test_legacy_choice_and_draft_do_not_gain_new_prefix_or_new_hash(tmp_path):

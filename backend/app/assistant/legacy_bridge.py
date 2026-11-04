@@ -25,7 +25,7 @@ from app.mention_agent.store import AgentStoreError
 from .backend_knowledge import BackendKnowledgeTools
 from .commands import CommandResolver
 from .conversation import ConversationStore
-from .reply_humanize import humanize_reply
+from .reply_humanize import CHOICE_MAX_CHARS, prepare_public_body, validate_frozen_reply
 
 
 _FOLLOWUP_ANCHOR_COUNT_KEYS = frozenset({'user_count', 'device_count', 'root_task_count', 'origin_count'})
@@ -834,6 +834,12 @@ class LegacyBridge:
                 from .choice_intent import choice_prompt
                 clarification = choice_prompt(resolution.choice_options, catalog_count=resolution.catalog_count,
                                                catalog_scope=resolution.catalog_scope)
+            if choice is None:
+                try:
+                    clarification = prepare_public_body(clarification, 'clarification',
+                        prefix=reply_prefix, maximum=320)
+                except ValueError:
+                    return {'state':'needs_review','reason_code':'reply_content_invalid'}
             self.agent.put_binding(binding.to_dict())
             old = self.agent.enqueue(binding.binding_id,task['envelope'])
             receipt = self._semantic_receipt(task)
@@ -943,7 +949,8 @@ class LegacyBridge:
                     grant = self.registry.get_grant(task['authorization']['grant_id'])
                     if grant is None or not self._authorized(task):
                         raise ValueError('binding_changed')
-                    self.agent.refresh_unsent_import_reply(old['task_id'],import_status_proposal(observed,grant['name']))
+                    self.agent.refresh_unsent_import_reply(old['task_id'],import_status_proposal(observed,grant['name'],
+                        reply_prefix=self.agent.reply_prefix('agent:' + old['task_id']) or ''))
             except (ValueError,AgentStoreError):
                 result = self._snapshot(task)
                 if result['state'] not in {'b_view_visible','delivery_unknown','verification_required','failed_no_submit'}:
@@ -1293,11 +1300,17 @@ class LegacyBridge:
             return result
         if self.choices is not None and not self.choices.before_publish(task):
             return self._snapshot(task)
+        choice_menu = (self.choices is not None
+                       and self.choices.store.get_for_root_task(task['id']) is not None)
         binding = self._binding(task)
         outcome = ReplyPublisher(self.agent,binding,self.adapter,self.agent_path.parent/'reply-evidence',
             should_stop=self.should_stop,scope_authorizer=lambda current:current==binding and self._authorized(task),
             publication_allowed=lambda:self.control.snapshot().get('desired_state')=='running',
-            content_gate=lambda text,kind:humanize_reply(text,kind)
+            # Menu text is already frozen into ask_ref and selection evidence.
+            # Preserve its names, original ordinals and complete body exactly.
+            content_gate=lambda text,kind:validate_frozen_reply(text,kind,
+                maximum=CHOICE_MAX_CHARS if choice_menu else 320),
+            require_exact_text=True,
             ).publish(result['agent_task_id'])
         if self.choices is not None:
             self.choices.after_publish(task, outcome)

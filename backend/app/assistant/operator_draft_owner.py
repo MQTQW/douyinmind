@@ -184,6 +184,8 @@ def finalize_query_draft(bridge, task_id, *, expected_candidate_sha256, reverify
             raise QueryDraftOwnerError('operator_query_draft_scope_changed')
         proposal = validate_operator_proposal(bundle['proposal'], evidence, prefix, maximum,
             comment_text=task['envelope']['comment_text'], library_name=resolution.library['name'])
+        if proposal != bundle['proposal']:
+            raise QueryDraftOwnerError('operator_query_draft_candidate_changed')
         budget_hash = _budget(bridge, task, snapshot)
         ui_hash = _fresh_ui(bridge, task, binding)
         reverify_identity()

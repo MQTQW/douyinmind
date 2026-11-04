@@ -1735,8 +1735,9 @@ class AgentStore:
         """Replace an unsent processing receipt after trusted backend reconciliation.
 
         This program-only operation neither claims model work nor requeues a
-        submission. It archives every old receipt and can never reopen a reply
-        with a send reservation, uncertain delivery, or a quarantined draft.
+        submission. Only a state transition archives and replaces a receipt;
+        an unchanged state preserves its existing body. It can never reopen a
+        reply with a send reservation, uncertain delivery, or quarantine.
         """
         proposal = _proposal(proposal)
         if proposal["kind"] != "import_status":
@@ -1755,11 +1756,15 @@ class AgentStore:
                     or previous["import_job_id"] != proposal["import_job_id"]):
                 raise AgentStoreError("import_proposal_job_mismatch")
             self._checked_import_proposal(db, task_id, proposal)
-            proposal = self._styled_proposal(proposal, self._reply_prefix(db, 'agent:' + task_id) or '')
-            if previous == proposal:
+            if previous['import_state'] == proposal['import_state']:
                 return self._reply(reply)
             if previous["import_state"] in {"succeeded", "failed", "failed_no_submit", "needs_review"}:
                 raise AgentStoreError("import_receipt_terminal")
+            from app.assistant.reply_humanize import prepare_public_body
+            prefix = self._reply_prefix(db, 'agent:' + task_id) or ''
+            proposal = {**proposal, 'text': prepare_public_body(
+                proposal['text'], 'import_status', prefix=prefix, maximum=320)}
+            proposal = self._styled_proposal(proposal, prefix)
             db.execute("""CREATE TABLE IF NOT EXISTS agent_import_reply_updates(
               update_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,observed_state TEXT NOT NULL,
               updated_at REAL NOT NULL,reply_snapshot TEXT NOT NULL)""")

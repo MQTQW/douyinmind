@@ -1901,11 +1901,25 @@ class NativeLane:
         if getattr(self,'clarification_coordinator',None) is not None:
             self.clarification_coordinator.admitted(tasks)
 
+    def _recover_clarifications(self, tasks=None):
+        """An optional session ledger cannot disable unrelated native intake."""
+        coordinator=getattr(self,'clarification_coordinator',None)
+        if coordinator is None:return None
+        try:
+            return (coordinator.reconcile_existing() if tasks is None
+                    else coordinator.recover_links(tasks))
+        except ReceiverInterventionRequired:
+            raise
+        except Exception:
+            # Keep the coordinator installed: its authority checks still deny
+            # affected replies. Never bypass owner/shared Source/Queue errors.
+            self.last_clarification_recovery_diagnostic={'code':'clarification_recovery_unavailable'}
+            return None
+
     def recover(self):
         """Only observe existing immutable Queue rows; never re-enqueue a plan."""
         self._owner()
-        if getattr(self,'clarification_coordinator',None) is not None:
-            self.clarification_coordinator.reconcile_existing()
+        self._recover_clarifications()
         recovered = 0
         plans = self.source_store.recoverable_ui_plans()
         if not isinstance(plans, list) or len(plans) > 100:
@@ -1941,8 +1955,7 @@ class NativeLane:
             elif env.get('evidence', {}).get('source_kind') == 'library_choice_reply':
                 self._hold(claim, 'native_plan_conflict'); continue
             self.source_store.finish_ui_admission(claim['source_id'], claim['claim_token'], task['id'], env['reference_id'])
-            if getattr(self,'clarification_coordinator',None) is not None:
-                self.clarification_coordinator.recover_links([task])
+            self._recover_clarifications([task])
             recovered += 1
         return recovered
 

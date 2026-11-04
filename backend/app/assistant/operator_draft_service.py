@@ -21,7 +21,8 @@ from app.mention_agent.knowledge import LocalKnowledgeTools
 from app.mention_agent.store import AgentStore
 from app.storage_guard import verified_readonly_connection
 from .backend_knowledge import decode_json
-from .reply_style import normalize_reply_prefix, reply_body_budget
+from .reply_humanize import prepare_public_body
+from .reply_style import normalize_reply_prefix, reply_body_budget, style_reply_text
 
 TASK = re.compile(r'[a-f0-9]{32}\Z')
 SHA = re.compile(r'[a-f0-9]{64}\Z')
@@ -117,20 +118,31 @@ def validate_operator_proposal(proposal, evidence, prefix, effective_max_chars, 
             raise ValueError()
         text = validator._public_text(re.sub(r'\[来源\s*[:：][^\]]*\]', '', text),
             maximum=effective_max_chars, check_write_claims=False)
+        # Prepare before registering/hashing the candidate. The owner repeats
+        # these checks against the final body, never rewrites a reviewed draft.
+        text = prepare_public_body(text, 'answer', prefix=prefix,
+            maximum=effective_max_chars + len(prefix))
+        text = validator._public_text(text, maximum=effective_max_chars, check_write_claims=False)
+        final_text = style_reply_text(text, prefix, maximum=effective_max_chars + len(prefix))
+        final_text = AgentEngine(None, None)._public_text(final_text, maximum=effective_max_chars + len(prefix),
+            check_write_claims=False)
+        mentioned = {'资料' + number for number in re.findall(r'资料\s*(\d+)', unicodedata.normalize('NFKC', final_text))}
+        if not mentioned <= set(ids):
+            raise ValueError()
         provided = {key: [by_id[key]['text']] for key in ids}
         labels = (library_name,) if library_name else ()
         if requirement is not None:
             quotes = []
-            for match in _PUBLIC_QUOTATIONS.finditer(text):
+            for match in _PUBLIC_QUOTATIONS.finditer(final_text):
                 excerpt = next(value for value in match.groups() if value is not None)
                 normalized = ' '.join(excerpt.split())
                 matches = [key for key in ids if normalized and normalized in ' '.join(by_id[key]['text'].split())]
                 if matches and len(''.join(excerpt.split())) >= 6 and sum(c.isalnum() for c in excerpt) >= 4:
                     quotes.append({'source_id': matches[0], 'excerpt': excerpt})
-            validate_quotes(requirement, quotes, text, ids, provided, non_evidence_labels=labels)
+            validate_quotes(requirement, quotes, final_text, ids, provided, non_evidence_labels=labels)
         spans = []
-        _literal_quote_support(text, ids, provided, labels=labels, attributed_spans=spans)
-        validator._check_write_claims(text, spans)
+        _literal_quote_support(final_text, ids, provided, labels=labels, attributed_spans=spans)
+        validator._check_write_claims(final_text, spans)
         return {'kind': 'answer', 'text': text, 'source_ids': list(ids), 'sources': sources}
     except Exception:
         raise OperatorDraftError('operator_draft_reply_invalid', 422) from None

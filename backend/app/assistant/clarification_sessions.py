@@ -331,10 +331,24 @@ class ClarificationSessionStore:
         with self._db(write=True) as db:
             self._require_enabled(db)
             row = db.execute('SELECT * FROM clarification_sessions WHERE session_id=?', (session_id,)).fetchone()
-            if (row is None or row['response_source_id'] != source_id or row['queue_item'] is None
-                    or immutable_envelope(json.loads(row['queue_item'])['envelope']) != immutable_envelope(task['envelope'])):
+            if row is None:
                 raise ClarificationError('clarification_handoff_changed')
-            if row['child_task_id'] not in (None, task['id']): raise ClarificationError('clarification_handoff_conflict')
-            db.execute("UPDATE clarification_sessions SET state='handed_off',child_task_id=?,revision=revision+1,updated_at=? WHERE session_id=? AND child_task_id IS NULL",
-                (task['id'], self.clock(), session_id))
+            current = self._view(row)
+            if (current['response_source_id'] != source_id or current['queue_item'] is None
+                    or immutable_envelope(current['queue_item']['envelope']) != immutable_envelope(task['envelope'])):
+                raise ClarificationError('clarification_handoff_changed')
+            if current['child_task_id'] not in (None, task['id']):
+                raise ClarificationError('clarification_handoff_conflict')
+            if current['state'] == 'handed_off':
+                if current['child_task_id'] != task['id']:
+                    raise ClarificationError('clarification_handoff_conflict')
+                return current
+            if current['state'] != 'planned':
+                raise ClarificationError('clarification_handoff_not_ready')
+            if current['child_task_id'] is not None:
+                raise ClarificationError('clarification_handoff_conflict')
+            updated = db.execute("UPDATE clarification_sessions SET state='handed_off',child_task_id=?,revision=revision+1,updated_at=? WHERE session_id=? AND state='planned' AND child_task_id IS NULL AND revision=?",
+                (task['id'], self.clock(), session_id, current['revision']))
+            if updated.rowcount != 1:
+                raise ClarificationError('clarification_handoff_conflict')
             return self._view(db.execute('SELECT * FROM clarification_sessions WHERE session_id=?', (session_id,)).fetchone())

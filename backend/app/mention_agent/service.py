@@ -176,6 +176,8 @@ class AgentService:
                     from .imports import ImportTools
                     factory = ImportTools
                 import_options = {"should_stop": self.import_should_stop or (lambda: False)}
+                if self.reply_prefix:
+                    import_options['reply_prefix'] = self.reply_prefix
                 if self.explicit_save_check is not None:
                     import_options["explicit_save_check"] = self.explicit_save_check
                 if self.import_wait_seconds is not None:

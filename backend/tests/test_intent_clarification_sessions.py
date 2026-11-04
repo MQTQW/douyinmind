@@ -119,3 +119,96 @@ def test_new_typed_evidence_is_not_a_real_mention_or_query_only_followup(tmp_pat
     with pytest.raises(ValueError):validate_envelope(altered,c.binding)
     altered=deepcopy(env);altered['evidence']['allowed_actions'].append('delete')
     with pytest.raises(ValueError):validate_envelope(altered,c.binding)
+
+
+def planned_handoff(tmp_path):
+    c=sample(tmp_path)
+    env=response(c);source_id='native:'+'c'*64
+    c.store.claim_response(c.session['session_id'],source_id,env)
+    item={'envelope':env,'kind':'save','binding':c.binding.to_dict()}
+    decision={'plan_id':'semantic-'+'e'*64,'action':'save','target_state':'one','grant_id':'synthetic-grant'}
+    planned=c.store.plan(c.session['session_id'],source_id,env,decision,item)
+    return c,source_id,{'id':'4'*32,'envelope':deepcopy(env)},planned
+
+
+@pytest.mark.parametrize('state',[
+    'needs_review','cancelled','held','responding','awaiting_reply','awaiting_publication','unexpected_state',
+])
+def test_first_handoff_never_reopens_a_nonplanned_session_without_a_child(tmp_path,state):
+    c,source_id,task,planned=planned_handoff(tmp_path)
+    # Retain a valid source, physical reply proof and frozen queue plan. The
+    # state gate itself must stop a review/hold from acquiring a child link.
+    with c.store._db(write=True) as db:
+        db.execute('UPDATE clarification_sessions SET state=?,reason_code=? WHERE session_id=?',
+                   (state,'synthetic_existing_hold',planned['session_id']))
+    before=c.store.get(planned['session_id']);raw=c.store.path.read_bytes()
+    assert before['child_task_id'] is None
+    with pytest.raises(ClarificationError,match='clarification_handoff_not_ready'):
+        c.store.admitted(planned['session_id'],source_id,task)
+    assert c.store.get(planned['session_id'])==before
+    assert c.store.path.read_bytes()==raw
+
+
+def test_same_handed_off_child_is_a_read_only_idempotent_link(tmp_path):
+    c,source_id,task,planned=planned_handoff(tmp_path)
+    linked=c.store.admitted(planned['session_id'],source_id,task)
+    assert linked['state']=='handed_off' and linked['child_task_id']==task['id']
+    assert linked['revision']==planned['revision']+1
+    before=c.store.path.read_bytes();c.clock[0]+=100
+    replay=deepcopy(task)
+    replay['envelope']['evidence']['observed_at_utc']=datetime.now(timezone.utc).isoformat()
+    assert c.store.admitted(planned['session_id'],source_id,replay)==linked
+    assert c.store.path.read_bytes()==before
+
+
+@pytest.mark.parametrize('change',['child','source','body','proof'])
+def test_handed_off_idempotency_never_accepts_a_different_child_source_or_reply(tmp_path,change):
+    c,source_id,task,planned=planned_handoff(tmp_path)
+    linked=c.store.admitted(planned['session_id'],source_id,task)
+    changed=deepcopy(task)
+    if change=='child':changed['id']='5'*32
+    elif change=='source':source_id='native:'+'f'*64
+    elif change=='body':changed['envelope']['comment_text']='changed synthetic response'
+    else:changed['envelope']['evidence']['prior_reply_sha256']='0'*64
+    before=c.store.path.read_bytes()
+    with pytest.raises(ClarificationError,match='clarification_handoff_(conflict|changed)'):
+        c.store.admitted(planned['session_id'],source_id,changed)
+    assert c.store.get(planned['session_id'])==linked
+    assert c.store.path.read_bytes()==before
+
+
+def test_handed_off_state_without_a_child_cannot_create_a_new_link(tmp_path):
+    c,source_id,task,planned=planned_handoff(tmp_path)
+    with c.store._db(write=True) as db:
+        db.execute("UPDATE clarification_sessions SET state='handed_off' WHERE session_id=?",
+                   (planned['session_id'],))
+    before=c.store.get(planned['session_id']);raw=c.store.path.read_bytes()
+    with pytest.raises(ClarificationError,match='clarification_handoff_conflict'):
+        c.store.admitted(planned['session_id'],source_id,task)
+    assert c.store.get(planned['session_id'])==before
+    assert c.store.path.read_bytes()==raw
+
+
+@pytest.mark.parametrize('already_linked',[False,True])
+def test_disabled_feature_cannot_create_or_recover_a_handoff_link(tmp_path,already_linked):
+    c,source_id,task,planned=planned_handoff(tmp_path)
+    if already_linked:c.store.admitted(planned['session_id'],source_id,task)
+    c.store.set_enabled(False)
+    before=c.store.get(planned['session_id']);raw=c.store.path.read_bytes()
+    with pytest.raises(ClarificationError,match='clarification_feature_disabled'):
+        c.store.admitted(planned['session_id'],source_id,task)
+    assert c.store.enabled is False and c.store.get(planned['session_id'])==before
+    assert c.store.path.read_bytes()==raw
+
+
+@pytest.mark.parametrize('already_linked',[False,True])
+def test_handoff_still_rejects_an_altered_immutable_root(tmp_path,already_linked):
+    c,source_id,task,planned=planned_handoff(tmp_path)
+    if already_linked:c.store.admitted(planned['session_id'],source_id,task)
+    with c.store._db(write=True) as db:
+        db.execute('UPDATE clarification_sessions SET immutable_hash=? WHERE session_id=?',
+                   ('0'*64,planned['session_id']))
+    before=c.store.path.read_bytes()
+    with pytest.raises(ClarificationError,match='clarification_immutable_root_changed'):
+        c.store.admitted(planned['session_id'],source_id,task)
+    assert c.store.path.read_bytes()==before

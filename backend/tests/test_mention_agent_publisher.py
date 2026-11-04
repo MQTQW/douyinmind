@@ -6,6 +6,7 @@ the business knowledge database. A fake click is only an in-memory counter.
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timezone
+import hashlib
 import json
 import sqlite3
 from threading import Barrier
@@ -348,3 +349,97 @@ def test_concurrent_publishers_get_only_one_successful_reservation_and_click(mak
     assert sum(outcome["state"] == "b_view_visible" for outcome in outcomes) == 1
     assert first.clicks + second.clicks == first.gates + second.gates == 1
     assert context.store.get_reply(context.task_id)["state"] == "b_view_visible"
+
+
+def test_frozen_reply_rejects_a_gate_rewrite_before_any_browser_or_reservation(make_context):
+    context = make_context()
+    original = deepcopy(context.reply)
+    checked = []
+
+    def remove_source_label(text, kind):
+        checked.append((text, kind))
+        return {"allowed": True, "text": text.replace("\n[来源：资料1]", ""), "reason": None}
+
+    publisher = ReplyPublisher(context.store, context.binding, context.adapter, context.root / "evidence",
+                               content_gate=remove_source_label, require_exact_text=True)
+    result = publisher.publish(context.task_id)
+    assert result["state"] == "preflight_blocked"
+    assert result["reason_code"] == "reply_content_changed_after_freeze"
+    assert checked == [(original["text"], original["kind"])]
+    held = context.store.get_reply(context.task_id)
+    assert held["text"] == original["text"] and held["target"] == original["target"]
+    assert held["send_token"] is None and context.store.get_task(context.task_id)["state"] == "needs_review"
+    assert context.adapter.prepares == context.adapter.submit_entries == context.adapter.gates == context.adapter.clicks == 0
+
+
+def test_unchanged_frozen_reply_is_the_exact_submitted_and_hashed_body(make_context):
+    context = make_context()
+    original = deepcopy(context.reply)
+    checked = []
+
+    def approve_unchanged(text, kind):
+        checked.append((text, kind))
+        return {"allowed": True, "text": text, "reason": None}
+
+    publisher = ReplyPublisher(context.store, context.binding, context.adapter, context.root / "evidence",
+                               content_gate=approve_unchanged, require_exact_text=True)
+    assert publisher.publish(context.task_id)["state"] == "b_view_visible"
+    saved = context.store.get_reply(context.task_id)
+    assert checked == [(original["text"], original["kind"])]
+    assert context.adapter.observed_text == saved["text"] == original["text"]
+    assert saved["target"] == original["target"]
+    assert saved["evidence"]["reply_sha256"] == hashlib.sha256(original["text"].encode()).hexdigest()
+    assert context.adapter.gates == context.adapter.clicks == 1
+    assert_no_restart_submission(context, 1)
+
+
+@pytest.mark.parametrize("reply_state", ["reserved", "delivery_unknown"])
+def test_frozen_gate_never_rechecks_or_resends_an_existing_reservation(make_context, reply_state):
+    context = make_context()
+    verification = context.adapter.prepare_reply(context.reply["target"], context.reply["text"])
+    reservation = context.store.reserve_send(context.task_id, verification)
+    assert reservation is not None
+    if reply_state == "delivery_unknown":
+        context.store.finish_send(context.task_id, reservation["send_token"], reply_state, {"synthetic": True})
+    before = context.store.get_reply(context.task_id)
+    checked = []
+    adapter = FakeAdapter()
+
+    def approve_unchanged(text, kind):
+        checked.append((text, kind))
+        return {"allowed": True, "text": text, "reason": None}
+
+    publisher = ReplyPublisher(context.store, context.binding, adapter, context.root / "evidence",
+                               content_gate=approve_unchanged, require_exact_text=True)
+    assert publisher.publish(context.task_id)["state"] == "not_sendable"
+    assert checked == [] and context.store.get_reply(context.task_id) == before
+    assert adapter.prepares == adapter.submit_entries == adapter.gates == adapter.clicks == 0
+
+
+def test_frozen_reply_still_obeys_the_content_gate_before_reserving(make_context):
+    from app.assistant.reply_humanize import humanize_reply
+
+    context = make_context()
+    task = context.store.enqueue(context.binding.binding_id, envelope_value(
+        command_id="unsafe-frozen-command", reference_id="unsafe-frozen-reference"))
+    claim = context.store.claim(task["task_id"])
+    original = context.store.complete(task["task_id"], claim["claim_token"], {
+        **proposal_value(), "text": "资料在 https://example.invalid/private-notes 。"})
+    publisher = ReplyPublisher(context.store, context.binding, context.adapter, context.root / "evidence",
+                               content_gate=humanize_reply, require_exact_text=True)
+    result = publisher.publish(task["task_id"])
+    assert result["state"] == "preflight_blocked" and result["reason_code"] == "reply_content_link"
+    held = context.store.get_reply(task["task_id"])
+    assert held["text"] == original["text"] and held["target"] == original["target"]
+    assert held["send_token"] is None
+    assert context.adapter.prepares == context.adapter.submit_entries == context.adapter.gates == context.adapter.clicks == 0
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true"])
+def test_frozen_reply_policy_requires_an_explicit_boolean(make_context, value):
+    context = make_context()
+    with pytest.raises(ValueError):
+        ReplyPublisher(context.store, context.binding, context.adapter, context.root / "evidence",
+                       require_exact_text=value)
+    assert context.store.get_reply(context.task_id) == context.reply
+    assert context.adapter.prepares == context.adapter.submit_entries == context.adapter.gates == context.adapter.clicks == 0

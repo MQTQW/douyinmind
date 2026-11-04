@@ -9,7 +9,7 @@ import pytest
 
 from app.assistant.operator_draft_service import (OperatorDraftService, OperatorDraftError,
     operator_snapshot_digest, existing_agent_readonly, fetch_operator_draft_bundle, validate_operator_proposal)
-from app.mention_agent.contracts import Binding
+from app.mention_agent.contracts import Binding, canonical_json
 from tests.test_operator_query_draft_store import eligible, QUEUE_ID
 
 
@@ -94,6 +94,68 @@ def test_readonly_exact_evidence_and_immutable_first_candidate_do_not_change_led
     assert path.read_bytes() == original
     assert c.store.path.read_bytes() == before and c.task == queue_before
     assert c.store.get_reply(c.task_id) is None
+
+
+def test_candidate_hash_binds_prepared_body_and_original_request_without_ledger_effects(tmp_path):
+    c = case(tmp_path)
+    before = c.store.path.read_bytes()
+    body = request(c.service.evidence(QUEUE_ID), text='首先，原文介绍资料整理的方法。[来源：资料1]')
+    result = c.service.register(QUEUE_ID, body)
+    assert result['proposal']['text'] == '原文介绍资料整理的方法。'
+    assert result['proposal']['sources'][0]['text_sha256'] == hashlib.sha256(c.docs[0]['text'].encode()).hexdigest()
+    path = c.service.directory / (QUEUE_ID + '.json')
+    candidate = json.loads(path.read_text(encoding='utf-8'))
+    assert candidate['request'] == body and candidate['proposal'] == result['proposal']
+    assert result['candidate_sha256'] == hashlib.sha256(canonical_json(candidate).encode()).hexdigest()
+    original = path.read_bytes()
+    assert c.service.bundle(QUEUE_ID) == result
+    assert path.read_bytes() == original and c.store.path.read_bytes() == before
+    assert c.store.get_reply(c.task_id) is None
+
+
+def test_old_candidate_requiring_preparation_is_rejected_without_rewriting_it(tmp_path, monkeypatch):
+    c = case(tmp_path)
+    before = c.store.path.read_bytes()
+    body = request(c.service.evidence(QUEUE_ID), text='首先，原文介绍资料整理的方法。')
+    # Simulate a candidate registered before presentation preparation existed.
+    with monkeypatch.context() as old_policy:
+        old_policy.setattr('app.assistant.operator_draft_service.prepare_public_body',
+            lambda text, *args, **kwargs: text)
+        result = c.service.register(QUEUE_ID, body)
+    assert result['proposal']['text'] == body['text']
+    path = c.service.directory / (QUEUE_ID + '.json')
+    original = path.read_bytes()
+    with pytest.raises(OperatorDraftError, match='candidate_invalid'):
+        c.service.bundle(QUEUE_ID)
+    assert path.read_bytes() == original and c.store.path.read_bytes() == before
+    assert c.store.get_reply(c.task_id) is None
+
+
+@pytest.mark.parametrize('prepared', [
+    '资料2介绍了资料整理的方法。',
+    '原文说：“这里是从未提供过的完整原文句子。”',
+    '这个视频已经保存成功。',
+])
+def test_final_prepared_body_still_requires_declared_sources_quotes_and_truthful_effects(tmp_path, monkeypatch, prepared):
+    c = case(tmp_path)
+    before = c.store.path.read_bytes()
+    monkeypatch.setattr('app.assistant.operator_draft_service.prepare_public_body',
+        lambda text, *args, **kwargs: prepared)
+    with pytest.raises(OperatorDraftError, match='reply_invalid'):
+        c.service.register(QUEUE_ID, request(c.service.evidence(QUEUE_ID)))
+    assert not c.service.directory.exists() and c.store.path.read_bytes() == before
+    assert c.store.get_reply(c.task_id) is None
+
+
+@pytest.mark.parametrize('prefix', ['我已保存，', '资料2，'])
+def test_prepared_body_cannot_gain_an_unverified_write_claim_or_source_from_its_prefix(tmp_path, prefix):
+    c = case(tmp_path)
+    evidence = c.service.evidence(QUEUE_ID)['evidence']
+    proposal = {'kind': 'answer', 'text': '原文介绍资料整理的方法。', 'source_ids': ['资料1'],
+        'sources': [{key: evidence[0][key] for key in
+            ('source_id', 'platform_item_id', 'chunk_id', 'title', 'url', 'text_sha256')}]}
+    with pytest.raises(OperatorDraftError, match='reply_invalid'):
+        validate_operator_proposal(proposal, evidence, prefix, 320 - len(prefix))
 
 
 @pytest.mark.parametrize('change', ['publication', 'queue_state', 'authorization', 'membership', 'receiver', 'owner', 'style', 'other_video'])
@@ -278,21 +340,44 @@ def test_transport_is_fixed_proxyless_bounded_no_redirect_and_one_attempt(monkey
 
 
 def test_owner_and_server_share_pure_quote_source_and_public_text_validation():
-    text = '先检查土壤是否已经湿润。如果盆土已经干燥，再用清水缓慢浇灌。'
+    text = '首先，检查土壤是否已经湿润。如果盆土已经干燥，再用清水缓慢浇灌。'
     item = {'source_id': '资料1', 'platform_item_id': '7999999000000000011', 'chunk_id': 'synthetic:1',
         'title': '合成资料', 'url': 'https://www.douyin.com/video/7999999000000000011',
         'text': text, 'text_sha256': hashlib.sha256(text.encode()).hexdigest()}
     source = {key: value for key, value in item.items() if key != 'text'}
-    proposal = {'kind': 'answer', 'text': '1.“先检查土壤是否已经湿润。”；2.“如果盆土已经干燥，再用清水缓慢浇灌。”',
+    proposal = {'kind': 'answer', 'text': '1.“首先，检查土壤是否已经湿润。”；2.“如果盆土已经干燥，再用清水缓慢浇灌。”',
         'source_ids': ['资料1'], 'sources': [source]}
     options = {'comment_text': '给出两条原文依据', 'library_name': '合成库'}
-    assert validate_operator_proposal(proposal, [item], '少爷，', 277, **options) == proposal
+    prepared = validate_operator_proposal(proposal, [item], '少爷，', 277, **options)
+    assert prepared['sources'] == proposal['sources'] and prepared['source_ids'] == proposal['source_ids']
+    assert '“首先，检查土壤是否已经湿润。”' in prepared['text']
+    assert '“如果盆土已经干燥，再用清水缓慢浇灌。”' in prepared['text']
+    assert validate_operator_proposal(prepared, [item], '少爷，', 277, **options) == prepared
     with pytest.raises(OperatorDraftError):
         validate_operator_proposal({**proposal, 'text': '只有概括并没有原文摘录。'}, [item], '少爷，', 277, **options)
     with pytest.raises(OperatorDraftError):
         validate_operator_proposal(proposal, [item], '少爷，', 317, **options)
     with pytest.raises(OperatorDraftError):
         validate_operator_proposal(proposal, [{**item, 'text': text + '已变动'}], '少爷，', 277, **options)
+
+
+@pytest.mark.parametrize('comment,body_budget', [('', 317), ('给出两条原文依据', 277)])
+def test_preparation_preserves_existing_operator_budget_including_prefix_without_truncation(comment, body_budget):
+    first = '原文第一段提供完整的合成依据。'
+    second = '原文第二段提供另一个不同的合成依据。'
+    text = first + second
+    item = {'source_id': '资料1', 'platform_item_id': '7999999000000000011', 'chunk_id': 'synthetic:1',
+        'title': '合成资料', 'url': 'https://www.douyin.com/video/7999999000000000011',
+        'text': text, 'text_sha256': hashlib.sha256(text.encode()).hexdigest()}
+    source = {key: value for key, value in item.items() if key != 'text'}
+    quoted = f'“{first}”“{second}”'
+    body = quoted + '文' * (body_budget - len(quoted))
+    proposal = {'kind': 'answer', 'text': body, 'source_ids': ['资料1'], 'sources': [source]}
+    prepared = validate_operator_proposal(proposal, [item], '少爷，', body_budget, comment_text=comment)
+    assert prepared == proposal and len('少爷，' + prepared['text']) == body_budget + 3
+    with pytest.raises(OperatorDraftError, match='reply_invalid'):
+        validate_operator_proposal({**proposal, 'text': body + '文'}, [item], '少爷，', body_budget,
+            comment_text=comment)
 
 
 def test_route_paths_local_json_and_duplicate_key_guards_without_event_loop(monkeypatch):

@@ -25,6 +25,7 @@ from .choice_intent import (choice_prompt, selection_forms, parse_library_select
 from .commands import CommandResolver, Resolution, library_forms
 from .library_choice import LibraryChoiceError
 from .reply_style import reply_body_budget, style_reply_text
+from .reply_humanize import CHOICE_MAX_CHARS
 
 
 def _digest(value):
@@ -100,8 +101,8 @@ class ChoiceController:
     @staticmethod
     def _menu(resolution, reply_prefix=''):
         body = choice_prompt(resolution.choice_options,catalog_count=resolution.catalog_count,
-            catalog_scope=resolution.catalog_scope,max_chars=reply_body_budget(280, reply_prefix))
-        return style_reply_text(body, reply_prefix, maximum=280)
+            catalog_scope=resolution.catalog_scope,max_chars=reply_body_budget(CHOICE_MAX_CHARS, reply_prefix))
+        return style_reply_text(body, reply_prefix, maximum=CHOICE_MAX_CHARS)
 
     @staticmethod
     def _ask_ref(task,resolution,ask_text):

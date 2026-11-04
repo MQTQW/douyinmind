@@ -8,6 +8,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, ProxyHandler, HTTPRedirectHandler, build_opener
 
 from .contracts import Binding
+from app.assistant.reply_humanize import prepare_public_body
 
 
 def is_save_command(text: str, library_name: str) -> bool:
@@ -24,8 +25,8 @@ def is_save_command(text: str, library_name: str) -> bool:
     return re.fullmatch(command + marker + r'[。！!\s]*', text) is not None
 
 
-def import_status_proposal(job, library_name):
-    """Render only a reconciled receipt; this helper cannot submit or publish."""
+def import_status_proposal(job, library_name, *, reply_prefix='', maximum=320):
+    """Render a reconciled receipt body with room for its frozen prefix."""
     state = job["state"]
     if state == "succeeded":
         text = f"存好啦，在「{library_name}」里，想问啥直接问我就行。"
@@ -37,6 +38,7 @@ def import_status_proposal(job, library_name):
         text = "这次没存成，记录我先留着了。"
     else:
         text = "刚才没确认成功，我先不重复提交。"
+    text = prepare_public_body(text, 'import_status', prefix=reply_prefix, maximum=maximum)
     return {"kind": "import_status", "text": text, "source_ids": [], "sources": [],
             "import_job_id": job["job_id"], "import_state": state}
 
@@ -85,9 +87,10 @@ class ImportTools:
 
     def __init__(self, store, binding: Binding, task_id, claim_token, envelope, library_name,
                  *, should_stop=None, client=None, wait_seconds=None, sleep=None, video_title=None,
-                 explicit_save_check=None, scope_authorizer=None):
+                 explicit_save_check=None, scope_authorizer=None, reply_prefix='', max_reply_chars=320):
         self.store, self.binding, self.task_id, self.claim_token = store, binding, task_id, claim_token
         self.envelope, self.library_name = envelope, library_name
+        self.reply_prefix, self.max_reply_chars = reply_prefix, max_reply_chars
         self.video_title = video_title.strip()[:512] if isinstance(video_title, str) else ""
         self.should_stop = should_stop or (lambda: False)
         self.client = client or BackendImportClient()
@@ -232,4 +235,5 @@ class ImportTools:
             if not self.confirmed_succeeded:
                 raise ValueError("import_status_unverified")
             state = job["state"]
-        return import_status_proposal(job, self.library_name)
+        return import_status_proposal(job, self.library_name,
+                                      reply_prefix=self.reply_prefix, maximum=self.max_reply_chars)

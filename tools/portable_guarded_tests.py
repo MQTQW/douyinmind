@@ -173,10 +173,24 @@ class Guard:
 
     def deny(self, event, arguments=()):
         self.denials.append(event)
-        if event.startswith("ctypes."):
-            self.denial_details.append({"event": event, "arguments": repr(arguments),
-                "stack": [{"file": frame.filename, "line": frame.lineno, "function": frame.name}
-                          for frame in traceback.extract_stack(limit=12)]})
+        if len(self.denial_details) < 64:
+            # Do not use linecache/traceback extraction inside the audit hook:
+            # reading source lines can cause another denied filesystem event.
+            frame, stack = sys._getframe(1), []
+            while frame is not None and len(stack) < 12:
+                stack.append({"file": frame.f_code.co_filename, "line": frame.f_lineno,
+                              "function": frame.f_code.co_name})
+                frame = frame.f_back
+            detail = {"event": event, "stack": stack}
+            if event in {"file_read", "file_write"} and len(arguments) == 3:
+                path, mode, flags = arguments
+                if type(path) is str:
+                    detail["path"] = path[:2048]
+                if mode is None or type(mode) is str:
+                    detail["mode"] = mode
+                if type(flags) is int:
+                    detail["flags"] = flags
+            self.denial_details.append(detail)
         raise PermissionError("isolated_guard_denied:" + event)
 
     def allowed_source(self, path, directory=False):
@@ -230,7 +244,7 @@ class Guard:
             write |= bool(isinstance(flags, int) and flags & (
                 os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC))
             if not self.allowed(path, write):
-                self.deny("file_write" if write else "file_read")
+                self.deny("file_write" if write else "file_read", args)
         if event in {
             "os.mkdir", "os.rmdir", "os.remove", "os.unlink", "os.chmod", "os.chown",
             "os.truncate", "os.utime", "shutil.rmtree",
