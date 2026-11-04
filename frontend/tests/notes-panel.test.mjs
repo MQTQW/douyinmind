@@ -25,7 +25,7 @@ const changed=(a,b)=>!a||!b||b.some((v,i)=>!Object.is(v,a[i]));
 export function useState(value,label){const h=current();h.cursor++;if(!(label in h.state))h.state[label]=typeof value==='function'?value():value;return[h.state[label],next=>{h.state[label]=typeof next==='function'?next(h.state[label]):next}];}
 export function useRef(value){const h=current(),i=h.cursor++;return h.slots[i]??={current:value};}
 export function useCallback(callback,deps){const h=current(),i=h.cursor++,old=h.slots[i];if(!old||changed(old.deps,deps))h.slots[i]={deps,callback};return h.slots[i].callback;}
-export function useEffect(effect,deps){const h=current(),i=h.cursor++,old=h.slots[i];if(changed(old?.deps,deps)){h.slots[i]={deps,cleanup:old?.cleanup};h.effects.push(()=>{h.slots[i].cleanup?.();h.slots[i].cleanup=effect()})}}
+export function useEffect(effect,deps){const h=current(),i=h.cursor++,old=h.slots[i];if(changed(old?.deps,deps)){h.slots[i]={deps,effect,cleanup:old?.cleanup};h.effects.push(()=>{h.slots[i].cleanup?.();h.slots[i].cleanup=effect()})}}
 `);
 const fakeAPI = asURL(`
 export {AiNotesError,aiNotesSupported,aiNoteDownloadURL,aiNotesFailureMessage} from '${apiURL}';
@@ -93,10 +93,14 @@ function harness(options = {}) {
     setInterval(callback) { const id = h.timers.size + 1; h.timers.set(id, callback); return id; }, clearInterval(id) { h.timers.delete(id); } };
     globalThis.document = { body: {}, visibilityState: 'visible', activeElement: null, getElementById: () => null };
   };
-  const props = { video: { platform_item_id: VIDEO, title: '整理笔记的方法（合成验证）' }, onClose: () => h.closed++ };
+  const props = { video: { platform_item_id: options.videoId || VIDEO, title: '整理笔记的方法（合成验证）' }, onClose: () => h.closed++ };
   h.render = () => { activate(); h.cursor = 0; return NotesPanel(props); };
   h.flush = async () => { activate(); h.effects.splice(0).forEach(effect => effect()); await settle(); };
   h.mount = async () => { for (let i = 0; i < 3; i++) { h.render(); await h.flush(); } return h.render(); };
+  h.strictReplayEffects = async () => {
+    activate(); const effects=h.slots.filter(slot=>slot?.effect);
+    effects.forEach(slot=>slot.cleanup?.());effects.forEach(slot=>{slot.cleanup=slot.effect()});await settle();
+  };
   h.open = async label => { button(h.render(), label || '生成并保存笔记').props.onClick(); h.render(); await h.flush(); return h.render(); };
   h.submit = async () => { button(h.render(), '确认并生成').props.onClick(); await settle(); return h.render(); };
   h.dispose = () => { activate(); h.slots.forEach(slot => slot?.cleanup?.()); };
@@ -108,6 +112,30 @@ test('old or unreadable backend has explicit update guidance and no legacy paid 
   assert.match(text(h.render()), /更新后台/); assert.doesNotMatch(text(h.render()), new RegExp(PRIVATE));
   assert.equal(h.lists.length, 0); assert.equal(h.posts.length, 0);
   assert.ok(links(h.render()).every(link => !link.props.href.includes('mode=ai'))); h.dispose();
+});
+test('StrictMode effect replay starts a fresh read and an obsolete finally cannot release the newer read', async () => {
+  const h=harness(),first=deferred(),second=deferred(),listing=deferred();let caps=0,lists=0;
+  h.api.capability=()=> (++caps===1?first:second).promise;
+  h.api.list=()=>{lists++;return listing.promise};
+  h.render();await h.flush();assert.equal(caps,1);
+  await h.strictReplayEffects();assert.equal(caps,2);
+  second.resolve(CAP);await settle();h.render();assert.equal(lists,1);
+  first.resolve({...CAP,version:0});await settle();
+  // A queued stale refresh handler must not start a third read while the
+  // replacement epoch still owns its list request.
+  button(h.render(),'正在读取…').props.onClick();await settle();assert.equal(caps,2);
+  listing.resolve({success:true,source:SOURCE,items:[],current_note:null,total:0});await settle();
+  assert.equal(button(h.render(),'生成并保存笔记').props.disabled,false);
+  assert.equal(h.state.capability.version,1);assert.equal(h.state.loading,false);
+  assert.equal(h.posts.length,0);assert.equal(h.uuids,0);h.dispose();
+});
+test('a late read for an unmounted video cannot enter a newly mounted video view', async () => {
+  const old=harness(),late=deferred();old.api.list=()=>late.promise;
+  old.render();await old.flush();old.dispose();
+  const fresh=harness({videoId:'another-synthetic-video'});await fresh.mount();
+  late.resolve({success:true,source:{...SOURCE,char_count:99999},items:[item()],current_note:null,total:1});await settle();
+  assert.equal(old.state.source,null);assert.equal(fresh.state.source.char_count,SOURCE.char_count);
+  assert.deepEqual(fresh.state.items,[]);assert.equal(fresh.posts.length,0);fresh.dispose();
 });
 
 test('scope and fees are confirmed before UUID creation or POST; cancelling or a stale cancelled handler cannot submit', async () => {

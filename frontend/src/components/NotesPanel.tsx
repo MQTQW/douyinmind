@@ -81,7 +81,7 @@ export default function NotesPanel({ video, onClose, onStateChanged }: Props) {
   const [storageBlocked, setStorageBlocked] = useState(initial.current.blocked);
   const [busy, setBusy] = useState(false);
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
-  const alive = useRef(false), loadingRef = useRef(false), busyRef = useRef(false), checkingRef = useRef(false);
+  const alive = useRef(false), loadingRef = useRef<number | null>(null), busyRef = useRef(false), checkingRef = useRef(false);
   const sequence = useRef(0), offset = useRef(0), title = useRef<HTMLHeadingElement>(null);
   const dialog = useRef<HTMLElement>(null), cancel = useRef<HTMLButtonElement>(null);
   const stateChanged = useRef(onStateChanged); stateChanged.current = onStateChanged;
@@ -121,9 +121,9 @@ export default function NotesPanel({ video, onClose, onStateChanged }: Props) {
   }, [applyItem, id]);
 
   const load = useCallback(async (more = false) => {
-    if (loadingRef.current) return;
-    loadingRef.current = true;
+    if (loadingRef.current !== null) return;
     const token = ++sequence.current;
+    loadingRef.current = token;
     setLoading(true); setLoadError('');
     try {
       let cap = current.current.capability;
@@ -150,7 +150,7 @@ export default function NotesPanel({ video, onClose, onStateChanged }: Props) {
     } catch {
       if (alive.current && sequence.current === token) setLoadError('笔记记录暂时无法读取，已显示的记录会保留。请重新读取；当前未生成新笔记。');
     } finally {
-      loadingRef.current = false;
+      if (loadingRef.current === token) loadingRef.current = null;
       if (alive.current && sequence.current === token) setLoading(false);
     }
   }, [id]);
@@ -166,7 +166,7 @@ export default function NotesPanel({ video, onClose, onStateChanged }: Props) {
       setIntent(state.items.find(item => item.videoId === id)?.requestId ?? null);
     };
     window.addEventListener('storage', storageChanged);
-    return () => { alive.current = false; sequence.current++; window.removeEventListener('storage', storageChanged); };
+    return () => { alive.current = false; sequence.current++; loadingRef.current = null; window.removeEventListener('storage', storageChanged); };
   }, [id, load]);
 
   const pollingId = intent || items.find(item => ['queued', 'running'].includes(item.state))?.request_id;
@@ -203,7 +203,7 @@ export default function NotesPanel({ video, onClose, onStateChanged }: Props) {
 
   const prepare = (recovery?: api.AiNoteRequest) => {
     const state = current.current;
-    if (!alive.current || busyRef.current || loadingRef.current || state.storageBlocked || !api.aiNotesSupported(state.capability)
+    if (!alive.current || busyRef.current || loadingRef.current !== null || state.storageBlocked || !api.aiNotesSupported(state.capability)
         || !state.capability?.ready || state.source?.status !== 'ready'
         || !/^[a-f\d]{64}$/i.test(state.source.fingerprint || '')
         || !number(state.source.expected_call_count) || state.source.expected_call_count < 1
