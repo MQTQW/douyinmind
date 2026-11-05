@@ -142,12 +142,12 @@ def test_unfavorite_sync_preserves_named_library_transcript(context):
     service.assign_videos(db, base_id, ["ready"])
     db.commit()
     favorites = FavoritesService()
-    snapshot = FavoriteScrapeSnapshot(collections=[FavoriteScrapedCollection("original", "收藏", 0)])
+    snapshot = FavoriteScrapeSnapshot(collections=[FavoriteScrapedCollection("original", "收藏", 0)], complete=True)
     collections = favorites._sync_collections(db, snapshot)
     favorites._sync_videos_and_cache(db, snapshot, collections)
     db.commit()
     assert db.scalars(select(FavoriteVideo)).all() == []
-    assert db.scalar(select(VideoCache).where(VideoCache.platform_item_id == "pending")) is None
+    assert db.scalar(select(VideoCache).where(VideoCache.platform_item_id == "pending")).status == "pending"
     saved = db.scalar(select(VideoCache).where(VideoCache.platform_item_id == "ready"))
     assert saved.status == "done" and saved.transcript_text == "保留全部原话"
     videos, total = service.list_videos(db, base_id)

@@ -38,6 +38,8 @@ jobs:
           package-manager-cache: false
       - run: npm ci
       - run: npm test
+      - name: Collector pagination safety with synthetic pages
+        run: node --test ../backend/tests/favorites_collector_pagination.test.mjs
       - run: npm run build
 
   backend:
@@ -144,7 +146,10 @@ jobs:
             'tests/test_ingestion_maintenance.py',
             'tests/test_knowledge_base_deletion.py',
             'tests/test_maintenance_api.py',
-            'tests/test_notes_api.py'
+            'tests/test_notes_api.py',
+            'tests/test_favorites_snapshot_safety.py',
+            'tests/test_knowledge_bases.py',
+            'tests/test_knowledge_base_integration.py'
           )
           & $backendPython @runnerArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

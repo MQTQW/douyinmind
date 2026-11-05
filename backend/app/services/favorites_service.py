@@ -4,17 +4,17 @@
 负责将从抖音抓取的快照数据与本地数据库进行差异对齐：
 - 新增收藏夹 / 标记已删除的收藏夹为失效
 - 新增视频 / 删除不再存在的视频关联
-- 同步更新 VideoCache 表（增删视频时保持一致）
+- 为新收藏建立 pending 缓存；本地识别资料只通过显式删除流程移除
 """
 from __future__ import annotations
 
 import logging
 from collections import OrderedDict
 
-from sqlalchemy import delete, desc, func, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
-from app.models.entities import FavoriteCollection, FavoriteVideo, KnowledgeBaseVideo, VideoCache
+from app.models.entities import FavoriteCollection, FavoriteVideo, VideoCache
 from app.services.douyin_collector import (
     FavoriteScrapeSnapshot,
     collector,
@@ -25,6 +25,12 @@ logger = logging.getLogger(__name__)
 # 虚拟收藏夹 ID，表示"全部收藏"
 ALL_COLLECTION_ID = "all"
 ALL_COLLECTION_TITLE = "全部收藏"
+
+
+def _require_complete_snapshot(snapshot: FavoriteScrapeSnapshot) -> None:
+    # Old/in-memory objects without the new marker are unknown, not empty.
+    if getattr(snapshot, "complete", False) is not True:
+        raise RuntimeError("收藏夹快照尚未完整确认，未同步或移除已有记录；请重新登录并等待收藏抓取完成。")
 
 
 class FavoritesService:
@@ -53,6 +59,7 @@ class FavoritesService:
         snapshot = await collector.fetch_snapshot(
             max_collections=100, max_videos_per_collection=500
         )
+        _require_complete_snapshot(snapshot)
 
         collections_by_platform = self._sync_collections(db, snapshot)
         added, removed = self._sync_videos_and_cache(
@@ -103,6 +110,7 @@ class FavoritesService:
         :param snapshot: 抖音抓取快照
         :return: {platform_collection_id: FavoriteCollection} 映射
         """
+        _require_complete_snapshot(snapshot)
         existing = (
             db.execute(select(FavoriteCollection)).scalars().all()
         )
@@ -150,13 +158,14 @@ class FavoritesService:
 
         1. 构建"期望状态"：(collection_id, platform_item_id) → 视频数据
         2. 对比现有数据，执行新增/更新/删除
-        3. 同步更新 VideoCache（新增 pending 记录、删除孤儿记录）
+        3. 为新收藏建立 pending 缓存，保留所有已保存的本地资料
 
         :param db: 数据库会话
         :param snapshot: 抖音抓取快照
         :param collections_by_platform: 收藏夹映射
         :return: (新增视频数, 删除视频数)
         """
+        _require_complete_snapshot(snapshot)
         # 构建期望的关联关系和视频数据
         desired_pairs: dict[tuple[int, str], dict] = {}
         desired_video_payload: dict[str, dict] = {}
@@ -238,11 +247,9 @@ class FavoritesService:
             row.is_active = True
 
         # 删除不再存在的关联
-        removed_ids: set[str] = set()
         for key, row in existing_map.items():
             if key in desired_pairs:
                 continue
-            removed_ids.add(row.platform_item_id)
             db.delete(row)
 
         # 同步 VideoCache 表
@@ -266,29 +273,9 @@ class FavoritesService:
 
         db.flush()
 
-        # 删除孤儿的 VideoCache 记录（视频已不在任何收藏夹中）
-        if removed_ids:
-            still_used = {
-                row[0]
-                for row in db.execute(
-                    select(FavoriteVideo.platform_item_id).where(
-                        FavoriteVideo.platform_item_id.in_(removed_ids)
-                    )
-                ).all()
-            }
-            # Removing a Douyin favorite must not erase material in a named library.
-            saved_in_library = set(db.scalars(
-                select(KnowledgeBaseVideo.platform_item_id).where(
-                    KnowledgeBaseVideo.platform_item_id.in_(removed_ids)
-                )
-            ).all())
-            orphan_ids = sorted(removed_ids - still_used - saved_in_library)
-            if orphan_ids:
-                db.execute(
-                    delete(VideoCache).where(
-                        VideoCache.platform_item_id.in_(orphan_ids)
-                    )
-                )
+        # A removed favorite is remote metadata, never deletion permission for
+        # local transcripts, notes, vectors or media (including pending rows).
+        # Only the explicit material-deletion workflow coordinates those stores.
 
         removed_count = len(existing_video_ids - desired_video_ids)
         return len(added_video_ids), removed_count

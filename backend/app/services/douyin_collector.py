@@ -61,6 +61,9 @@ class FavoriteScrapedVideo:
 class FavoriteScrapeSnapshot:
     collections: list[FavoriteScrapedCollection] = field(default_factory=list)
     videos: list[FavoriteScrapedVideo] = field(default_factory=list)
+    # Only a fully validated, explicitly terminated traversal may align removals.
+    # Older snapshots without proof of completion must not erase local metadata.
+    complete: bool = False
 
 
 class DouyinCollector:
@@ -244,19 +247,39 @@ class DouyinCollector:
                 if (typeof listFn !== "function" || typeof videoFn !== "function")
                     return {ok:false, error:"bad_exports", keys:Object.keys(api||{}).slice(0,20)};
 
-                // 拉收藏夹列表
+                const incomplete = error => ({ok:false, complete:false, error});
+                const more = value => value === true || value === 1 ? true :
+                    value === false || value === 0 ? false : null;
+                const nextCursor = (value, current, seen) => {
+                    if ((typeof value !== 'number' && typeof value !== 'string') ||
+                        String(value).trim() === '') return null;
+                    const next = Number(value);
+                    if (!Number.isSafeInteger(next) || next < 0 || next === current || seen.has(next)) return null;
+                    return next;
+                };
+
+                // A partial page, unknown termination or cap is not an empty
+                // remote collection. Refuse the whole snapshot before syncing.
                 const collections = [];
                 let cursor = 0, guard = 0;
-                while (guard < 30 && collections.length < 100) {
+                const collectionIds = new Set(), collectionCursors = new Set([0]);
+                while (true) {
+                    if (guard >= 30) return incomplete('collection_page_limit');
                     guard++;
                     const r = await listFn({cursor, offset:30});
-                    if (!r || r.statusCode !== 0) {
-                        return {ok:false, error:"list_status", statusCode:r?.statusCode, msg:r?.statusMsg};
+                    if (guard >= 30) return incomplete('collection_page_limit');
+                    if (!r || r.statusCode !== 0) return incomplete('list_status');
+                    if (!Array.isArray(r.data) || more(r.hasMore) === null) return incomplete('list_page_invalid');
+                    for (const c of r.data) {
+                        const id = c && String(c.collectionFolderId ?? '').trim();
+                        if (!id || collectionIds.has(id)) return incomplete('collection_identity_invalid');
+                        collectionIds.add(id); collections.push(c);
                     }
-                    for (const c of (Array.isArray(r.data) ? r.data : []))
-                        if (c && c.collectionFolderId) collections.push(c);
-                    cursor = Number(r.cursor || 0);
-                    if (!r.hasMore) break;
+                    if (collections.length >= 100) return incomplete('collection_limit');
+                    if (!more(r.hasMore)) break;
+                    const next = nextCursor(r.cursor, cursor, collectionCursors);
+                    if (next === null || !r.data.length) return incomplete('collection_cursor_invalid');
+                    cursor = next; collectionCursors.add(cursor);
                 }
 
                 // 拉每个收藏夹的视频
@@ -265,14 +288,18 @@ class DouyinCollector:
                     const cid = String(c.collectionFolderId);
                     const rows = [];
                     const seen = new Set();
+                    const videoCursors = new Set([0]);
                     let cCur = 0, cG = 0;
-                    while (cG < 120 && rows.length < 500) {
+                    while (true) {
+                        if (cG >= 120) return incomplete('video_page_limit');
                         cG++;
                         const vr = await videoFn({collectsId:cid, cursor:cCur, offset:20});
-                        if (!vr || vr.statusCode !== 0) break;
-                        for (const v of (Array.isArray(vr.data) ? vr.data : [])) {
+                        if (cG >= 120) return incomplete('video_page_limit');
+                        if (!vr || vr.statusCode !== 0) return incomplete('video_status');
+                        if (!Array.isArray(vr.data) || more(vr.hasMore) === null) return incomplete('video_page_invalid');
+                        for (const v of vr.data) {
                             const vid = String(v?.awemeId || v?.groupId || "").trim();
-                            if (!vid || seen.has(vid)) continue;
+                            if (!/^[0-9]+$/.test(vid) || seen.has(vid)) return incomplete('video_identity_invalid');
                             seen.add(vid);
                             rows.push({
                                 awemeId:vid,
@@ -281,38 +308,50 @@ class DouyinCollector:
                                 durationMs:Number(v?.video?.duration||0)
                             });
                         }
-                        cCur = Number(vr.cursor || 0);
-                        if (!vr.hasMore) break;
+                        if (rows.length >= 500) return incomplete('video_limit');
+                        if (!more(vr.hasMore)) break;
+                        const next = nextCursor(vr.cursor, cCur, videoCursors);
+                        if (next === null || !vr.data.length) return incomplete('video_cursor_invalid');
+                        cCur = next; videoCursors.add(cCur);
                     }
                     byCol[cid] = rows;
                 }
-                return {ok:true, collections, itemsByCollection:byCol};
+                return {ok:true, complete:true, collections, itemsByCollection:byCol};
             }
         """)
 
-        if not isinstance(result, dict) or not result.get("ok"):
+        if not isinstance(result, dict) or result.get("ok") is not True or result.get("complete") is not True:
             error = result.get("error", "unknown") if isinstance(result, dict) else str(result)
-            raise RuntimeError(f"Webpack 模块调用失败: {error}")
+            raise RuntimeError(f"收藏夹抓取尚未完整完成（{error}），未生成可同步快照，已有资料保留。")
+
+        if not isinstance(result.get("collections"), list) or not isinstance(result.get("itemsByCollection"), dict):
+            raise RuntimeError("收藏夹快照结构不完整，已有资料保留，请重新登录后再同步。")
 
         # 解析结果
         collections: list[FavoriteScrapedCollection] = []
         videos_by_id: dict[str, FavoriteScrapedVideo] = {}
 
         for col in (result.get("collections") or []):
+            if not isinstance(col, dict):
+                raise RuntimeError("收藏夹快照编号不完整，未同步已有记录。")
             cid = str(col.get("collectionFolderId") or "").strip()
             if not cid:
-                continue
+                raise RuntimeError("收藏夹快照编号不完整，未同步已有记录。")
             collections.append(FavoriteScrapedCollection(
                 platform_collection_id=cid,
                 title=str(col.get("collectionFolderName") or "收藏夹")[:255],
                 video_count=max(int(col.get("videoTotal") or 0), 0),
                 cover_url=col.get("cover"),
             ))
-            rows = (result.get("itemsByCollection") or {}).get(cid, [])
-            for row in (rows or []):
+            rows = result["itemsByCollection"].get(cid)
+            if not isinstance(rows, list):
+                raise RuntimeError("收藏夹视频快照不完整，未同步已有记录。")
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise RuntimeError("收藏夹视频编号不完整，未同步已有记录。")
                 aid = str(row.get("awemeId") or "").strip()
                 if not aid or not aid.isdigit():
-                    continue
+                    raise RuntimeError("收藏夹视频编号不完整，未同步已有记录。")
                 if aid not in videos_by_id:
                     videos_by_id[aid] = FavoriteScrapedVideo(
                         platform_item_id=aid,
@@ -326,6 +365,7 @@ class DouyinCollector:
         return FavoriteScrapeSnapshot(
             collections=collections,
             videos=list(videos_by_id.values()),
+            complete=True,
         )
 
     @staticmethod
@@ -350,6 +390,8 @@ class DouyinCollector:
         """返回登录时已抓取的快照，如果不存在则报错"""
         if self._snapshot is None:
             raise RuntimeError("尚未登录或登录时未成功抓取，请先扫码登录")
+        if getattr(self._snapshot, "complete", False) is not True:
+            raise RuntimeError("收藏夹快照尚未完整确认，未同步已有记录；请重新登录并等待抓取完成。")
         return self._snapshot
 
     # ------------------------------------------------------------------
