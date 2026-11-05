@@ -55,18 +55,19 @@ def test_explicit_visibility_hint_request_is_once_and_never_an_effect(tmp_path):
     assert box.process_one(lambda *_:pytest.fail('replay')) is None
 
 
-def test_original_source_inspection_only_queues_fixed_owner_read(tmp_path):
+@pytest.mark.parametrize('operation',['inspect_original_source','inspect_thread_followup'])
+def test_original_source_inspection_only_queues_fixed_owner_read(tmp_path,operation):
     box,_,_=make(tmp_path)
-    request=box.submit(SOURCE,'inspect_original_source')
+    request=box.submit(SOURCE,operation)
     assert request['status']=='queued' and request['no_model'] and request['no_import'] and request['no_send']
-    assert json.loads(pending(box,request).read_text())['operation']=='inspect_original_source'
+    assert json.loads(pending(box,request).read_text())['operation']==operation
     calls=[]
     def handler(operation,source):
         calls.append((operation,source))
         return {'ok':True,'reviewed':True,'queued_for_fresh_ui':False,'dispatchable':False,
             'matched':True,'private':'DO-NOT-SAVE'}
     result=box.process_one(handler)
-    assert calls==[('inspect_original_source',SOURCE)]
+    assert calls==[(operation,SOURCE)]
     assert result['status']=='done' and result['code']=='native_recovery_inspected'
     assert result['queued_for_fresh_ui'] is False and result['dispatchable'] is False
     assert result['no_model'] and result['no_import'] and result['no_send']

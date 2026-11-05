@@ -10,6 +10,10 @@ import threading
 from .queue import AssistantQueue, QueueError
 
 
+class ReconciliationInterrupted(QueueError):
+    """Current control or page ownership interrupted a read-only snapshot."""
+
+
 class AssistantRuntime:
     def __init__(self, queue: AssistantQueue, control, *, execute=None, publish=None, reconcile=None, intake=None,
                  run_id=None, owner_thread_id=None, resume_adapter=None, retry_adapter=None,
@@ -298,10 +302,18 @@ class AssistantRuntime:
         task = self.queue.claim_waiting()
         if task is None:
             return None
+        if not self._running():
+            return None
         try:
             result = self.reconcile_adapter(task)
+        except ReconciliationInterrupted:
+            return None
         except Exception:
             result = {"state": "waiting_ingestion", "reason_code": "ingestion_status_unavailable"}
+        if not self._running():
+            # The short poll lease expires normally. A stopped observation
+            # cannot replace the durable waiting state with an auth failure.
+            return None
         return self.queue.apply_reconciliation(task["id"], result, poll_token=task["poll_token"])
 
     def process_action_once(self):

@@ -25,6 +25,7 @@ from app.mention_agent.store import AgentStoreError
 from .backend_knowledge import BackendKnowledgeTools
 from .commands import CommandResolver
 from .conversation import ConversationStore
+from .runtime import ReconciliationInterrupted
 from .reply_humanize import CHOICE_MAX_CHARS, prepare_public_body, validate_frozen_reply
 
 
@@ -919,10 +920,16 @@ class LegacyBridge:
         result.setdefault('usage',{})['elapsed_ms'] = elapsed
         return result
 
+    def _snapshot_for_reconciliation(self, task):
+        if self.should_stop():raise ReconciliationInterrupted('reconciliation_control_changed')
+        result = self._snapshot(task)
+        if self.should_stop():raise ReconciliationInterrupted('reconciliation_control_changed')
+        return result
+
     def reconcile(self, task):
         old = self._find(task)
         if old is None or not self._authorized(task):
-            return self._snapshot(task)
+            return self._snapshot_for_reconciliation(task)
         job = self.agent.get_task_ingestion(old['task_id'])
         reply = self.agent.get_reply(old['task_id'])
         processing = None
@@ -932,7 +939,7 @@ class LegacyBridge:
             except Exception:
                 response = None
             if response is None:
-                result = self._snapshot(task)
+                result = self._snapshot_for_reconciliation(task)
                 if (result.get('binding_active') is True and result['state'] not in
                         {'b_view_visible','delivery_unknown','verification_required','failed_no_submit'}):
                     result.update(state='waiting_ingestion',safe_to_publish=False,reason_code='ingestion_status_unavailable')
@@ -954,16 +961,16 @@ class LegacyBridge:
                     self.agent.refresh_unsent_import_reply(old['task_id'],import_status_proposal(observed,grant['name'],
                         reply_prefix=self.agent.reply_prefix('agent:' + old['task_id']) or ''))
             except (ValueError,AgentStoreError):
-                result = self._snapshot(task)
+                result = self._snapshot_for_reconciliation(task)
                 if result['state'] not in {'b_view_visible','delivery_unknown','verification_required','failed_no_submit'}:
                     result.update(state='needs_review',safe_to_publish=False,reason_code='ingestion_receipt_conflict')
                 return result
             except Exception:
-                result = self._snapshot(task)
+                result = self._snapshot_for_reconciliation(task)
                 if result.get('binding_active') is True and result['state'] not in {'b_view_visible','delivery_unknown','verification_required','failed_no_submit'}:
                     result.update(state='waiting_ingestion',safe_to_publish=False,reason_code='ingestion_status_unavailable')
                 return result
-        result = self._snapshot(task)
+        result = self._snapshot_for_reconciliation(task)
         if processing is not None:
             result['details'].setdefault('timings',{})['video_processing'] = processing
         return result

@@ -207,7 +207,7 @@ def test_page_error_exposes_only_fixed_counts_and_reason(monkeypatch):
     assert value.last_original_lookup['final_verified'] == 0
 
 
-@pytest.mark.parametrize('limit', [0, 4, True, None])
+@pytest.mark.parametrize('limit', [0, 13, True, None])
 def test_untrusted_limit_cannot_expand_bounded_lookup(monkeypatch, limit):
     value, page, calls = receiver(monkeypatch, [notice('one')], {'one': detail()})
     with pytest.raises(ValueError): value.open_original_from_notifications(TARGET, max_candidates=limit)

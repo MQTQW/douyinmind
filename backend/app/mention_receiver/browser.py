@@ -917,21 +917,33 @@ class NormalPageReceiver:
 
         try:
             current = snapshot()
-            keys = list(current)
-            frozen_keys = set(keys)
-            matches = []
-            matched_native_ids = {}
-            same_video_keys = []
-            for index, key in enumerate(keys):
-                if index or history_enabled:
-                    current = snapshot(frozen_keys, key)
-                value = inspect(current[key])
-                if value['video_id'] == target['video_id']:
-                    same_video_keys.append(key)
-                if full_match(value):
-                    matches.append(key)
-                    matched_native_ids[key] = value['native_comment_id']
-                    counts['match_count'] = len(matches)
+            for _ in range(2):
+                keys = list(current)
+                frozen_keys = set(keys)
+                matches = []
+                matched_native_ids = {}
+                same_video_keys = []
+                for index, key in enumerate(keys):
+                    if index or history_enabled:
+                        current = snapshot(frozen_keys, key)
+                    value = inspect(current[key])
+                    if value['video_id'] == target['video_id']:
+                        same_video_keys.append(key)
+                    if full_match(value):
+                        matches.append(key)
+                        matched_native_ids[key] = value['native_comment_id']
+                        counts['match_count'] = len(matches)
+                if matches or history_enabled:
+                    break
+                # A recent same-author/body card may belong to another video.
+                # After every visible card was readable but none matched the
+                # frozen target, inspect one bounded history window. Re-read
+                # its complete frozen set and retain all prior visible cards.
+                history_enabled = True
+                current = snapshot()
+                if not frozen_keys.issubset(current):
+                    counts['snapshot_changes'] += 1
+                    reject('original_notification_changed')
             if len(matches) != 1:
                 reject('original_target_not_unique')
             if (native_candidate_correlation and matched_native_ids[matches[0]] is None

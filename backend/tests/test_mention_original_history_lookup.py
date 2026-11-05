@@ -9,6 +9,7 @@ import pytest
 from app.mention_receiver.browser import ReceiverDetailError, ReceiverPageError, ReceiverInterventionRequired
 from app.mention_receiver.browser import NOTICE_HISTORY_CONTAINER_JS, NOTICE_JS
 from tests.test_mention_original_target_lookup import receiver, notice, detail, TARGET, VIDEO
+from tests.test_mention_original_target_lookup import OTHER as OTHER_VIDEO
 
 
 OTHER = lambda key='recent': notice(key, exact_text='@6 another request')
@@ -70,6 +71,130 @@ def test_initial_nonzero_path_never_acquires_or_scrolls_history(monkeypatch):
     page.evaluate_handle=forbidden
     value.open_original_from_notifications(TARGET)
     assert len(calls)==2 and page.actions==[] and 'history_scrolls' not in value.last_original_lookup
+
+
+@pytest.mark.parametrize('observed_id', [None, '7999999000000000033'])
+def test_readable_recent_same_text_wrong_video_does_not_hide_bounded_old_target(monkeypatch, observed_id):
+    native_id = '7999999000000000033'
+    value, page, calls = setup(monkeypatch, [[notice('recent')], [notice('older')]],
+        {'recent': detail(OTHER_VIDEO, native='7999999000000000044'),
+         'older': detail(native=observed_id)})
+    observed = value.open_original_from_notifications({**TARGET, 'native_comment_id': native_id},
+        max_candidates=8, native_candidate_correlation=True)
+    assert observed['video_id'] == VIDEO and observed['native_comment_id'] == observed_id
+    assert observed['native_correlation']['quality'] == ('semantic_only' if observed_id is None else 'native_equal')
+    assert [row['semantic_fingerprint'] for row in calls] == ['recent', 'recent', 'older', 'older']
+    assert value.last_original_lookup['candidate_count'] == 2
+    assert value.last_original_lookup['checked_count'] == 3
+    assert value.last_original_lookup['final_verified'] == 1
+    assert len(calls) <= 2 * 8 + 1 and len(page.navigations) == 5
+    assert all(handle.disposed for handle in page.handles) and page.keys == []
+
+
+def test_visible_wrong_native_id_can_find_exact_older_comment_on_same_video(monkeypatch):
+    native_id = '7999999000000000033'
+    value, page, calls = setup(monkeypatch, [[notice('recent')], [notice('older')]],
+        {'recent': detail(native='7999999000000000044'), 'older': detail(native=native_id)})
+    observed = value.open_original_from_notifications({**TARGET, 'native_comment_id': native_id},
+        native_candidate_correlation=True)
+    assert observed['native_comment_id'] == native_id
+    assert observed['native_correlation']['quality'] == 'native_equal'
+    assert len(calls) == 4 and all(handle.disposed for handle in page.handles) and page.keys == []
+
+
+@pytest.mark.parametrize('semantic_ambiguity', [False, True])
+def test_history_upgrade_preserves_competing_target_and_semantic_ambiguity(monkeypatch, semantic_ambiguity):
+    native_id = '7999999000000000033'
+    value, page, calls = setup(monkeypatch,
+        [[notice('recent')], [notice('one')], [notice('two')]],
+        {'recent': detail(OTHER_VIDEO),
+         'one': detail(native='7999999000000000044' if semantic_ambiguity else native_id),
+         'two': detail(native=None if semantic_ambiguity else native_id)})
+    with pytest.raises(ReceiverDetailError) as error:
+        value.open_original_from_notifications({**TARGET, 'native_comment_id': native_id},
+            native_candidate_correlation=True)
+    expected = 'original_native_semantic_ambiguous' if semantic_ambiguity else 'original_target_not_unique'
+    assert error.value.diagnostics['reason_code'] == expected
+    assert len(calls) == 4 and value.last_original_lookup['final_verified'] == 0
+    assert all(handle.disposed for handle in page.handles) and page.keys == []
+
+
+@pytest.mark.parametrize('unreadable_recent', [False, True])
+def test_history_upgrade_never_skips_an_unreadable_card(monkeypatch, unreadable_recent):
+    def details(row, _count):
+        if row['semantic_fingerprint'] == ('recent' if unreadable_recent else 'older'):
+            raise ReceiverDetailError('synthetic unreadable', {})
+        return detail(OTHER_VIDEO)
+    value, page, calls = setup(monkeypatch, [[notice('recent')], [notice('older')]], details)
+    with pytest.raises(ReceiverDetailError) as error:
+        value.open_original_from_notifications(TARGET)
+    assert error.value.diagnostics['reason_code'] == 'original_candidate_unreadable'
+    assert len(calls) == (1 if unreadable_recent else 3)
+    assert bool(page.handles) is not unreadable_recent
+    assert all(handle.disposed for handle in page.handles) and page.keys == []
+
+
+def test_history_upgrade_rejects_changed_prior_visible_card_before_new_detail(monkeypatch):
+    def pages(n):
+        return [[notice('recent' if n == 1 else 'replacement')], [notice('older')]]
+    value, page, calls = setup(monkeypatch, pages, {'recent': detail(OTHER_VIDEO)})
+    with pytest.raises(ReceiverDetailError) as error:
+        value.open_original_from_notifications(TARGET)
+    assert error.value.diagnostics['reason_code'] == 'original_notification_changed'
+    assert value.last_original_lookup['snapshot_changes'] == 1 and len(calls) == 1
+    assert all(handle.disposed for handle in page.handles) and page.keys == []
+
+
+def test_history_upgrade_rejects_drift_after_freezing_expanded_set(monkeypatch):
+    def pages(n):
+        extra = [notice('new')] if n >= 3 else []
+        return [[notice('recent')], [notice('older')] + extra]
+    value, page, calls = setup(monkeypatch, pages, {'recent': detail(OTHER_VIDEO)})
+    with pytest.raises(ReceiverDetailError) as error:
+        value.open_original_from_notifications(TARGET)
+    assert error.value.diagnostics['reason_code'] == 'original_notification_changed'
+    assert len(calls) == 1 and value.last_original_lookup['snapshot_changes'] == 1
+    assert all(handle.disposed for handle in page.handles) and page.keys == []
+
+
+@pytest.mark.parametrize('limitation', ['no_progress', 'beyond_three_scrolls', 'too_many_candidates', 'unknown_pane'])
+def test_history_upgrade_has_one_bounded_window_and_no_fallback_around_its_limits(monkeypatch, limitation):
+    pages = [[notice('recent')], [notice('older')]]
+    if limitation == 'beyond_three_scrolls':
+        pages = [[notice('recent')]] + [[OTHER(str(index))] for index in range(3)] + [[notice('older')]]
+    elif limitation == 'too_many_candidates':
+        pages = [[notice('recent')]] + [[notice(str(index))] for index in range(3)]
+    value, page, calls = setup(monkeypatch, pages, {'recent': detail(OTHER_VIDEO)})
+    page.no_progress = limitation == 'no_progress'
+    page.unknown_pane = limitation == 'unknown_pane'
+    with pytest.raises(ReceiverDetailError) as error:
+        value.open_original_from_notifications(TARGET)
+    expected = {'no_progress': 'original_target_not_unique', 'beyond_three_scrolls': 'original_target_not_unique',
+        'too_many_candidates': 'original_notification_candidates_exceed_limit',
+        'unknown_pane': 'original_notifications_unavailable'}
+    assert error.value.diagnostics['reason_code'] == expected[limitation]
+    assert all(row['semantic_fingerprint'] == 'recent' for row in calls)
+    assert len(calls) <= 2 and page.actions.count('next') <= 6
+    assert len(page.handles) <= 2 and all(handle.disposed for handle in page.handles) and page.keys == []
+
+
+@pytest.mark.parametrize('intervention', [False, True])
+def test_history_upgrade_checks_stop_and_challenge_during_lazy_loading(monkeypatch, intervention):
+    value, page, calls = setup(monkeypatch, [[notice('recent')], [notice('older')]],
+        {'recent': detail(OTHER_VIDEO)})
+    interrupted = [False]
+    page.wait_for_timeout = lambda _: interrupted.__setitem__(0, True)
+    if intervention:
+        def check():
+            if interrupted[0]:
+                raise ReceiverInterventionRequired('synthetic intervention')
+        monkeypatch.setattr(value, 'check_intervention', check)
+    else:
+        value.choice_should_stop = lambda: interrupted[0]
+    with pytest.raises(ReceiverInterventionRequired if intervention else ReceiverPageError):
+        value.open_original_from_notifications(TARGET)
+    assert len(calls) == 1 and page.actions == ['seek']
+    assert all(handle.disposed for handle in page.handles) and page.keys == []
 
 
 def test_unknown_or_nonunique_pane_never_scrolls_the_whole_document(monkeypatch):

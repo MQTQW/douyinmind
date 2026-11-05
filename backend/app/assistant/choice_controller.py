@@ -140,6 +140,7 @@ class ChoiceController:
         return result
 
     def _hold(self,session,reason='binding_changed'):
+        if self.should_stop():return
         self.last_issue_code=reason
         self.store.hold_waiting(session['choice_id'],reason)
 
@@ -369,7 +370,8 @@ class ChoiceController:
         if session is None:return result
         self.after_publish(task,result)
         session=self.store.get(session['choice_id']);value=deepcopy(result)
-        invalid=session['state'] in {'awaiting_ask','ask_unknown','ask_held','waiting_library','selected','handoff_claimed'} and self._fresh_root(session) is None
+        invalid=(session['state'] in {'awaiting_ask','ask_unknown','ask_held','waiting_library','selected','handoff_claimed'}
+            and not self.should_stop() and self._fresh_root(session) is None and not self.should_stop())
         if invalid:
             self._hold(session);session=self.store.get(session['choice_id'])
             value.update(state='needs_review',reason_code='binding_changed',safe_to_execute=False,safe_to_publish=False)

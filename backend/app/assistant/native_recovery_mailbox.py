@@ -298,7 +298,7 @@ class NativeRecoveryMailbox:
                     else:
                         code = ('assistant_reply_inspected' if value['operation'] == 'inspect_reply' else
                             'native_visibility_recovery_requested' if value['operation'] == 'recover_visibility_hint' else
-                            'native_recovery_inspected' if value['operation'] in {'inspect_visibility_hint','inspect_original_source'} else
+                            'native_recovery_inspected' if value['operation'] in {'inspect_visibility_hint','inspect_original_source','inspect_thread_followup'} else
                             'native_recovery_reviewed' if value['operation'] == 'review_legacy_prequeue' else
                             'operator_query_draft_finalized' if value['operation'] == 'finalize_query_draft' else
                             'native_recovery_resume_requested')
