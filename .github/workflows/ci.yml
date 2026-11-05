@@ -113,6 +113,7 @@ jobs:
             'tests/test_notes_persistence.py',
             'tests/test_notes_deletion_and_worker.py',
             'tests/test_retrieval_pipeline.py',
+            'tests/test_grounded_answers.py',
             'tests/test_persistent_ingestion_jobs.py',
             'tests/test_typed_job_kinds.py',
             'tests/test_worker_shutdown_deadline.py',

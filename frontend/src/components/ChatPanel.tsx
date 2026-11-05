@@ -3,7 +3,7 @@ import * as api from '../api';
 import ExecutionTrace from './ExecutionTrace';
 import MessageContent from './MessageContent';
 import { answerClipboardText, copyText } from '../clipboard';
-import { ArrowUp, BookOpen, Check, Copy, ExternalLink, Sparkles } from 'lucide-react';
+import { ArrowUp, BookOpen, Check, Copy, Sparkles } from 'lucide-react';
 
 interface Props {
   collectionId: string;
@@ -253,22 +253,10 @@ export default function ChatPanel({
                 }`}>
                   {msg.role === 'assistant' && <div className="assistant-label"><span><Sparkles size={15} /></span><strong>DouyinMind</strong></div>}
                   <div className="break-words" aria-live="polite" aria-busy={msg.isStreaming || false}>
-                    {msg.role === 'assistant' && msg.content ? <MessageContent content={msg.content} /> : <span className="whitespace-pre-wrap">{msg.content || (msg.isStreaming ? '正在查找资料并准备回答…' : '')}</span>}
+                    {msg.role === 'assistant' && msg.content ? <MessageContent content={msg.content} sources={msg.sources} trace={msg.trace} /> : <span className="whitespace-pre-wrap">{msg.content || (msg.isStreaming ? '正在查找资料并准备回答…' : '')}</span>}
                     {msg.isStreaming && <span aria-hidden="true" className="inline-block w-1.5 h-4 bg-current ml-0.5 animate-pulse rounded-sm" />}
                   </div>
                   {msg.error && <p role="alert" className="mt-2 text-xs text-red-600">{msg.error}</p>}
-                  {/* Sources */}
-                  {msg.sources && msg.sources.length > 0 && (
-                    <div className="answer-sources">
-                      <span className="w-full text-xs text-[var(--color-ink-muted)]">已引用的视频来源</span>
-                      {msg.sources.map((s, j) => (
-                        <a key={j} href={s.url} target="_blank" rel="noopener noreferrer"
-                          className="answer-source">
-                          <span>{s.title}<small>打开原视频</small></span><ExternalLink size={14} />
-                        </a>
-                      ))}
-                    </div>
-                  )}
                   {msg.trace && <ExecutionTrace trace={msg.trace} latency_ms={msg.latency_ms} />}
                   {msg.role === 'assistant' && msg.content && !msg.isStreaming && <button className="text-button mt-3" type="button" onClick={async () => {
                     setCopyError('');

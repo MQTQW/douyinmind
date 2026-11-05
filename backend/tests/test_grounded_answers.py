@@ -468,7 +468,7 @@ def test_explicit_prose_citations_use_same_whitelist_in_answers_and_history(
     result = finish(service, db, streaming, "这些资料中具体说了什么？", kb_id=kb.id)
     assert {source["platform_item_id"] for source in result["sources"]} == expected_ids
     for item in expected_ids:
-        assert f"《视频{item}》" in result["answer"]
+        assert f"[来源: 视频{item}]" in result["answer"]
     if expected_ids:
         assert "资料1" not in result["answer"] and "资料2" not in result["answer"]
     else:
@@ -482,3 +482,161 @@ def test_explicit_prose_citations_use_same_whitelist_in_answers_and_history(
     restored_assistant = next(message for message in restored if message["role"] == "assistant")
     assert {source["platform_item_id"] for source in restored_assistant["sources"]} == expected_ids
     assert restored_assistant["content"] == result["answer"]
+
+
+@pytest.mark.parametrize("answer", [
+    "资料2讲的是另一种设备，不能把两套参数混在一起。",
+    "另外，资料2介绍了另一种方案。",
+    "资料2描述的是替代流程。",
+    "资料2说明了适用条件。",
+    "资料2指出了配置步骤。",
+    "资料2提到先检查电源。",
+    "资料2记载了备用步骤。",
+    "资料2展示了完整流程。",
+])
+def test_affirmative_numbered_attribution_has_a_normal_marker(rag_module, answer):
+    service = rag_module.RagService()
+    chunks = [hit(item, f"原始正文_{item}。") for item in ['a', 'b']]
+    assert [item['platform_item_id'] for item in service._cited_sources(answer, chunks)] == ['b']
+    normalized = service._ensure_sources(answer, service._source_candidates(chunks))
+    assert '[来源: 视频b]' in normalized
+    assert service._ensure_sources(normalized, service._source_candidates(chunks)) == normalized
+
+
+@pytest.mark.parametrize("answer", [
+    "只是提到资料2，没有声称由它支持答案。",
+    "资料2没有给出答案。",
+    "资料2讲的不是所问的步骤。",
+    "不能只根据资料2判断参数。",
+    "没有证据支持依据资料2得出这个结论。",
+    "如果资料2讲的是甲方案，就需要另查原文。",
+    "假设内容完整，资料2讲的是甲方案。",
+    "用户问题：资料2讲的是哪个方案。",
+    "问题：资料2讲的是哪个方案。",
+    "有人问资料2讲了什么。",
+    "例如：资料2讲的是甲方案。",
+    "资料2讲的是什么？",
+    "资料2讲的是什么",
+    "资料2讲义需要重新排版。",
+    "资料2说明书需要补充内容。",
+    "资料2介绍页尚未发布。",
+    "资料2展示页更新完成。",
+    "资料99讲的是甲方案。",
+    "资料02讲的是甲方案。",
+    "资料2a讲的是甲方案。",
+    "资料2.5讲的是甲方案。",
+])
+def test_mention_question_negation_or_nominal_prefix_does_not_add_sources(rag_module, answer):
+    service = rag_module.RagService()
+    chunks = [hit(item, f"原始正文_{item}。") for item in ['a', 'b']]
+    assert service._cited_sources(answer, chunks) == []
+    assert '[来源: 视频' not in service._ensure_sources(answer, service._source_candidates(chunks))
+
+
+@pytest.mark.parametrize("literal", [
+    '“资料2讲的是示例。”',
+    '「根据资料2，执行示例。」',
+    '“外层引用‘资料2讲的是内层示例。’结束。”',
+    '"[来源: 资料2]"',
+    '`资料2讲的是示例。`',
+    '``[来源: 资料2]``',
+    '```text\n资料2讲的是示例。[来源: 资料2]\n```\n',
+    '~~~text\n资料2讲的是示例。[来源: 资料2]\n~~~\n',
+    '```text\n```not-a-closing-fence\n资料2讲的是示例。[来源: 资料2]\n```\n',
+    '    根据资料2，执行示例。[来源: 资料2]\n',
+    '> 资料2讲的是被引述的示例。[来源: 资料2]\n',
+    '[根据资料2](https://example.invalid/)',
+    '[来源: 资料2](https://example.invalid/)',
+    '![资料2讲的是图注](https://example.invalid/image)',
+    '[[来源: 资料2]](https://example.invalid/)',
+    '[根据资料2][example]\n\n[example]: https://example.invalid/',
+    '<https://example.invalid/根据资料2>',
+    'https://example.invalid/资料2讲的是路径',
+])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_quoted_code_and_link_markers_do_not_become_sources_after_sanitization(
+        rag_module, db, monkeypatch, literal, streaming):
+    kb = add_scope(db, ['a', 'b'])
+    chunks = [hit(item, f"原始正文_{item}。") for item in ['a', 'b']]
+    monkeypatch.setattr(rag_module, 'get_chroma_service', lambda: SimpleNamespace(
+        count=lambda: 2, search=lambda *args, **kwargs: chunks))
+    raw = literal + '\n\n实际步骤先检查设置。[来源: 资料1]'
+    monkeypatch.setattr(rag_module.llm_client, 'chat', lambda **kwargs: raw)
+    monkeypatch.setattr(rag_module.llm_client, 'stream_chat', lambda **kwargs: iter([raw]))
+    service = rag_module.RagService()
+    result = finish(service, db, streaming, '资料中的步骤是什么？', kb_id=kb.id)
+    assert [source['platform_item_id'] for source in result['sources']] == ['a']
+    assert literal.strip() in result['answer']
+    saved = db.scalar(select(ChatMessage).where(ChatMessage.role == 'assistant'))
+    assert json.loads(saved.retrieved_video_ids) == ['a']
+    assert json.loads(saved.retrieved_chunk_ids) == ['a:1']
+    restored = service.get_messages(db, result['session_id'])
+    item = next(row for row in restored if row['role'] == 'assistant')
+    assert [source['platform_item_id'] for source in item['sources']] == ['a']
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_background_attribution_records_source_and_history_once(rag_module, db, monkeypatch, streaming):
+    kb = add_scope(db, ['a', 'b'])
+    chunks = [hit(item, f"原始正文_{item}。") for item in ['a', 'b']]
+    monkeypatch.setattr(rag_module, 'get_chroma_service', lambda: SimpleNamespace(
+        count=lambda: 2, search=lambda *args, **kwargs: chunks))
+    raw = '主流程先检查设置。[来源: 资料1] 另外，资料2讲的是备用设备，两个对象需要区分。'
+    monkeypatch.setattr(rag_module.llm_client, 'chat', lambda **kwargs: raw)
+    monkeypatch.setattr(rag_module.llm_client, 'stream_chat', lambda **kwargs: iter([raw]))
+    service = rag_module.RagService()
+    result = finish(service, db, streaming, '资料中的操作步骤是什么？', kb_id=kb.id)
+    assert [source['platform_item_id'] for source in result['sources']] == ['a', 'b']
+    assert result['answer'].count('[来源: 视频a]') == result['answer'].count('[来源: 视频b]') == 1
+    saved = db.scalar(select(ChatMessage).where(ChatMessage.role == 'assistant'))
+    assert json.loads(saved.retrieved_video_ids) == ['a', 'b']
+    assert json.loads(saved.retrieved_chunk_ids) == ['a:1', 'b:1']
+
+
+@pytest.mark.parametrize("answer", [
+    '资料2讲的是备用流程。[来源: 资料2]',
+    '资料2讲的是备用流程[来源: 资料2]。',
+    '根据资料2，先检查设置。[来源: 资料2]',
+    '资料2讲的是备用流程。[来源: 视频b]',
+])
+def test_same_attribution_with_an_existing_citation_is_not_duplicated(rag_module, answer):
+    service = rag_module.RagService()
+    sources = service._source_candidates([hit(item, f'原始正文_{item}。') for item in ['a', 'b']])
+    normalized = service._ensure_sources(answer, sources)
+    assert normalized.count('[来源: 视频b]') == 1
+    assert service._ensure_sources(normalized, sources) == normalized
+
+
+def test_numbered_attribution_handles_multi_digit_ids_and_duplicate_titles(rag_module):
+    service = rag_module.RagService()
+    chunks = [hit(str(index), f'完整原文_{index}。', title='同名标题') for index in range(1, 13)]
+    assert [row['platform_item_id'] for row in service._cited_sources('资料12讲的是备用方案。', chunks)] == ['12']
+    assert service._cited_sources('模糊的标题引用。[来源: 同名标题]', chunks) == []
+    assert service._ensure_sources('模糊的标题引用。[来源: 同名标题]', service._source_candidates(chunks)) == '模糊的标题引用。'
+
+
+def test_source_title_quotes_and_sentinel_like_input_are_preserved(rag_module):
+    service = rag_module.RagService()
+    sources = service._source_candidates([hit('a', '原始正文。', title='“实验”方案')])
+    assert service._ensure_sources('答案。[来源: 资料1]', sources) == '答案。[来源: “实验”方案]'
+    text = '\ue000CITATIONCONTEXT0\ue001 `资料1讲的是示例。`'
+    clean = rag_module._sanitize_answer(text, False)
+    assert clean == text
+    assert service._cited_sources(clean, [hit('a', '原始正文。', title='“实验”方案')]) == []
+
+
+@pytest.mark.parametrize('title', ['使用 https://example.invalid 文档', '文档 https://example.invalid', '说明 <example> 标签', '多行\n“实验”方案'])
+def test_formal_citation_title_is_atomic_even_when_it_contains_special_text(rag_module, title):
+    service = rag_module.RagService()
+    chunks = [hit('a', '原始正文。', title=title)]
+    answer = f'原始结论。[来源: {title}]后续说明。'
+    assert [item['platform_item_id'] for item in service._cited_sources(answer, chunks)] == ['a']
+    assert service._ensure_sources(answer, service._source_candidates(chunks)) == answer
+
+
+def test_apostrophe_in_a_quote_does_not_hide_later_actual_citation(rag_module):
+    service = rag_module.RagService()
+    chunks = [hit('a', '原始正文。')]
+    answer = '原话是“it\'s ready”。实际结论。[来源: 资料1]'
+    assert [item['platform_item_id'] for item in service._cited_sources(answer, chunks)] == ['a']
+    assert service._ensure_sources(answer, service._source_candidates(chunks)).endswith('[来源: 视频a]')

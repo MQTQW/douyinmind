@@ -1,7 +1,11 @@
 import type { SourceItem } from './api';
+import { citationReferences, compactCitationText, safeSourceUrl } from './citations';
 
 export function answerClipboardText(content: string, sources: SourceItem[] = []): string {
-  return sources.length ? `${content}\n\n参考来源：\n${sources.map(source => `- ${source.title}\n  ${source.url}`).join('\n')}` : content;
+  const references = citationReferences(sources);
+  if (!references.length) return content;
+  return `${compactCitationText(content, references)}\n\n参考来源：\n${references.map(reference =>
+    `[${reference.number}] ${reference.source.title}\n  ${safeSourceUrl(reference.source) ?? '原视频链接暂不可用'}`).join('\n')}`;
 }
 
 export async function copyText(text: string): Promise<void> {

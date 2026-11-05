@@ -138,9 +138,29 @@ def _sanitize_answer(text: str, is_structured: bool) -> str:
     :param is_structured: 是否允许结构化格式
     :return: 清洗后的文本
     """
-    text = (text or "").replace("\r\n", "\n").strip()
-    if not text:
-        return text
+    text = (text or "").replace("\r\n", "\n")
+    if not text.strip():
+        return ""
+
+    # Keep the syntax that distinguishes a quoted/code example from an answer
+    # attribution. Otherwise stripping backticks can turn an example into a
+    # live citation later. Ordinary command formatting keeps its old behavior.
+    protected = []
+    for start, end in sorted(RagService._citation_protected_spans(text)):
+        if protected and start <= protected[-1][1]:
+            protected[-1] = (protected[-1][0], max(end, protected[-1][1]))
+        else:
+            protected.append((start, end))
+    prefix = '\ue000CITATIONCONTEXT'
+    while prefix in text:
+        prefix += 'X'
+    held = {}
+    for start, end in reversed(protected):
+        value = text[start:end]
+        if re.search(r"资料[1-9][0-9]*|\[来源\s*[:：]", value):
+            token = f'{prefix}{len(held)}\ue001'
+            held[token] = value
+            text = text[:start] + token + text[end:]
 
     # 去除 Markdown 标题符号
     text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.MULTILINE)
@@ -180,6 +200,8 @@ def _sanitize_answer(text: str, is_structured: bool) -> str:
     if not is_structured:
         merged = re.sub(r"(?<![。！？.!?：:])\n(?!\n)", " ", merged)
     merged = re.sub(r"\n{3,}", "\n\n", merged).strip()
+    for token, original in held.items():
+        merged = merged.replace(token, original)
     return merged
 
 
@@ -640,7 +662,8 @@ class RagService:
             "不要自动改答通用知识，也不要编造示例、配置或确定性结论。\n"
             "缺项说明只针对用户明确问到的内容；不要主动列举未提问的细节，也不要泛称整份资料没有参数或实现信息。\n"
             "5) 可以用通俗语言解释原意，但不要延伸出新的能力、方法、规则或保证。答案够用即止，不主动扩写。\n"
-            "6) 每个有依据的核心结论标注[来源: 资料1]这类标记，编号只选本次原文的资料编号。"
+            "6) 每个有依据的核心结论，以及主动补充的背景、参数或比较，都要标注[来源: 资料1]这类标记；"
+            "不能只写‘资料2讲的是’而不提供来源标记。没有必要的旁支背景不补充。编号只选本次原文的资料编号。"
             "每个标记只放一个编号；没有支持该结论的原文就不标来源，不能把未提及当作已证实。\n"
         )
 
@@ -724,7 +747,7 @@ class RagService:
         candidates = self._source_candidates(hits)
         allowed = self._citation_map(candidates)
         cited = set()
-        for match in re.finditer(r"\[来源\s*[:：]\s*([^\]]+)\]", answer):
+        for match in self._explicit_citations(answer):
             source = allowed.get(match.group(1).strip())
             if source is not None:
                 cited.add(source["platform_item_id"])
@@ -735,28 +758,184 @@ class RagService:
         return [source for source in candidates if source["platform_item_id"] in cited]
 
     @staticmethod
-    def _natural_citations(answer: str):
-        # A model can explicitly cite in prose instead of the requested brackets.
-        # Recognize the same numbered whitelist, never arbitrary mentions of a
-        # document or negated phrases such as "不是来自资料1".
-        pattern = r"(?:来源(?:是|为|\s*[:：])|来自|依据|根据)\s*(?P<label>资料[1-9]\d*)"
-        for match in re.finditer(pattern, answer):
-            if not re.search(r"(?:不|非|未|没有|不能|并非|并不|不应|不是)$", answer[:match.start()].rstrip()):
+    def _citation_protected_spans(answer: str) -> list[tuple[int, int]]:
+        """Quoted examples and code are text, not an attribution by the answer."""
+        spans = []
+        offset, fence_start, fence = 0, None, None
+        for line in answer.splitlines(keepends=True):
+            marker = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+            if fence is not None:
+                if (marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence)
+                        and not line[marker.end():].strip()):
+                    spans.append((fence_start, offset + len(line)))
+                    fence_start, fence = None, None
+            elif marker:
+                fence_start, fence = offset, marker[1]
+            elif re.match(r"^ {0,3}>|^(?: {4}|\t)", line):
+                spans.append((offset, offset + len(line)))
+            offset += len(line)
+        if fence is not None:
+            spans.append((fence_start, len(answer)))
+        formal_spans = [match.span() for match in re.finditer(r"\[来源\s*[:：]\s*[^\]]+\]", answer)]
+        spans += [match.span() for match in re.finditer(
+            r"(?im)\b(?:https?://|ftp://|www\.)[^\s<>\[\]]+|<[^>\n]*>|^ {0,3}\[[^]\n]+\]:[^\n]*", answer)
+            if not any(start <= match.start() and match.end() <= end for start, end in formal_spans)]
+
+        pairs = {'“': '”', '‘': '’', '「': '」', '『': '』', '《': '》', '"': '"', "'": "'"}
+        index = 0
+        while index < len(answer):
+            protected_end = next((end for start, end in spans if start <= index < end), None)
+            if protected_end is not None:
+                index = protected_end
+                continue
+            if answer[index] == '[':
+                # Balanced labels/targets also cover nested image labels and
+                # reference-style links. Do not turn their text into citations.
+                depth, end = 1, index + 1
+                while end < len(answer) and depth and answer[end] != '\n':
+                    if answer[end] == '\\':
+                        end += 2
+                        continue
+                    depth += (answer[end] == '[') - (answer[end] == ']')
+                    end += 1
+                marker = re.match(r"\[来源\s*[:：]\s*[^\]]+\]", answer[index:])
+                if marker:
+                    end = index + marker.end()
+                linked = depth == 0 and end < len(answer) and answer[end] in '(['
+                if marker:
+                    linked = end < len(answer) and answer[end] in '(['
+                if linked:
+                    opening, closing = answer[end], ')' if answer[end] == '(' else ']'
+                    nesting, end = 1, end + 1
+                    while end < len(answer) and nesting and answer[end] != '\n':
+                        if answer[end] == '\\':
+                            end += 2
+                            continue
+                        nesting += (answer[end] == opening) - (answer[end] == closing)
+                        end += 1
+                if not marker or linked:
+                    spans.append((index, end))
+                # Actual source titles may contain quotes, punctuation or code.
+                index = index + marker.end() if marker and not linked else end
+                continue
+            if answer[index] == '`':
+                opening = re.match(r"`+", answer[index:])[0]
+                closing = re.search(r"(?<!`)" + re.escape(opening) + r"(?!`)", answer[index + len(opening):])
+                end = index + len(opening) + closing.end() if closing else len(answer)
+                spans.append((index, end)); index = end
+                continue
+            char = answer[index]
+            apostrophe = (char == "'" and index > 0 and index + 1 < len(answer)
+                          and answer[index - 1].isascii() and answer[index - 1].isalnum()
+                          and answer[index + 1].isascii() and answer[index + 1].isalnum())
+            if char not in pairs or apostrophe:
+                index += 1
+                continue
+            stack, end = [pairs[char]], index + 1
+            while end < len(answer) and stack:
+                current = answer[end]
+                if current == '\\':
+                    end += 2
+                    continue
+                if current == stack[-1]:
+                    stack.pop()
+                elif current in pairs and not (
+                        current == "'" and end > 0 and end + 1 < len(answer)
+                        and answer[end - 1].isascii() and answer[end - 1].isalnum()
+                        and answer[end + 1].isascii() and answer[end + 1].isalnum()):
+                    stack.append(pairs[current])
+                end += 1
+            spans.append((index, end)); index = end
+        return spans
+
+    @staticmethod
+    def _citation_overlaps(match, spans: list[tuple[int, int]]) -> bool:
+        return any(match.start() < end and match.end() > start for start, end in spans)
+
+    @staticmethod
+    def _citation_plain_text(answer: str) -> str:
+        spans = RagService._citation_protected_spans(answer)
+        spans += [match.span() for match in re.finditer(r"\[来源\s*[:：]\s*[^\]]+\]", answer)]
+        plain = list(answer)
+        for start, end in spans:
+            plain[start:end] = ['\n' if char == '\n' else ' ' for char in answer[start:end]]
+        return ''.join(plain)
+
+    @staticmethod
+    def _explicit_citations(answer: str):
+        spans = RagService._citation_protected_spans(answer)
+        for match in re.finditer(r"\[来源\s*[:：]\s*([^\]]+)\]", answer):
+            if not RagService._citation_overlaps(match, spans):
                 yield match
+
+    @staticmethod
+    def _natural_citations(answer: str):
+        # Only an affirmative attribution is normalized. A bare document number
+        # or a quoted question cannot add a source card or a persisted reference.
+        spans = RagService._citation_protected_spans(answer)
+        spans += [match.span() for match in re.finditer(r"\[来源\s*[:：]\s*[^\]]+\]", answer)]
+        plain = RagService._citation_plain_text(answer)
+        pattern = (r"(?:(?P<attribution>来源(?:是|为|\s*[:：])|来自|依据|根据)\s*)?"
+                   r"(?P<label>资料[1-9][0-9]*)(?![0-9A-Za-z_]|[.．][0-9])")
+        subject_verb = (r"\s*(?:讲(?!义|稿|座|师|台|解稿)(?:的是|了)?|介绍(?!页|信|栏|稿|文|卡|书|性)(?:的是|了)?|"
+                        r"描述(?!文|符|性|页)(?:的是|了)?|说明(?!书|文|页|函|单|稿|性|栏)(?:的是|了)?|"
+                        r"提到(?:的是|了)?|指出(?:的是|了)?|记载(?:的是|了)?|展示(?!页|板|栏|稿)(?:的是|了)?)")
+        for match in re.finditer(pattern, answer):
+            if RagService._citation_overlaps(match, spans):
+                continue
+            sentence_start = max((plain.rfind(mark, 0, match.start()) for mark in '。！？!?\n'), default=-1) + 1
+            sentence_end = re.search(r"[。！？!?\n]", plain[match.end():])
+            end = match.end() + sentence_end.end() if sentence_end else len(answer)
+            sentence = plain[sentence_start:end]
+            before = plain[sentence_start:match.start()]
+            if re.search(r"[?？]", sentence) or re.search(
+                    r"用户(?:问题|提问|问)|提问者|原问题|当前问题|有人问|请问|假设|假如|如果|倘若|例如|比如|"
+                    r"(?:^|[：:\s])(?:问题|提问内容|引文|原话|示例)\s*[:：]|(?:^|[，,\s])若", before):
+                continue
+            clause_prefix = re.split(r"[，,；;]", before)[-1].rstrip()
+            if (re.search(r"(?:不|不是|并非|并不|未|没有|不能|不可|不应|不要|无法|不足以)(?:\s*(?:仅|只|直接|完全|能够|可以|能|再))*$", clause_prefix)
+                    or re.search(r"(?:没有|缺乏|缺少|未见|无).{0,10}(?:依据|证据|支撑|支持)", clause_prefix)):
+                continue
+            following = plain[match.end():end]
+            verb = re.match(subject_verb, following)
+            if not match.group('attribution') and not verb:
+                continue
+            rest = following[verb.end():] if not match.group('attribution') else following
+            rest = re.sub(r"^[\s，,]*(?:(?:可知|可以看出|当前|目前|本次)\s*)*", '', rest)
+            if re.match(r"(?:的)?(?:也|并|还|尚)?(?:未|没有|没|不是|无法|无依据|无证据|缺乏|不足|错误|讲错)", rest):
+                continue
+            if not match.group('attribution') and re.match(r"什么|哪[一个些种]|谁|是否|能否|多少|几[个条步次]", rest):
+                continue
+            yield match
 
     def _ensure_sources(self, answer: str, sources: list[dict]) -> str:
         """Normalize only explicit, allowed citations; never append unused hits."""
         allowed = self._citation_map(sources)
-        def replace(match):
+        explicit = list(self._explicit_citations(answer))
+        edits = []
+        for match in explicit:
             source = allowed.get(match.group(1).strip())
-            return f"[来源: {source['title']}]" if source else ""
-        normalized = re.sub(r"\[来源\s*[:：]\s*([^\]]+)\]", replace, answer)
-        for match in reversed(list(self._natural_citations(normalized))):
+            edits.append((*match.span(), f"[来源: {source['title']}]" if source else ""))
+        plain = self._citation_plain_text(answer)
+        for match in self._natural_citations(answer):
             source = allowed.get(match.group("label"))
             if source is not None:
-                normalized = (normalized[:match.start("label")] + f"《{source['title']}》"
-                              + normalized[match.end("label"):])
-        return normalized.strip()
+                start = max((plain.rfind(mark, 0, match.start()) for mark in '。！？!?\n'), default=-1) + 1
+                closing = re.search(r"[。！？!?\n]", plain[match.end():])
+                end = match.end() + closing.end() if closing else len(answer)
+                # An already-cited attribution needs no second marker. An
+                # immediately following sentence-final citation belongs here too.
+                already_cited = any(
+                    allowed.get(item.group(1).strip()) is source
+                    and start <= item.start()
+                    and (item.start() < end or not answer[end:item.start()].strip())
+                    for item in explicit)
+                if not already_cited:
+                    edits.append((match.start("label"), match.end("label"), f"[来源: {source['title']}]"))
+        normalized = answer
+        for start, end, replacement in sorted(edits, reverse=True):
+            normalized = normalized[:start] + replacement + normalized[end:]
+        return normalized.rstrip() if re.match(r"^(?: {4}|\t)", normalized) else normalized.strip()
 
     # ------------------------------------------------------------------
     # 非流式回答
