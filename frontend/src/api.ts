@@ -299,11 +299,19 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 
 // ---- Auth ----
 
-export async function loginStart(): Promise<{ success: boolean; message: string; status: string }> {
+export interface CollectionLoginStatus {
+  status: string;
+  message: string;
+  phase?: 'idle' | 'logging_in' | 'scraping' | 'ready' | 'failed';
+  snapshot_ready?: boolean;
+  busy?: boolean;
+}
+
+export async function loginStart(): Promise<CollectionLoginStatus & { success: boolean }> {
   return request('/auth/douyin/login/start', { method: 'POST' });
 }
 
-export async function loginStatus(): Promise<{ status: string; message: string }> {
+export async function loginStatus(): Promise<CollectionLoginStatus> {
   return request('/auth/douyin/login/status');
 }
 

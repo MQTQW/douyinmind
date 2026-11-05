@@ -5,13 +5,14 @@ import * as api from '../api';
 import { subscribePageReturn } from '../pageRefresh';
 import { BookOpen, ChevronLeft, Download, Files, LogOut, Menu, MessagesSquare, Plus } from 'lucide-react';
 import type { WorkspaceView } from '../workspaceView';
+import type { CollectionConnection } from '../collectionConnection';
 
 const AssistantPanel = lazy(() => import('../components/AssistantPanel'));
 
 interface Props { onLogout: () => void; loggedIn: boolean; initialChatOnly?: boolean;
-  onConnectFavorites?: () => void; loginBusy?: boolean; loginError?: string; }
+  onConnectFavorites?: () => void; loginBusy?: boolean; loginError?: string; connection?: CollectionConnection; }
 
-export default function Workspace({ onLogout, loggedIn, initialChatOnly = false, onConnectFavorites, loginBusy = false, loginError = '' }: Props) {
+export default function Workspace({ onLogout, loggedIn, initialChatOnly = false, onConnectFavorites, loginBusy = false, loginError = '', connection }: Props) {
   const [chatOnly, setChatOnly] = useState(initialChatOnly);
   const [leftWidth, setLeftWidth] = useState(272);
   const [view, setView] = useState<WorkspaceView>(() => {
@@ -23,7 +24,9 @@ export default function Workspace({ onLogout, loggedIn, initialChatOnly = false,
   const [selectedCollectionId, setSelectedCollectionId] = useState<string>('all');
   const [selectedKnowledgeBase, setSelectedKnowledgeBase] = useState<api.KnowledgeBaseItem | null>(null);
   const [statsRefreshKey, setStatsRefreshKey] = useState(0);
-  const [statusMsg, setStatusMsg] = useState(loggedIn ? '收藏已连接' : '收藏未连接 · 本地资料可用');
+  const statusMsg = connection?.message || (loggedIn ? '收藏已连接' : '收藏未连接 · 本地资料可用');
+  const statusLabel = connection?.shortLabel || (loggedIn ? '收藏已连接' : '收藏未连接');
+  const statusColor = connection?.phase === 'failed' ? 'var(--color-amber)' : loggedIn ? 'var(--color-success)' : 'var(--color-ink-muted)';
   const [showSources, setShowSources] = useState(false);
   const [currentSession, setCurrentSession] = useState<{id: number; title: string} | null>(null);
   const [openedSessionId, setOpenedSessionId] = useState<number | null>(null);
@@ -124,17 +127,6 @@ export default function Workspace({ onLogout, loggedIn, initialChatOnly = false,
     setIsDragging(true);
   }, []);
 
-  // Poll login status for detailed message
-  useEffect(() => {
-    const poll = setInterval(async () => {
-      try {
-        const s = await api.loginStatus();
-        if (s.message) setStatusMsg(s.message);
-      } catch {}
-    }, 3000);
-    return () => clearInterval(poll);
-  }, []);
-
   useEffect(() => {
     if (!isDragging) return;
     const move = (e: MouseEvent) => {
@@ -172,14 +164,14 @@ export default function Workspace({ onLogout, loggedIn, initialChatOnly = false,
           >
             <Menu size={15} className="inline mr-1" />{showSources ? '返回工作区' : '资料库'}
           </button>
-          <span className="workspace-status inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs max-w-md truncate" title={statusMsg}
-            style={{ backgroundColor: 'rgba(91,140,90,0.12)', color: 'var(--color-success)' }}>
-            <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: 'var(--color-success)' }} /><span className="connection-detail">{statusMsg}</span><span className="connection-short">{loggedIn ? '抖音已连接' : '收藏未连接'}</span>
+          <span role="status" className="workspace-status inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs max-w-md truncate" title={statusMsg}
+            style={{ backgroundColor: loggedIn ? 'rgba(91,140,90,0.12)' : 'var(--color-bg)', color: statusColor }}>
+            <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: 'currentColor' }} /><span className="connection-detail">{statusMsg}</span><span className="connection-short">{statusLabel}</span>
           </span>
           <button onClick={onLogout} aria-label={loggedIn ? '退出登录' : '返回首页'} title={loggedIn ? '退出登录' : '返回首页'} className="icon-button"><LogOut size={17} /></button>
         </div>
       </header>
-      {loginError && <div role="alert" className="flex flex-wrap items-center justify-between gap-2 px-5 py-3 text-sm bg-[var(--color-accent-light)]"><span>{loginError}</span><button className="text-button" onClick={onConnectFavorites} disabled={loginBusy}>重试连接收藏</button></div>}
+      {loginError && <div role="alert" className="flex flex-wrap items-center justify-between gap-2 px-5 py-3 text-sm bg-[var(--color-accent-light)]"><span>{loginError}</span><button className="text-button" onClick={onConnectFavorites} disabled={loginBusy || connection?.busy}>重试读取收藏</button></div>}
 
       {/* Main Area */}
       <div ref={containerRef} className="flex-1 flex min-h-0" style={{ userSelect: isDragging ? 'none' : undefined }}>

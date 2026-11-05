@@ -25,8 +25,11 @@ function page(data = [], hasMore = false, cursor = 0) {
   return { statusCode: 0, data, hasMore, cursor };
 }
 
-async function collect(collectionPages, videoPages = {}) {
+async function collect(collectionPages, videoPages = {}, options = {}) {
   const calls = [];
+  const requiredModules = [];
+  let waits = 0;
+  let clock = 0;
   let collectionIndex = 0;
   const videoIndexes = new Map();
   const take = (pages, index) => {
@@ -38,7 +41,7 @@ async function collect(collectionPages, videoPages = {}) {
   function markerModule() {
     return ['/aweme/v1/web/collects/list/', '/aweme/v1/web/collects/video/list/'];
   }
-  const api = {
+  const defaultApi = {
     async So(args) {
       calls.push({ kind: 'collections', ...args });
       return take(collectionPages, collectionIndex++);
@@ -51,14 +54,28 @@ async function collect(collectionPages, videoPages = {}) {
       return take(videoPages[id], index);
     },
   };
+  const api = options.apiFactory ? options.apiFactory(defaultApi) : defaultApi;
   function requireModule(id) {
-    assert.equal(id, 7, 'only the authored API module is available');
+    const factory = requireModule.m[id];
+    assert.equal(typeof factory, 'function', 'required module must exist');
+    const source = Function.prototype.toString.call(factory);
+    assert.ok(source.includes('/aweme/v1/web/collects/list/')
+      && source.includes('/aweme/v1/web/collects/video/list/'), 'only the verified API factory may run');
+    requiredModules.push(String(id));
+    if (options.requireError) throw new Error('authored module initialization failure');
     return api;
   }
-  requireModule.m = { 7: markerModule };
+  requireModule.m = options.modules ?? { 7: markerModule };
   const chunks = [];
   chunks.push = () => requireModule;
-  const context = vm.createContext({ window: { webpackChunkdouyin_web: chunks } }, {
+  const window = options.noWebpack ? {} : { webpackChunkdouyin_web: chunks };
+  const context = vm.createContext({ window, Date: { now: () => clock },
+    setTimeout(resolve, milliseconds) {
+      waits++; clock += milliseconds;
+      options.onWait?.({ waits, calls, requiredModules, requireModule, markerModule, window, chunks, api, defaultApi });
+      resolve();
+    },
+  }, {
     name: 'authored-favorites-pagination-only',
     codeGeneration: { strings: false, wasm: false },
   });
@@ -66,13 +83,138 @@ async function collect(collectionPages, videoPages = {}) {
   // sandbox; the executed expression is the reviewed repository function.
   const result = await new vm.Script(`(${embedded})()`, { filename: collectorPath })
     .runInContext(context, { timeout: 1000 });
-  return { result, calls };
+  return { result, calls, waits, requiredModules, clock };
 }
 
 function incomplete(result) {
   assert.equal(result?.ok, false, 'a partial or unknown snapshot must fail closed');
   assert.notEqual(result?.complete, true, 'a failed snapshot cannot assert completeness');
 }
+
+test('specific API module can arrive after DOM-ready without an early collection request', async () => {
+  const { result, calls, waits, requiredModules } = await collect([page()], {}, {
+    modules: {},
+    onWait(state) {
+      assert.equal(state.calls.length, 0);
+      assert.equal(state.requiredModules.length, 0);
+      if (state.waits === 2) state.requireModule.m[7] = state.markerModule;
+    },
+  });
+  assert.equal(result.complete, true);
+  assert.equal(calls.length, 1);
+  assert.equal(waits, 2);
+  assert.deepEqual(requiredModules, ['7']);
+});
+
+test('webpack itself can become ready before the collection module', async () => {
+  const { result, waits, calls } = await collect([page()], {}, {
+    noWebpack: true,
+    onWait(state) {
+      assert.equal(state.calls.length, 0);
+      if (state.waits === 3) state.window.webpackChunkdouyin_web = state.chunks;
+    },
+  });
+  assert.equal(result.complete, true);
+  assert.equal(waits, 3);
+  assert.equal(calls.length, 1);
+});
+
+test('verified module exports can become available without requiring the factory again', async () => {
+  const { result, requiredModules, waits } = await collect([page()], {}, {
+    apiFactory: () => ({}),
+    onWait(state) {
+      assert.equal(state.calls.length, 0);
+      if (state.waits === 2) Object.assign(state.api, state.defaultApi);
+    },
+  });
+  assert.equal(result.complete, true);
+  assert.equal(waits, 2);
+  assert.deepEqual(requiredModules, ['7']);
+});
+
+test('module wait stops with no API calls when the target never loads', async () => {
+  const { result, calls, requiredModules, waits, clock } = await collect([], {}, {
+    modules: { unrelated: () => 'unrelated', notAFunction: {} },
+  });
+  incomplete(result);
+  assert.equal(result.error, 'module_not_found');
+  assert.equal(result.module_wait_timeout, true);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(requiredModules, []);
+  assert.equal(waits, 79);
+  assert.ok(clock < 20000);
+});
+
+test('separate route factories are not guessed or called as a combined API', async () => {
+  function listOnly() { return '/aweme/v1/web/collects/list/'; }
+  function videoOnly() { return '/aweme/v1/web/collects/video/list/'; }
+  const { result, calls, requiredModules } = await collect([], {}, { modules: { one: listOnly, two: videoOnly } });
+  incomplete(result);
+  assert.equal(result.error, 'module_not_found');
+  assert.deepEqual(calls, []);
+  assert.deepEqual(requiredModules, []);
+});
+
+test('multiple matching factories fail before any factory or API is called', async () => {
+  function first() { return ['/aweme/v1/web/collects/list/', '/aweme/v1/web/collects/video/list/']; }
+  const { result, calls, requiredModules } = await collect([], {}, { modules: { a: first, b: first } });
+  incomplete(result);
+  assert.equal(result.error, 'ambiguous_collection_module');
+  assert.deepEqual(calls, []);
+  assert.deepEqual(requiredModules, []);
+});
+
+test('webpack module identity is preserved as a string', async () => {
+  function target() { return ['/aweme/v1/web/collects/list/', '/aweme/v1/web/collects/video/list/']; }
+  const { result, requiredModules } = await collect([page()], {}, { modules: { 'api-collections': target } });
+  assert.equal(result.complete, true);
+  assert.deepEqual(requiredModules, ['api-collections']);
+});
+
+test('missing or aliased exports time out with no collection requests', async () => {
+  for (const apiFactory of [() => ({}), api => ({ So: api.So }), api => ({ So: api.So, d6: api.So })]) {
+    const { result, calls, requiredModules } = await collect([], {}, { apiFactory });
+    incomplete(result);
+    assert.equal(result.error, 'bad_exports');
+    assert.equal(result.module_wait_timeout, true);
+    assert.deepEqual(calls, []);
+    assert.deepEqual(requiredModules, ['7']);
+  }
+});
+
+test('unready export getters are retried without making a request', async () => {
+  let available = false;
+  const { result, requiredModules } = await collect([page()], {}, {
+    apiFactory(api) {
+      return { get So() { if (!available) throw new Error('not initialized'); return api.So; },
+        get d6() { if (!available) throw new Error('not initialized'); return api.d6; } };
+    },
+    onWait(state) { assert.equal(state.calls.length, 0); available = true; },
+  });
+  assert.equal(result.complete, true);
+  assert.deepEqual(requiredModules, ['7']);
+});
+
+test('a verified factory initialization error is not automatically replayed', async () => {
+  const { result, calls, requiredModules } = await collect([], {}, { requireError: true });
+  incomplete(result);
+  assert.equal(result.error, 'collection_module_unavailable');
+  assert.deepEqual(requiredModules, ['7']);
+  assert.deepEqual(calls, []);
+});
+
+test('explicit endpoint-bearing exports work independently of legacy alias names', async () => {
+  const { result, calls } = await collect([page()], {}, {
+    apiFactory(api) {
+      return {
+        async listing(args) { void '/aweme/v1/web/collects/list/'; return api.So(args); },
+        async videos(args) { void '/aweme/v1/web/collects/video/list/'; return api.d6(args); },
+      };
+    },
+  });
+  assert.equal(result.complete, true);
+  assert.equal(calls.length, 1);
+});
 
 test('an explicitly finished empty collection list is complete', async () => {
   const { result, calls } = await collect([page()]);

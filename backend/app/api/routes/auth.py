@@ -26,9 +26,9 @@ async def login_start():
     """
     success, message = collector.start_login()
     return {
+        **collector.login_state(),
         "success": success,
         "message": message,
-        "status": collector.status,
     }
 
 
@@ -39,10 +39,7 @@ async def login_status():
 
     :return: 当前状态（idle / pending / logged_in / failed）和描述信息
     """
-    return {
-        "status": collector.status,
-        "message": collector.message,
-    }
+    return collector.login_state()
 
 
 @router.post("/logout")
@@ -56,7 +53,7 @@ async def logout():
     """
     success, message = collector.logout()
     return {
+        **collector.login_state(),
         "success": success,
         "message": message,
-        "status": collector.status,
     }

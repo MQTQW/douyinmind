@@ -150,7 +150,8 @@ jobs:
             'tests/test_notes_api.py',
             'tests/test_favorites_snapshot_safety.py',
             'tests/test_knowledge_bases.py',
-            'tests/test_knowledge_base_integration.py'
+            'tests/test_knowledge_base_integration.py',
+            'tests/test_collector_login_lifecycle.py'
           )
           & $backendPython @runnerArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

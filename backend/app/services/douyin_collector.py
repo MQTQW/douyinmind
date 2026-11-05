@@ -14,6 +14,7 @@ import json
 import logging
 import shutil
 import sys
+from threading import RLock
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -70,11 +71,37 @@ class DouyinCollector:
     """抖音数据采集器 — 登录 + 抓取一体化"""
 
     def __init__(self) -> None:
+        self._state_lock = RLock()
         self.status: str = "idle"
+        self.phase: str = "idle"
         self.message: str = ""
         self._login_task: Optional[asyncio.Task] = None
         self.storage_state_path: Path = Path(settings.playwright_user_data_dir) / "state.json"
         self._snapshot: Optional[FavoriteScrapeSnapshot] = None
+
+    def login_state(self) -> dict:
+        """Read the login task and published snapshot as one state."""
+        with self._state_lock:
+            return {
+                "status": self.status,
+                "message": self.message,
+                "phase": self.phase,
+                "snapshot_ready": (
+                    self.phase == "ready" and self.status == "logged_in"
+                    and self._snapshot is not None and getattr(self._snapshot, "complete", False) is True
+                ),
+                "busy": self._login_task is not None and not self._login_task.done(),
+            }
+
+    def _set_login_state(
+        self, status: str, phase: str, message: str,
+        *, snapshot: Optional[FavoriteScrapeSnapshot] = None,
+    ) -> None:
+        with self._state_lock:
+            self.status = status
+            self.phase = phase
+            self.message = message
+            self._snapshot = snapshot
 
     # ------------------------------------------------------------------
     # 浏览器
@@ -98,13 +125,12 @@ class DouyinCollector:
 
     def start_login(self) -> tuple[bool, str]:
         """启动扫码登录（后台异步），登录成功后自动抓取收藏夹快照"""
-        if self.status == "pending" and self._login_task and not self._login_task.done():
-            return False, "登录已在进行中"
-        self.status = "pending"
-        self.message = "请在打开的浏览器窗口中扫码登录抖音"
-        self._snapshot = None
-        self._login_task = asyncio.ensure_future(self._login_flow())
-        return True, self.message
+        with self._state_lock:
+            if self._login_task is not None and not self._login_task.done():
+                return False, "收藏连接正在进行中，请等待本次读取结束。"
+            self._set_login_state("pending", "logging_in", "请在打开的浏览器窗口中扫码登录抖音")
+            self._login_task = asyncio.ensure_future(self._login_flow())
+            return True, self.message
 
     async def _login_flow(self) -> None:
         await asyncio.to_thread(self._login_and_fetch_sync)
@@ -119,6 +145,7 @@ class DouyinCollector:
 
         关键：不关浏览器，登录后立即在同一个 session 中抓数据
         """
+        snapshot = None
         try:
             with sync_playwright() as p:
                 kwargs = self._browser_launch_kwargs()
@@ -127,53 +154,48 @@ class DouyinCollector:
                     user_data_dir=settings.playwright_user_data_dir,
                     **kwargs,
                 )
-                page = context.pages[0] if context.pages else context.new_page()
-
-                # 1. 等待扫码登录
-                page.goto(settings.douyin_home_url, timeout=120_000)
-                logger.info("已打开抖音首页，等待扫码登录...")
-
-                found = False
-                for _ in range(120):
-                    cookies = context.cookies()
-                    has_login = any(
-                        c.get("name") in {"sessionid", "sid_guard"} for c in cookies
-                    )
-                    if has_login:
-                        found = True
-                        break
-                    time.sleep(1)
-
-                if not found:
-                    self.status = "failed"
-                    self.message = "登录超时（120秒），请重试"
-                    context.close()
-                    return
-
-                logger.info("扫码登录成功，立即开始抓取收藏夹...")
-                self.status = "logged_in"
-                self.message = "登录成功，正在同步收藏夹..."
-
-                # 2. 立即在同一个 context 中抓数据
                 try:
-                    snapshot = self._fetch_in_context(page)
-                    self._snapshot = snapshot
-                    self.status = "logged_in"
-                    self.message = f"登录成功，已同步 {len(snapshot.collections)} 个收藏夹，{len(snapshot.videos)} 个视频"
-                    logger.info("登录+抓取全部完成: %d 收藏夹, %d 视频", len(snapshot.collections), len(snapshot.videos))
-                except Exception as exc:
-                    logger.exception("抓取收藏夹失败")
-                    self.status = "logged_in"
-                    self.message = f"登录成功，但抓取失败: {str(exc)[:100]}"
+                    page = context.pages[0] if context.pages else context.new_page()
+                    page.goto(settings.douyin_home_url, timeout=120_000)
+                    logger.info("已打开抖音首页，等待扫码登录...")
 
-                # 3. 保存登录态
-                context.storage_state(path=str(self.storage_state_path))
-                context.close()
+                    found = False
+                    for _ in range(120):
+                        has_login = any(
+                            cookie.get("name") in {"sessionid", "sid_guard"}
+                            for cookie in context.cookies()
+                        )
+                        if has_login:
+                            found = True
+                            break
+                        time.sleep(1)
+                    if not found:
+                        self._set_login_state("failed", "failed", "登录等待超时，请重新连接收藏。")
+                        return
 
-        except Exception as exc:
+                    self._set_login_state("pending", "scraping", "登录已完成，正在读取收藏夹，请稍候。")
+                    try:
+                        snapshot = self._fetch_in_context(page)
+                        if snapshot.complete is not True:
+                            raise RuntimeError("incomplete_collection_snapshot")
+                    except Exception:
+                        snapshot = None
+                        logger.exception("抓取收藏夹失败")
+                        self._set_login_state("failed", "failed", "登录已完成，收藏夹读取失败，请重新连接后重试。")
+
+                    context.storage_state(path=str(self.storage_state_path))
+                finally:
+                    context.close()
+            if snapshot is not None:
+                self._set_login_state(
+                    "logged_in", "ready",
+                    f"收藏读取完成，已读取 {len(snapshot.collections)} 个收藏夹、{len(snapshot.videos)} 个视频。",
+                    snapshot=snapshot,
+                )
+                logger.info("登录+抓取全部完成: %d 收藏夹, %d 视频", len(snapshot.collections), len(snapshot.videos))
+        except Exception:
             logger.exception("登录流程异常")
-            self.status = "failed"
-            self.message = str(exc)[:500]
+            self._set_login_state("failed", "failed", "收藏连接未完成，请重新连接后重试。")
 
     def _fetch_in_context(self, page) -> FavoriteScrapeSnapshot:
         """
@@ -182,70 +204,68 @@ class DouyinCollector:
         :param page: 已登录的 Playwright Page
         :return: 收藏夹快照
         """
-        # 先回到首页确保 Webpack 已加载
-        page.goto(settings.douyin_home_url, timeout=120_000, wait_until="domcontentloaded")
-        time.sleep(3.0)
-
-        # 检查 Webpack
-        try:
-            page.wait_for_function(
-                "typeof window.webpackChunkdouyin_web !== 'undefined'",
-                timeout=15000,
-            )
-            logger.info("Webpack 已就绪")
-        except Exception:
-            page.reload(wait_until="domcontentloaded", timeout=30000)
-            time.sleep(4.0)
-            try:
-                page.wait_for_function(
-                    "typeof window.webpackChunkdouyin_web !== 'undefined'",
-                    timeout=15000,
-                )
-                logger.info("Webpack 刷新后就绪")
-            except Exception:
-                raise RuntimeError("抖音页面加载失败：Webpack 模块未检测到，请确认网络正常后重试")
-
-        # 导航到收藏夹页面
+        # The collection route loads its API module asynchronously after DOM ready.
         page.goto("https://www.douyin.com/user/self?showTab=favorite_collection",
                   timeout=120_000, wait_until="domcontentloaded")
-        time.sleep(4.0)
 
-        # 执行 JS 调用 Webpack collects 模块
+        # Wait for the specific module and exports before the first list request.
         result = page.evaluate("""
             async () => {
-                const chunks = window.webpackChunkdouyin_web;
-                if (!Array.isArray(chunks)) return {ok:false, error:"no_webpack"};
-                const req = chunks.push([[Symbol("c")], {}, r => r]);
-                try { chunks.pop(); } catch(e) {}
-                if (!req || !req.m) return {ok:false, error:"no_require"};
-
-                let mid = null;
-                for (const [id, mod] of Object.entries(req.m)) {
-                    let src = "";
-                    try { src = Function.prototype.toString.call(mod); } catch(e) { continue; }
-                    if (src.includes("/aweme/v1/web/collects/list/") && src.includes("/aweme/v1/web/collects/video/list/")) {
-                        mid = id; break;
+                let req = null, api = null, loadedModule = null;
+                let listFn = null, videoFn = null, readinessError = "no_webpack";
+                const readinessDeadline = Date.now() + 20000;
+                for (let attempt = 0; attempt < 80; attempt++) {
+                    const chunks = window.webpackChunkdouyin_web;
+                    if (!req && Array.isArray(chunks)) {
+                        const captured = chunks.push([[Symbol("douyinmind-collections")], {}, r => r]);
+                        try { chunks.pop(); } catch(e) {}
+                        if (typeof captured === "function" && captured.m) req = captured;
+                        else readinessError = "no_require";
                     }
+                    if (req) {
+                        const candidates = Object.entries(req.m).filter(([, factory]) => {
+                            if (typeof factory !== "function") return false;
+                            const source = Function.prototype.toString.call(factory);
+                            return source.includes("/aweme/v1/web/collects/list/") &&
+                                source.includes("/aweme/v1/web/collects/video/list/");
+                        });
+                        if (candidates.length > 1)
+                            return {ok:false, complete:false, error:"ambiguous_collection_module"};
+                        readinessError = "module_not_found";
+                        if (candidates.length === 1) {
+                            const moduleId = candidates[0][0];
+                            if (loadedModule !== moduleId) {
+                                try { api = req(moduleId); }
+                                catch(e) { return {ok:false, complete:false, error:"collection_module_unavailable"}; }
+                                loadedModule = moduleId;
+                            }
+                            listFn = videoFn = null;
+                            for (const key of Object.keys(api || {})) {
+                                let value;
+                                try { value = api[key]; } catch(e) { continue; }
+                                if (typeof value !== "function") continue;
+                                const source = Function.prototype.toString.call(value);
+                                if (!listFn && source.includes("/aweme/v1/web/collects/list/")) listFn = value;
+                                if (!videoFn && source.includes("/aweme/v1/web/collects/video/list/")) videoFn = value;
+                            }
+                            // Legacy export aliases apply only to the verified API module.
+                            try {
+                                listFn = listFn || api?.So;
+                                videoFn = videoFn || api?.d6;
+                            } catch(e) {}
+                            if (typeof listFn === "function" && typeof videoFn === "function" && listFn !== videoFn
+                                && Date.now() <= readinessDeadline)
+                                break;
+                            readinessError = "bad_exports";
+                        }
+                    }
+                    const remaining = readinessDeadline - Date.now();
+                    if (remaining <= 0 || attempt === 79) break;
+                    await new Promise(resolve => setTimeout(resolve, Math.min(250, remaining)));
                 }
-                if (!mid) return {ok:false, error:"module_not_found"};
-
-                const api = req(Number(mid));
-
-                // 智能查找 API 函数
-                let listFn = null, videoFn = null;
-                for (const key of Object.keys(api)) {
-                    const v = api[key];
-                    if (typeof v !== 'function') continue;
-                    try {
-                        const src = Function.prototype.toString.call(v);
-                        if (!listFn && src.includes('collects/list')) listFn = v;
-                        if (!videoFn && src.includes('collects/video/list')) videoFn = v;
-                    } catch(e) {}
-                }
-                if (!listFn) listFn = api.So;
-                if (!videoFn) videoFn = api.d6;
-                if (typeof listFn !== "function" || typeof videoFn !== "function")
-                    return {ok:false, error:"bad_exports", keys:Object.keys(api||{}).slice(0,20)};
+                if (typeof listFn !== "function" || typeof videoFn !== "function" || listFn === videoFn
+                    || Date.now() > readinessDeadline)
+                    return {ok:false, complete:false, error:readinessError, module_wait_timeout:true};
 
                 const incomplete = error => ({ok:false, complete:false, error});
                 const more = value => value === true || value === 1 ? true :
@@ -388,17 +408,27 @@ class DouyinCollector:
         self, max_collections: int = 100, max_videos_per_collection: int = 500
     ) -> FavoriteScrapeSnapshot:
         """返回登录时已抓取的快照，如果不存在则报错"""
-        if self._snapshot is None:
+        with self._state_lock:
+            snapshot = self._snapshot
+            busy = self._login_task is not None and not self._login_task.done()
+            phase = self.phase
+        if snapshot is None:
+            if busy:
+                raise RuntimeError("收藏连接正在进行中，请等待读取完成后再同步。")
+            if phase == "failed":
+                raise RuntimeError("本次收藏读取未完成，请重新连接后再同步。")
             raise RuntimeError("尚未登录或登录时未成功抓取，请先扫码登录")
-        if getattr(self._snapshot, "complete", False) is not True:
+        if getattr(snapshot, "complete", False) is not True:
             raise RuntimeError("收藏夹快照尚未完整确认，未同步已有记录；请重新登录并等待抓取完成。")
-        return self._snapshot
+        return snapshot
 
     # ------------------------------------------------------------------
     # 登出
     # ------------------------------------------------------------------
 
     def logout(self) -> tuple[bool, str]:
+        if self.login_state()["busy"]:
+            return False, "收藏连接正在进行中，请等待本次读取结束后再退出。"
         if not persistent_profile_lock.acquire(blocking=False):
             return False, "抖音登录或视频下载正在使用浏览器，请完成后再退出登录。"
         try:
@@ -407,9 +437,7 @@ class DouyinCollector:
             persistent_profile_lock.release()
 
     def _logout_locked(self) -> tuple[bool, str]:
-        if self._login_task and not self._login_task.done():
-            self._login_task.cancel()
-            self._login_task = None
+        self._login_task = None
 
         errors: list[str] = []
         try:
@@ -426,14 +454,12 @@ class DouyinCollector:
         except Exception as exc:
             errors.append(f"清理用户数据失败: {exc}")
 
-        self._snapshot = None
         if errors:
-            self.status = "failed"
-            self.message = "; ".join(errors)[:1000]
+            self._set_login_state("failed", "failed", "退出收藏连接未完成，请稍后重试。")
+            logger.error("退出收藏连接失败，发生%d项本地清理错误", len(errors))
             return False, self.message
 
-        self.status = "idle"
-        self.message = "已退出登录"
+        self._set_login_state("idle", "idle", "已退出登录")
         return True, self.message
 
 
