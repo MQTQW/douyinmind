@@ -42,7 +42,7 @@ _FOLLOWUP_ANCHOR_REASONS = frozenset('followup_anchor_' + name for name in (
     'ancestor_not_unique', 'ancestor_scope', 'root_evidence', 'agent_missing', 'reply_missing',
     'active_binding_missing', 'reply_unreserved', 'agent_binding_mismatch', 'binding_changed',
     'agent_envelope_mismatch', 'reply_readback_unconfirmed', 'reply_state', 'proposal_kind',
-    'proposal_text', 'reply_target', 'read_unconfirmed', 'lineage_scope', 'lineage_kind',
+    'proposal_text', 'clarification_context_required', 'reply_target', 'read_unconfirmed', 'lineage_scope', 'lineage_kind',
     'lineage_predecessor', 'parent_native_unmatched', 'origin_conflict', 'origins_ambiguous',
 ))
 
@@ -466,6 +466,8 @@ class LegacyBridge:
                     return _followup_anchor_reject(self, 'followup_anchor_reply_state')
                 proposal = json.loads(reply['proposal'])
                 text = proposal.get('text')
+                if proposal.get('kind') == 'clarification':
+                    return _followup_anchor_reject(self, 'followup_anchor_clarification_context_required')
                 if proposal.get('kind') not in {'answer','import_status'}:
                     return _followup_anchor_reject(self, 'followup_anchor_proposal_kind')
                 if type(text) is not str or not 1 <= len(text) <= 8000:

@@ -33,6 +33,8 @@ def make(tmp_path):
     ('native-hint:'+'c'*64,'review_legacy_prequeue'),
     ('native-hint:'+'c'*64,'resume_interrupted_prequeue'),
     (SOURCE,'request_visibility_ui_review'),
+    ('native-hint:'+'c'*64,'inspect_original_source'),
+    ('assistant-task:'+'c'*32,'inspect_original_source'),
 ])
 def test_operation_and_source_namespaces_cannot_be_swapped(tmp_path,source,operation):
     box,_,_=make(tmp_path)
@@ -51,6 +53,35 @@ def test_explicit_visibility_hint_request_is_once_and_never_an_effect(tmp_path):
     assert result['status']=='done' and result['no_model'] and result['no_import'] and result['no_send']
     assert calls==[('request_visibility_ui_review',hint)]
     assert box.process_one(lambda *_:pytest.fail('replay')) is None
+
+
+def test_original_source_inspection_only_queues_fixed_owner_read(tmp_path):
+    box,_,_=make(tmp_path)
+    request=box.submit(SOURCE,'inspect_original_source')
+    assert request['status']=='queued' and request['no_model'] and request['no_import'] and request['no_send']
+    assert json.loads(pending(box,request).read_text())['operation']=='inspect_original_source'
+    calls=[]
+    def handler(operation,source):
+        calls.append((operation,source))
+        return {'ok':True,'reviewed':True,'queued_for_fresh_ui':False,'dispatchable':False,
+            'matched':True,'private':'DO-NOT-SAVE'}
+    result=box.process_one(handler)
+    assert calls==[('inspect_original_source',SOURCE)]
+    assert result['status']=='done' and result['code']=='native_recovery_inspected'
+    assert result['queued_for_fresh_ui'] is False and result['dispatchable'] is False
+    assert result['no_model'] and result['no_import'] and result['no_send']
+    assert 'matched' not in result and 'DO-NOT-SAVE' not in result_file(box,request).read_text()
+    assert box.process_one(lambda *_:pytest.fail('inspection replay')) is None
+
+
+@pytest.mark.parametrize('field,value',[('state','running'),('desired_state','running'),
+    ('process_alive',False),('worker_state','processing'),('run_id','c'*32)])
+def test_original_source_inspection_requires_paused_live_idle_run(tmp_path,field,value):
+    box,control,_=make(tmp_path)
+    control.value[field]=value
+    with pytest.raises(NativeRecoveryMailboxError,match='native_recovery_not_paused'):
+        box.submit(SOURCE,'inspect_original_source')
+    assert list(tmp_path.iterdir())==[]
 
 
 def pending(box,request):

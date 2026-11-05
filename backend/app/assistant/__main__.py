@@ -14,6 +14,7 @@ from .integration import STATE, STORAGE, RECEIVER_STATE, AGENT_PATH, registry_if
 from .queue import AssistantQueue, utc
 from .background_mode import product_browser_headless
 from .native_configuration import build_intake_lane
+from .native_lane import _ORIGINAL_LOOKUP_REASONS, _ORIGINAL_LOOKUP_COUNT_KEYS
 
 
 def record_native_read_diagnostic(control, run_id, lane, previous):
@@ -41,6 +42,16 @@ def record_native_read_diagnostic(control, run_id, lane, previous):
         lookup_stage = value.get('lookup_stage_index')
         if type(lookup_stage) is int and 0 <= lookup_stage <= 10:
             safe['lookup_stage_index'] = lookup_stage
+        source_id = value.get('source_id')
+        if type(source_id) is str and re.fullmatch(r'native:[a-f0-9]{64}', source_id):
+            safe['source_id'] = source_id
+        lookup_reason = value.get('lookup_reason_code')
+        if type(lookup_reason) is str and lookup_reason in _ORIGINAL_LOOKUP_REASONS:
+            safe['lookup_reason_code'] = lookup_reason
+        lookup_counts = value.get('lookup_counts')
+        if type(lookup_counts) is dict:
+            safe['lookup_counts'] = {key: number for key, number in lookup_counts.items()
+                if key in _ORIGINAL_LOOKUP_COUNT_KEYS and type(number) is int and 0 <= number <= 1000000}
         safe['observed_at'] = utc()
         def record(current):
             if current.get('run_id') == run_id:
@@ -657,6 +668,7 @@ def main(argv=None):
     recovery.add_argument('--inspect-assistant-reply',help='仅登记已发表任务的B侧原线程只读检查，填写32位任务ID')
     recovery.add_argument('--review-thread-followup',help='明确登记一条从未执行的普通追问重新核对原线程，填写完整native来源号')
     recovery.add_argument('--inspect-thread-followup',help='只读定位一条未处理追问，不理解、不创建任务或发送')
+    recovery.add_argument('--inspect-original-source',help='只读核对一条暂存原生提及的原评论与通知，填写完整native来源号')
     recovery.add_argument('--review-unexecuted-followup',help='完整审计无执行记录及真实原线程后，为中断追问登记独立一次新读取；不重发任何结果')
     recovery.add_argument('--finalize-query-draft',help='核验已登记的操作员问答首稿，只生成未发草稿，不重跑模型或发送；填写32位任务号')
     parser.add_argument('--candidate-sha256',help='与操作员首稿请求一起固定已核对候选的64位SHA256，不能单独使用')
@@ -669,7 +681,7 @@ def main(argv=None):
         parser.error('先用独立启用配置命令，再通过正常助手入口加载；不与后台owner参数合并。')
     if configuring_clarification and any(value is not None for value in (args.review_native_source,args.resume_native_source,
             args.review_native_visibility_hint,args.inspect_native_visibility_hint,args.recover_native_visibility_hint,
-            args.inspect_assistant_reply,args.review_thread_followup,args.inspect_thread_followup,
+            args.inspect_assistant_reply,args.review_thread_followup,args.inspect_thread_followup,args.inspect_original_source,
             args.review_unexecuted_followup,args.finalize_query_draft,args.candidate_sha256)):
         parser.error('启用配置不能与审查、恢复、首稿或其它操作合并。')
     draft_provided = args.finalize_query_draft is not None
@@ -682,7 +694,7 @@ def main(argv=None):
         parser.error('候选SHA256格式不符。')
     if args.state_dir.absolute()!=STATE or args.state_dir.resolve()!=STATE:
         parser.error('助手目录由项目固定，不能指定其他文件或数据库。')
-    if args.run_registered and (args.review_native_source or args.resume_native_source or args.review_native_visibility_hint or args.inspect_native_visibility_hint or args.recover_native_visibility_hint or args.inspect_assistant_reply or args.review_thread_followup or args.inspect_thread_followup or args.review_unexecuted_followup or args.finalize_query_draft):
+    if args.run_registered and (args.review_native_source or args.resume_native_source or args.review_native_visibility_hint or args.inspect_native_visibility_hint or args.recover_native_visibility_hint or args.inspect_assistant_reply or args.review_thread_followup or args.inspect_thread_followup or args.inspect_original_source or args.review_unexecuted_followup or args.finalize_query_draft):
         parser.error('后台运行与本机审查请求不能合并。')
     if args.disable_intent_clarification:
         # Revoking this opt-in capability must remain possible when login or
@@ -715,12 +727,12 @@ def main(argv=None):
                 'activated_at':store.activated_at,'started':False,
                 'message':'已明确启用未来意图澄清续接。请通过正常助手入口加载匹配版本；当前owner和旧任务未变更。'},ensure_ascii=False))
             return 0
-        if args.review_native_source or args.resume_native_source or args.review_native_visibility_hint or args.inspect_native_visibility_hint or args.recover_native_visibility_hint or args.inspect_assistant_reply or args.review_thread_followup or args.inspect_thread_followup or args.review_unexecuted_followup or args.finalize_query_draft:
+        if args.review_native_source or args.resume_native_source or args.review_native_visibility_hint or args.inspect_native_visibility_hint or args.recover_native_visibility_hint or args.inspect_assistant_reply or args.review_thread_followup or args.inspect_thread_followup or args.inspect_original_source or args.review_unexecuted_followup or args.finalize_query_draft:
             from .native_recovery_mailbox import NativeRecoveryMailbox
             request=NativeRecoveryMailbox(STATE,initial.get('run_id'),control).submit(
                 ('assistant-task:'+args.inspect_assistant_reply) if args.inspect_assistant_reply else
                 ('assistant-draft:'+args.finalize_query_draft+':'+args.candidate_sha256) if args.finalize_query_draft else
-                (args.review_native_source or args.resume_native_source or args.review_native_visibility_hint or args.inspect_native_visibility_hint or args.recover_native_visibility_hint or args.review_thread_followup or args.inspect_thread_followup or args.review_unexecuted_followup),
+                (args.review_native_source or args.resume_native_source or args.review_native_visibility_hint or args.inspect_native_visibility_hint or args.recover_native_visibility_hint or args.review_thread_followup or args.inspect_thread_followup or args.inspect_original_source or args.review_unexecuted_followup),
                 'review_legacy_prequeue' if args.review_native_source else
                 'resume_interrupted_prequeue' if args.resume_native_source else
                 'inspect_visibility_hint' if args.inspect_native_visibility_hint else
@@ -728,6 +740,7 @@ def main(argv=None):
                 'inspect_reply' if args.inspect_assistant_reply else
                 'finalize_query_draft' if args.finalize_query_draft else
                 'inspect_thread_followup' if args.inspect_thread_followup else
+                'inspect_original_source' if args.inspect_original_source else
                 'review_unexecuted_followup' if args.review_unexecuted_followup else
                 'request_followup_ui_review' if args.review_thread_followup else 'request_visibility_ui_review')
             print(json.dumps(request,ensure_ascii=False))

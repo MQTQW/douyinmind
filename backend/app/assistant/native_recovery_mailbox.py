@@ -23,7 +23,7 @@ _DRAFT = re.compile(r'assistant-draft:[a-f0-9]{32}:[a-f0-9]{64}\Z')
 _REQUEST = re.compile(r'([a-f0-9]{32})\.json\Z')
 OPERATIONS = frozenset({'review_legacy_prequeue', 'resume_interrupted_prequeue','request_visibility_ui_review',
                         'inspect_visibility_hint','recover_visibility_hint','inspect_reply','request_followup_ui_review',
-                        'inspect_thread_followup','review_unexecuted_followup','finalize_query_draft'})
+                        'inspect_thread_followup','inspect_original_source','review_unexecuted_followup','finalize_query_draft'})
 _MARKER = 'DouyinMind.native-review.v1'
 _BOOLS = ('reviewed', 'eligible', 'queued_for_fresh_ui', 'historical_preserved', 'dispatchable')
 _HANDLER_CODES = frozenset({'native_recovery_not_safe', 'native_recovery_scope_unavailable',
@@ -298,7 +298,7 @@ class NativeRecoveryMailbox:
                     else:
                         code = ('assistant_reply_inspected' if value['operation'] == 'inspect_reply' else
                             'native_visibility_recovery_requested' if value['operation'] == 'recover_visibility_hint' else
-                            'native_recovery_inspected' if value['operation'] == 'inspect_visibility_hint' else
+                            'native_recovery_inspected' if value['operation'] in {'inspect_visibility_hint','inspect_original_source'} else
                             'native_recovery_reviewed' if value['operation'] == 'review_legacy_prequeue' else
                             'operator_query_draft_finalized' if value['operation'] == 'finalize_query_draft' else
                             'native_recovery_resume_requested')

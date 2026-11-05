@@ -125,7 +125,16 @@ jobs:
             'tests/test_clarification_recovery_safety.py',
             'tests/test_choice_menu_versions.py',
             'tests/test_mention_agent_import_mode.py',
-            'tests/test_thread_followup_semantic_limits.py'
+            'tests/test_thread_followup_semantic_limits.py',
+            'tests/test_followup_anchor_diagnostics.py',
+            'tests/test_native_original_source_inspection.py',
+            'tests/test_native_read_diagnostics.py',
+            'tests/test_native_read_diagnostic_projection.py',
+            'tests/test_native_recovery_owner.py',
+            'tests/test_thread_followup_entry_guard.py',
+            'tests/test_assistant_native_recovery_mailbox.py::test_operation_and_source_namespaces_cannot_be_swapped',
+            'tests/test_assistant_native_recovery_mailbox.py::test_original_source_inspection_only_queues_fixed_owner_read',
+            'tests/test_assistant_native_recovery_mailbox.py::test_original_source_inspection_requires_paused_live_idle_run'
           )
           & $backendPython @runnerArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

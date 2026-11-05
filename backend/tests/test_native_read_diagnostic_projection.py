@@ -62,3 +62,43 @@ def test_lookup_stage_is_only_a_bounded_integer_observation():
             assert saved['lookup_stage_index'] == number
         else:
             assert 'lookup_stage_index' not in saved
+
+
+def test_fixed_source_lookup_reason_and_counts_are_current_diagnostics_only():
+    state, control = case()
+    value = observation(source_id='native:'+'a'*64, lookup_reason_code='intervention_required',
+        lookup_counts={'candidate_count':2,'final_verified':0,'page_open_count':1,
+            'raw':'DO-NOT-SAVE','checked_count':True,'history_scrolls':-1,'match_count':1000001},
+        secret='DO-NOT-SAVE', path='DO-NOT-SAVE')
+    assert record_native_read_diagnostic(control,'synthetic-run',SimpleNamespace(last_native_read_diagnostic=value),None)
+    saved = state['native_read_diagnostic']
+    assert saved['source_id']=='native:'+'a'*64
+    assert saved['lookup_reason_code']=='intervention_required'
+    assert saved['lookup_counts']=={'candidate_count':2,'final_verified':0,'page_open_count':1}
+    assert state['state']==state['desired_state']=='running'
+    assert 'DO-NOT-SAVE' not in str(saved)
+
+
+def test_unrecognized_source_reason_or_counter_values_cannot_escape_projection():
+    for changes in ({'source_id':'native-hint:'+'a'*64}, {'source_id':'file:///private'},
+                    {'source_id':'native:'+'A'*64}, {'source_id':{}},
+                    {'lookup_reason_code':'DO-NOT-SAVE'}, {'lookup_reason_code':[]},
+                    {'lookup_counts':[]}, {'lookup_counts':{'candidate_count':True}}):
+        state, control = case()
+        value=observation(**changes)
+        assert record_native_read_diagnostic(control,'synthetic-run',SimpleNamespace(last_native_read_diagnostic=value),None)
+        saved=state['native_read_diagnostic']
+        assert 'source_id' not in saved and 'lookup_reason_code' not in saved
+        assert saved.get('lookup_counts',{})=={}
+
+
+def test_old_owner_cannot_replace_source_correlated_failure_diagnostic():
+    state, control = case()
+    current=observation(source_id='native:'+'a'*64,lookup_reason_code='original_notification_not_found',
+        lookup_counts={'candidate_count':0})
+    lane=SimpleNamespace(last_native_read_diagnostic=current)
+    assert record_native_read_diagnostic(control,'synthetic-run',lane,None)
+    before=deepcopy(state)
+    lane.last_native_read_diagnostic=observation(source_id='native:'+'b'*64,lookup_reason_code='matched')
+    assert record_native_read_diagnostic(control,'old-run',lane,None)
+    assert state==before

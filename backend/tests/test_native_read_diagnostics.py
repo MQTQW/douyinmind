@@ -65,9 +65,10 @@ def test_plain_page_failure_keeps_attempt_two_claim_without_effects_and_drops_ol
     assert row(store,source)==expected and expected['state']=='claimed' and expected['attempts']==2
     assert expected['plan'] is expected['task_id'] is expected['reference_id'] is None
     assert lane.last_native_read_diagnostic=={'stage':'original_ui_lookup','code':'native_read_page_unready',
-        'exception_type':'ReceiverPageError','viewport_counts':{'configured':1,'expanded':1,'restored':1,'restore_failed':0}}
+        'exception_type':'ReceiverPageError','viewport_counts':{'configured':1,'expanded':1,'restored':1,'restore_failed':0},
+        'source_id':source}
     diagnostic=json.dumps(lane.last_native_read_diagnostic)
-    assert all(value not in diagnostic for value in ('PRIVATE','token','https://',source,expected['claim_token'],'matched'))
+    assert all(value not in diagnostic for value in ('PRIVATE','token','https://',expected['claim_token'],'matched'))
     with pytest.raises(NativeStoreError,match='already_requested'):
         request(reviewed_case)
     lane.semantic_intake_ready=lambda:False
@@ -86,7 +87,8 @@ def test_followup_none_resolution_has_its_own_fixed_report_and_keeps_claim(revie
     assert row(store,source)==expected and expected['state']=='claimed' and expected['attempts']==2
     assert effects=={'read':1,'native_get':0,'model':0,'enqueue':0,'send':0}
     assert lane.last_native_read_diagnostic=={'stage':'followup_prepare','code':'native_followup_no_resolution',
-        'exception_type':None,'viewport_counts':{'configured':1,'expanded':1,'restored':1,'restore_failed':0}}
+        'exception_type':None,'viewport_counts':{'configured':1,'expanded':1,'restored':1,'restore_failed':0},
+        'source_id':source}
 
 
 def bare_lane():
@@ -122,6 +124,30 @@ def test_read_return_none_is_not_retried_or_converted_to_a_failure_transition():
     assert calls==['read']
     assert lane.last_native_read_diagnostic=={'stage':'original_ui_lookup','code':'native_read_no_result',
         'exception_type':None,'viewport_counts':ZERO}
+
+
+def test_read_records_exact_source_and_fixed_lookup_reason_with_bounded_counts():
+    lane=bare_lane()
+    source='native:'+'7'*64
+    def read():
+        lane.adapter.last_original_lookup={'reason_code':'original_notification_not_found',
+            'candidate_count':0,'checked_count':True,'raw':'PRIVATE'}
+        return None
+    lane._read_with_interruption_receipt({'source_id':source},'original_ui_lookup',read)
+    assert lane.last_native_read_diagnostic['source_id']==source
+    assert lane.last_native_read_diagnostic['lookup_reason_code']=='original_notification_not_found'
+    assert lane.last_native_read_diagnostic['lookup_counts']=={'candidate_count':0}
+    assert 'PRIVATE' not in json.dumps(lane.last_native_read_diagnostic)
+
+
+@pytest.mark.parametrize('source',['PRIVATE',True,None,'native:'+'f'*63])
+def test_read_omits_invalid_source_and_unrecognized_reason(source):
+    lane=bare_lane()
+    def read():
+        lane.adapter.last_original_lookup={'reason_code':'PRIVATE','raw':'PRIVATE'}
+    lane._read_with_interruption_receipt({'source_id':source},'original_ui_lookup',read)
+    assert 'source_id' not in lane.last_native_read_diagnostic
+    assert 'lookup_reason_code' not in lane.last_native_read_diagnostic
 
 
 @pytest.mark.parametrize('index',[0,2,10,True,-1,11,'PRIVATE',{}])

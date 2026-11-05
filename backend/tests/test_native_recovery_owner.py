@@ -74,3 +74,70 @@ def test_visibility_hint_request_only_arms_read_only_review(case):
     assert result['ok'] is True and result['queued_for_fresh_ui'] is True
     assert result['dispatchable'] is False and case.events==['hint_request']
     assert case.state['desired_state']=='paused'
+
+
+def test_original_source_inspection_reads_once_and_keeps_processing_paused(case):
+    def inspect(source):
+        assert case.flags[0].is_set() and case.flags[1].is_set()
+        case.events.append(('original_inspect',source))
+        return {'source_id':source,'status':'original_source_inspected',
+            'matched':True,'dispatchable':False}
+    case.lane.inspect_original_source=inspect
+    result=case.owner('inspect_original_source',SOURCE)
+    assert result=={'ok':True,'reviewed':True,'queued_for_fresh_ui':False,
+        'historical_preserved':True,'dispatchable':False}
+    assert case.events==[('original_inspect',SOURCE)]
+    assert case.state['state']==case.state['desired_state']=='paused'
+    assert not case.flags[0].is_set() and not case.flags[1].is_set()
+
+
+@pytest.mark.parametrize('block',['state','desired','run','process','worker_state',
+    'worker_inflight','manual','hold','executing','publishing'])
+def test_original_source_inspection_obeys_existing_owner_gates(case,block):
+    case.lane.inspect_original_source=lambda *_:pytest.fail('blocked owner invoked source READ')
+    if block=='state':case.state['state']='running'
+    elif block=='desired':case.state['desired_state']='running'
+    elif block=='run':case.state['run_id']='b'*32
+    elif block=='process':case.state['process_alive']=False
+    elif block=='worker_state':case.state['worker_state']='processing'
+    elif block=='worker_inflight':case.flags[2].set()
+    elif block=='manual':case.pending[0]=True
+    elif block=='hold':case.flags[0].set()
+    else:case.counts[block]=1
+    assert case.owner('inspect_original_source',SOURCE)=={'ok':False,'code':'native_recovery_not_safe'}
+    assert case.events==[]
+
+
+@pytest.mark.parametrize('change',[{'dispatchable':True},{'source_id':'native:'+'2'*64},
+    {'status':'unrecognized_read_result'}])
+def test_original_source_inspection_rejects_invalid_lane_result(case,change):
+    value={'source_id':SOURCE,'status':'original_source_inspected','dispatchable':False}
+    value.update(change)
+    case.lane.inspect_original_source=lambda source:value
+    assert case.owner('inspect_original_source',SOURCE)=={'ok':False,'code':'native_recovery_effects_unknown'}
+    assert case.state['desired_state']=='paused'
+    assert not case.flags[0].is_set() and not case.flags[1].is_set()
+
+
+def test_original_source_inspection_failure_keeps_fixed_reason_and_pause(case):
+    def failed(source):raise ValueError('DO-NOT-SAVE')
+    case.lane.inspect_original_source=failed
+    assert case.owner('inspect_original_source',SOURCE)=={'ok':False,'code':'native_recovery_not_safe'}
+    assert case.state['desired_state']=='paused'
+    assert not case.flags[0].is_set() and not case.flags[1].is_set()
+
+
+@pytest.mark.parametrize('reason',['matched','intervention_required'])
+def test_original_source_inspection_projects_only_bounded_lookup_counts(case,reason):
+    case.owner.control.queue=SimpleNamespace(update_control=lambda update:update(case.state))
+    case.lane.last_native_recovery_diagnostic={
+        'stage':'original_inspect_complete','code':'original_source_matched',
+        'lookup_reason_code':reason,'raw':'DO-NOT-SAVE',
+        'lookup_counts':{'candidate_count':1,'final_verified':1,'checked_count':True,
+            'page_open_count':-1,'history_scrolls':1000001,'raw':'DO-NOT-SAVE'}}
+    case.lane.inspect_original_source=lambda source:{'source_id':source,
+        'status':'original_source_inspected','dispatchable':False,'matched':True}
+    assert case.owner('inspect_original_source',SOURCE)['queued_for_fresh_ui'] is False
+    assert case.state['native_recovery']=={'source_id':SOURCE,'diagnostic':{
+        'stage':'original_inspect_complete','code':'original_source_matched',
+        'lookup_reason_code':reason,'lookup_counts':{'candidate_count':1,'final_verified':1}}}

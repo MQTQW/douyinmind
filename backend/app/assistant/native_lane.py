@@ -56,6 +56,16 @@ _NATIVE_READ_CODES = frozenset({'native_read_checking', 'native_read_complete', 
 _NATIVE_READ_EXCEPTION_TYPES = frozenset({'ReceiverPageError', 'ReceiverDetailError',
     'ReceiverInterventionRequired', 'NativeLaneError', 'TimeoutError', 'ValueError', 'TypeError', 'KeyError', 'local_error'})
 _NATIVE_READ_VIEWPORT_KEYS = ('configured', 'expanded', 'restored', 'restore_failed')
+_ORIGINAL_LOOKUP_COUNT_KEYS = frozenset({'candidate_limit', 'candidate_count', 'checked_count',
+    'match_count', 'unreadable_count', 'final_rechecks', 'final_verified', 'snapshot_changes',
+    'page_open_count', 'lookup_stage_index', 'history_scrolls'})
+_ORIGINAL_LOOKUP_REASONS = frozenset({'checking', 'matched', 'invalid_original_target',
+    'native_correlation_requires_source_id', 'receiver_binding_mismatch',
+    'original_notifications_unavailable', 'original_notification_not_unique',
+    'original_notification_candidates_exceed_limit', 'original_notification_changed',
+    'original_notification_not_found', 'original_candidate_unreadable', 'original_target_not_unique',
+    'original_native_semantic_ambiguous', 'original_target_changed', 'original_lookup_stopped',
+    'original_identity_not_ready', 'original_lookup_unavailable', 'intervention_required'})
 
 
 class NativeLaneError(ReceiverPageError):
@@ -256,6 +266,7 @@ class NativeLane:
             'code':code if type(code) is str and code in _NATIVE_READ_CODES else 'native_read_unconfirmed',
             'exception_type':kind, 'viewport_counts':counts}
         lookup_stage = previous.get('lookup_stage_index')
+        lookup = {}
         if capture_viewport:
             try:
                 lookup = getattr(self.adapter, 'last_original_lookup', {})
@@ -264,11 +275,22 @@ class NativeLane:
                 lookup_stage = None
         if type(lookup_stage) is int and 0 <= lookup_stage <= 10:
             diagnostic['lookup_stage_index'] = lookup_stage
+        source_id = previous.get('source_id')
+        if type(source_id) is str and re.fullmatch(r'native:[a-f0-9]{64}', source_id):
+            diagnostic['source_id'] = source_id
+        if capture_viewport and type(lookup) is dict:
+            reason = lookup.get('reason_code')
+            if type(reason) is str and reason in _ORIGINAL_LOOKUP_REASONS:
+                diagnostic['lookup_reason_code'] = reason
+            lookup_counts = {key: value for key, value in lookup.items()
+                if key in _ORIGINAL_LOOKUP_COUNT_KEYS and type(value) is int and 0 <= value <= 1000000}
+            if lookup_counts:
+                diagnostic['lookup_counts'] = lookup_counts
         self.last_native_read_diagnostic = diagnostic
 
     def _read_with_interruption_receipt(self, claim, stage, read):
         self._owner()
-        self.last_native_read_diagnostic = {}
+        self.last_native_read_diagnostic = {'source_id': claim.get('source_id')}
         self._native_read_diagnostic(stage, 'native_read_checking')
         # A viewport-entry checkpoint can fail before the inner reader seeds its
         # own diagnostics. Never inherit a previous inspect's matched evidence.
@@ -465,6 +487,108 @@ class NativeLane:
                     'lookup_stage_index', 'history_scrolls'} and type(value) is int and 0 <= value <= 1000000}
         return {'source_id': source_id, 'status': 'followup_source_inspected',
             'dispatchable': False, 'matched': envelope is not None}
+
+    def inspect_original_source(self, source_id):
+        """Read a held AT source through its owner page without consuming it."""
+        self._owner()
+        diagnostic = {'stage': 'original_inspect_scope', 'code': 'checking'}
+        self.last_native_recovery_diagnostic = diagnostic
+        state = self.queue.get_control()
+        if (self.run_id is None or state.get('run_id') != self.run_id
+                or state.get('state') != 'paused' or state.get('desired_state') != 'paused'
+                or type(source_id) is not str or not re.fullmatch(r'native:[a-f0-9]{64}', source_id)):
+            raise NativeLaneError('native_recovery_not_safe')
+        self._recovery_identity()
+        before = self.source_store.get_source(source_id)
+        if (not isinstance(before, dict) or before.get('state') != 'held'
+                or before.get('hold_code') != 'native_ui_unverified'
+                or before.get('historical') is not False
+                or any(before.get(key) is not None for key in ('plan', 'task_id', 'reference_id'))):
+            raise NativeLaneError('native_recovery_scope_unavailable')
+        candidate = self._candidate(before.get('candidate'))
+        if (candidate['source_kind'] != 'native_notice_candidate'
+                or not self._visibility_scope_current(candidate)
+                or not self._visibility_absent_from_effects(candidate)):
+            raise NativeLaneError('native_recovery_scope_unavailable')
+
+        def checkpoint():
+            if not self._checkpoint():
+                return False
+            current = self.queue.get_control()
+            return (current.get('run_id') == self.run_id
+                and current.get('state') == current.get('desired_state') == 'paused'
+                and self.source_store.get_source(source_id) == before
+                and self._visibility_scope_current(candidate)
+                and self._visibility_absent_from_effects(candidate))
+
+        if not checkpoint():
+            raise NativeLaneError('native_recovery_scope_unavailable')
+        target = {'sender_profile_url': candidate['sender_profile_url'],
+            'receiver_profile_url': candidate['receiver_profile_url'], 'video_id': candidate['video_id'],
+            'comment_text': candidate['content'], 'native_comment_id': candidate['native_comment_id'],
+            'reference_id': 'native-inspection:' + source_id.split(':', 1)[1]}
+        self.adapter.last_original_lookup = {}
+        diagnostic['stage'] = 'original_inspect_read'
+        detail = None
+        try:
+            try:
+                detail = self.adapter.open_original_from_notifications(target,
+                    max_candidates=8, native_candidate_correlation=True)
+            except ReceiverDetailError:
+                diagnostic['code'] = 'original_source_unverified'
+            self._recovery_identity()
+            if not checkpoint():
+                raise NativeLaneError('native_recovery_scope_unavailable')
+            lookup = getattr(self.adapter, 'last_original_lookup', {})
+            lookup = lookup if type(lookup) is dict else {}
+            observed = detail.get('native_comment_id') if isinstance(detail, dict) else None
+            notice = detail.get('native_ui_notice') if isinstance(detail, dict) else None
+            correlation = {'source_native_comment_id': candidate['native_comment_id'],
+                'observed_native_comment_id': observed,
+                'quality': 'native_equal' if observed == candidate['native_comment_id'] else 'semantic_only'}
+            matched = (isinstance(detail, dict)
+                and all(detail.get(key) == candidate[key] for key in
+                    ('sender_profile_url', 'receiver_profile_url', 'video_id'))
+                and type(detail.get('command_text')) is str
+                and _normal(detail['command_text']) == _normal(candidate['content'])
+                and 'native_comment_id' in detail and observed in (None, candidate['native_comment_id'])
+                and not detail.get('native_comment_id_conflict')
+                and ('ok' not in detail or detail['ok'] is True)
+                and ('unique_count' not in detail
+                    or type(detail['unique_count']) is int and detail['unique_count'] == 1)
+                and all(key not in detail or detail[key] is True
+                    for key in ('real_mention', 'sender_verified', 'video_verified'))
+                and detail.get('native_correlation') == correlation
+                and type(notice) is dict
+                and set(notice) == {'source_profile_url', 'exact_text', 'semantic_fingerprint'}
+                and notice['source_profile_url'] == candidate['sender_profile_url']
+                and type(notice['exact_text']) is str
+                and _normal(notice['exact_text']) == _normal(candidate['content'])
+                and type(notice['semantic_fingerprint']) is str and bool(notice['semantic_fingerprint'].strip())
+                and lookup.get('reason_code') == 'matched'
+                and type(lookup.get('final_verified')) is int and lookup['final_verified'] == 1
+                and type(lookup.get('lookup_stage_index')) is int and lookup['lookup_stage_index'] == 10)
+            diagnostic.update(stage='original_inspect_complete',
+                code='original_source_matched' if matched else 'original_source_unverified')
+            return {'source_id': source_id, 'status': 'original_source_inspected',
+                'dispatchable': False, 'matched': bool(matched)}
+        except Exception as error:
+            code = getattr(error, 'code', None)
+            diagnostic['code'] = code if type(code) is str and code in {'native_recovery_not_safe',
+                'native_recovery_scope_unavailable', 'native_recovery_stopped',
+                'native_recovery_identity_unverified'} else 'original_source_unverified'
+            kinds = {'ReceiverDetailError', 'ReceiverPageError', 'ReceiverInterventionRequired',
+                'NativeLaneError', 'NativeStoreError', 'TimeoutError', 'KeyError', 'TypeError', 'ValueError'}
+            diagnostic['exception_type'] = type(error).__name__ if type(error).__name__ in kinds else 'local_error'
+            raise
+        finally:
+            lookup = getattr(self.adapter, 'last_original_lookup', {})
+            if type(lookup) is dict:
+                diagnostic['lookup_counts'] = {key: value for key, value in lookup.items()
+                    if key in _ORIGINAL_LOOKUP_COUNT_KEYS and type(value) is int and 0 <= value <= 1000000}
+                reason = lookup.get('reason_code')
+                if type(reason) is str and reason in _ORIGINAL_LOOKUP_REASONS:
+                    diagnostic['lookup_reason_code'] = reason
 
     def inspect_visibility_hint(self, hint_id):
         """Explicit paused-owner READ only; never reclaim or revive a hint.

@@ -8,6 +8,7 @@ import re
 from datetime import datetime
 
 from app.mention_receiver.browser import ReceiverInterventionRequired
+from .native_lane import _ORIGINAL_LOOKUP_REASONS, _ORIGINAL_LOOKUP_COUNT_KEYS
 
 
 class NativeRecoveryOwner:
@@ -61,6 +62,8 @@ class NativeRecoveryOwner:
                     result=self.lane.review_no_effects_followup(source_id)
                 elif operation=='inspect_thread_followup':
                     result=self.lane.inspect_followup_source(source_id)
+                elif operation=='inspect_original_source':
+                    result=self.lane.inspect_original_source(source_id)
                 elif operation=='finalize_query_draft':
                     matched = re.fullmatch(r'assistant-draft:([a-f0-9]{32}):([a-f0-9]{64})',source_id) if type(source_id) is str else None
                     if matched is None or self.draft_finalizer is None:
@@ -88,10 +91,10 @@ class NativeRecoveryOwner:
                         or result.get('status') not in {'legacy_prequeue_review_resumed','prequeue_resume_requested',
                                                      'visibility_ui_review_requested','visibility_hint_inspected',
                                                      'visibility_hint_recovery_requested','assistant_reply_inspected',
-                                                     'followup_ui_review_requested','followup_source_inspected',
+                                                     'followup_ui_review_requested','followup_source_inspected','original_source_inspected',
                                                      'followup_no_effects_review_queued','operator_query_draft_finalized'}):
                     return {'ok':False,'code':'native_recovery_effects_unknown'}
-                return {'ok':True,'reviewed':True,'queued_for_fresh_ui':operation not in {'inspect_visibility_hint','inspect_reply','inspect_thread_followup','finalize_query_draft'},
+                return {'ok':True,'reviewed':True,'queued_for_fresh_ui':operation not in {'inspect_visibility_hint','inspect_reply','inspect_thread_followup','inspect_original_source','finalize_query_draft'},
                         'historical_preserved':True,'dispatchable':False}
             except ReceiverInterventionRequired:
                 self.control.set_receiver_health(self.run_id,'verification_required',reason_code='human_intervention_required')
@@ -113,11 +116,8 @@ class NativeRecoveryOwner:
                           and type(v) is str and len(v)<100}
                     counts=diagnostic.get('lookup_counts')
                     if type(counts) is dict:
-                        keys={'candidate_limit','candidate_count','checked_count','match_count','unreadable_count',
-                              'final_rechecks','final_verified','snapshot_changes','page_open_count',
-                              'lookup_stage_index','history_scrolls'}
                         safe['lookup_counts']={k:v for k,v in counts.items()
-                            if k in keys and type(v) is int and 0<=v<=1000000}
+                            if k in _ORIGINAL_LOOKUP_COUNT_KEYS and type(v) is int and 0<=v<=1000000}
                     followup_counts=diagnostic.get('followup_counts')
                     if operation=='inspect_thread_followup' and type(followup_counts) is dict:
                         keys={'original_root_count','ask_count','selection_count','choice_sender_row_count',
@@ -133,13 +133,7 @@ class NativeRecoveryOwner:
                         keys={'user_count','device_count','root_task_count','origin_count'}
                         safe['anchor_counts']={k:v for k,v in anchor_counts.items()
                             if k in keys and type(v) is int and 0<=v<=1000000}
-                    reasons={'checking','matched','invalid_original_target','native_correlation_requires_source_id',
-                        'receiver_binding_mismatch','original_notifications_unavailable','original_notification_not_unique',
-                        'original_notification_candidates_exceed_limit','original_notification_changed',
-                        'original_notification_not_found','original_candidate_unreadable','original_target_not_unique',
-                        'original_native_semantic_ambiguous','original_target_changed','original_lookup_stopped',
-                        'original_identity_not_ready','original_lookup_unavailable'}
-                    if type(diagnostic.get('lookup_reason_code')) is str and diagnostic['lookup_reason_code'] in reasons:
+                    if type(diagnostic.get('lookup_reason_code')) is str and diagnostic['lookup_reason_code'] in _ORIGINAL_LOOKUP_REASONS:
                         safe['lookup_reason_code']=diagnostic['lookup_reason_code']
                     if operation=='inspect_reply':
                         for key in ('b_view_visible_now','a_visibility_verified'):

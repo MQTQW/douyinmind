@@ -152,7 +152,8 @@ def test_persisted_task_reply_and_binding_refusals_have_separate_fixed_codes(anc
     alter_json = lambda column, value: lambda raw: json.dumps({**json.loads(raw), column: value})
     cells = [
         (c.agent.path, 'agent_replies', 'send_token', 'task_id', agent_id, None, 'reply_unreserved'),
-        (c.agent.path, 'agent_replies', 'proposal', 'task_id', agent_id, alter_json('kind', 'clarification'), 'proposal_kind'),
+        (c.agent.path, 'agent_replies', 'proposal', 'task_id', agent_id, alter_json('kind', 'clarification'), 'clarification_context_required'),
+        (c.agent.path, 'agent_replies', 'proposal', 'task_id', agent_id, alter_json('kind', 'unsupported'), 'proposal_kind'),
         (c.agent.path, 'agent_replies', 'proposal', 'task_id', agent_id, alter_json('text', 7), 'proposal_text'),
         (c.agent.path, 'agent_replies', 'target', 'task_id', agent_id, alter_json('unexpected', 'DIAGNOSTIC-PRIVATE'), 'reply_target'),
         (c.agent.path, 'agent_bindings', 'payload', 'binding_id', binding_id, alter_json('unexpected', 'DIAGNOSTIC-PRIVATE'), 'binding_changed'),
@@ -165,7 +166,37 @@ def test_persisted_task_reply_and_binding_refusals_have_separate_fixed_codes(anc
     assert_fixed(c, 'followup_anchor_matched', ONE_COUNTS)
 
 
-def test_zero_anchor_inspection_projects_only_current_fixed_diagnostic_without_ui_or_effects(observed_followup_case):
+def test_legacy_clarification_requires_typed_context_without_observation_or_rearming(anchored_case, monkeypatch):
+    from app.assistant.thread_followup import ThreadFollowupCoordinator
+    from app.assistant.clarification_sessions import ClarificationSessionStore, DATABASE_NAME
+
+    c = anchored_case
+    task_id = c.anchor['root_agent_task_id']
+    def clarification(raw):
+        return json.dumps({**json.loads(raw), 'kind': 'clarification'})
+    def forbidden(*args, **kwargs):
+        pytest.fail('legacy clarification diagnostics performed an observation or armed a new session')
+
+    with changed_cell(c.agent.path, 'agent_replies', 'proposal', 'task_id', task_id, clarification):
+        coordinator = ThreadFollowupCoordinator(SimpleNamespace(pending={}), c.bridge)
+        monkeypatch.setattr(ClarificationSessionStore, 'prepare', forbidden)
+        for enabled in (False, True):
+            c.bridge.clarifications = SimpleNamespace(store=SimpleNamespace(enabled=enabled),
+                admitted=forbidden, prepare=forbidden)
+            result = readonly_call(c, lambda: coordinator.observe(c.candidate,
+                checkpoint=lambda: True, read=forbidden))
+            assert result == (None, None, None, 'native_reply_parent_unresolved')
+            assert_fixed(c, 'followup_anchor_clarification_context_required', {
+                'user_count': 1, 'device_count': 1, 'root_task_count': 1, 'origin_count': 0})
+            assert not (c.directory / DATABASE_NAME).exists()
+        monkeypatch.setattr(c.bridge, 'source_authorizer', lambda task: False)
+        assert readonly_call(c, lambda: c.bridge.followup_anchors(c.candidate)) == []
+        assert_fixed(c, 'followup_anchor_source_authorizer_rejected')
+
+
+@pytest.mark.parametrize('reason', ['followup_anchor_source_authorizer_rejected',
+    'followup_anchor_clarification_context_required'])
+def test_zero_anchor_inspection_projects_only_current_fixed_diagnostic_without_ui_or_effects(observed_followup_case, reason):
     c = observed_followup_case
     lane, store, state, saved, events = inspection_lane(c)
     before = deepcopy(saved)
@@ -190,7 +221,7 @@ def test_zero_anchor_inspection_projects_only_current_fixed_diagnostic_without_u
         def followup_anchors(self, candidate):
             self.calls.append('anchors')
             if self.emit:
-                self.value = {'code': 'followup_anchor_source_authorizer_rejected', 'counts': {
+                self.value = {'code': reason, 'counts': {
                     **ONE_COUNTS, 'origin_count': 0, 'raw': 'DIAGNOSTIC-PRIVATE'}}
             return []
     bridge = DiagnosticBridge()
@@ -198,7 +229,7 @@ def test_zero_anchor_inspection_projects_only_current_fixed_diagnostic_without_u
     result = lane.inspect_followup_source(saved['source_id'])
     assert result['matched'] is False and result['dispatchable'] is False
     diagnostic = lane.last_native_recovery_diagnostic
-    assert diagnostic['code'] == 'followup_anchor_source_authorizer_rejected'
+    assert diagnostic['code'] == reason
     assert diagnostic['anchor_counts'] == {**ONE_COUNTS, 'origin_count': 0}
     assert bridge.calls == ['reset', 'anchors']
     assert saved == before and 'read' not in events and c.c.model.requests == [] and not c.lane.pending
@@ -213,17 +244,20 @@ def test_zero_anchor_inspection_projects_only_current_fixed_diagnostic_without_u
     assert saved == before and 'read' not in events and c.c.model.requests == []
 
 
-def test_owner_projects_only_four_nonboolean_bounded_anchor_counts(recovery_owner_case):
+@pytest.mark.parametrize('reason', ['followup_anchor_source_authorizer_rejected',
+    'followup_anchor_clarification_context_required'])
+def test_owner_projects_only_four_nonboolean_bounded_anchor_counts(recovery_owner_case, reason):
     c = recovery_owner_case
     writes = []
     c.owner.control.queue = SimpleNamespace(update_control=lambda fn: writes.append(fn(dict(c.state))))
     c.lane.last_native_recovery_diagnostic = {
-        'stage': 'followup_inspect_complete', 'code': 'followup_anchor_source_authorizer_rejected',
+        'stage': 'followup_inspect_complete', 'code': reason,
         'anchor_counts': {'user_count': 1, 'device_count': 1, 'root_task_count': 1, 'origin_count': 0,
             'raw': 'DIAGNOSTIC-PRIVATE'}}
     c.lane.inspect_followup_source = lambda source: {'source_id': source,
         'status': 'followup_source_inspected', 'dispatchable': False, 'matched': False}
     assert c.owner('inspect_thread_followup', SOURCE)['ok'] is True
+    assert writes[0]['native_recovery']['diagnostic']['code'] == reason
     assert writes[0]['native_recovery']['diagnostic']['anchor_counts'] == {**ONE_COUNTS, 'origin_count': 0}
     assert 'DIAGNOSTIC-PRIVATE' not in str(writes)
     c.lane.last_native_recovery_diagnostic['anchor_counts'] = {
