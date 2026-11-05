@@ -1,6 +1,5 @@
 """Actual TEMP Worker/SQL lifecycle, fake LLM and no platform/index clients."""
 import threading
-import time
 
 import pytest
 from sqlalchemy import select
@@ -63,14 +62,24 @@ def test_actual_typed_worker_owns_notes_and_maintenance_exclusion_and_restart_ne
     c = context; local = Worker(c.tmp / 'typed-jobs.sqlite3')
     if long_form: long_source(c)
     service = NotesService(session_factory=c.factory, worker=local, llm=c.model, ready=lambda: True)
-    entered, release = threading.Event(), threading.Event()
-    c.model.on_call = lambda index: (entered.set(), release.wait(4))
+    entered, release, completed = threading.Event(), threading.Event(), threading.Event()
+    run_notes = service._run
+    def observed_run(*args, **kwargs):
+        try:
+            return run_notes(*args, **kwargs)
+        finally:
+            completed.set()
+    service._run = observed_run
+    def held_model_call(index):
+        entered.set()
+        assert release.wait(10), 'the test did not release its fake model call'
+    c.model.on_call = held_model_call
     try:
         local.start()
         result = service.submit(c.db, VIDEO, request_id=__import__('uuid').uuid4(), confirm=True,
             expected_source_fingerprint=service.source_view(c.db, VIDEO)['fingerprint'])
         task_id = result['item']['task_id']
-        assert entered.wait(3)
+        assert entered.wait(10), 'the actual worker did not enter its fake model call'
         assert local.get_progress(task_id)['kind'] == 'notes'
         assert local.list_tasks(kind='ingestion') == [] and local.count_tasks(kind='notes') == 1
         with pytest.raises(WorkerBusyError):
@@ -79,16 +88,21 @@ def test_actual_typed_worker_owns_notes_and_maintenance_exclusion_and_restart_ne
             local.submit('other-ingestion', lambda *, task_id: None,
                 job_metadata={'platform_item_ids': [VIDEO]}, job_kind='ingestion')
         release.set()
-        deadline = time.monotonic() + 4
-        while time.monotonic() < deadline and local.get_progress(task_id)['status'] not in {'done', 'failed'}:
-            time.sleep(.01)
+        # All actual note steps must return before stopping: an earlier stop
+        # correctly fences the next paid segment. Wait on the callback instead
+        # of repeatedly opening the ledger while it is persisting those steps.
+        assert completed.wait(10), 'the actual NotesService callback did not finish'
+        assert len(c.model.calls) == (3 if long_form else 1)
+        stopped = local.stop(timeout=10)
+        assert stopped['stopped'] and not stopped['timed_out']
+        assert stopped.get('state_recorded') is not False
         assert local.get_progress(task_id)['status'] == 'done'
         assert local.get_progress(task_id)['progress'] == local.get_progress(task_id)['total'] == 1
         assert service.lookup(c.db, result['item']['request_id'])['item']['state'] == 'done'
-        assert local.stop(timeout=3)['stopped']
         reopened = Worker(c.tmp / 'typed-jobs.sqlite3'); reopened.start()
         try:
             assert reopened.get_progress(task_id)['kind'] == 'notes'
+            assert reopened.get_progress(task_id)['status'] == 'done'
             assert len(c.model.calls) == (3 if long_form else 1)
         finally:
             assert reopened.stop(timeout=3)['stopped']
@@ -103,18 +117,24 @@ def test_stop_saves_current_result_but_never_starts_the_next_paid_segment(contex
     local = Worker(c.tmp / 'stopping-jobs.sqlite3')
     service = NotesService(session_factory=c.factory, worker=local, llm=c.model, ready=lambda: True)
     entered, release = threading.Event(), threading.Event()
-    c.model.on_call = lambda index: (entered.set(), release.wait(4))
+    def held_model_call(index):
+        entered.set()
+        assert release.wait(10), 'the test did not release its fake model call'
+    c.model.on_call = held_model_call
     try:
         local.start()
         result = service.submit(c.db, VIDEO, request_id=__import__('uuid').uuid4(), confirm=True,
             expected_source_fingerprint=service.source_view(c.db, VIDEO)['fingerprint'])
-        task_id = result['item']['task_id']; assert entered.wait(3)
+        task_id = result['item']['task_id']
+        assert entered.wait(10), 'the actual worker did not enter its fake model call'
         assert local.stop(timeout=.01)['stopped'] is False
         assert local.is_stopping() is True
         release.set()
-        deadline = time.monotonic() + 4
-        while time.monotonic() < deadline and local.get_progress(task_id)['status'] not in {'done', 'failed'}:
-            time.sleep(.01)
+        # stop() joins the actual thread and its final state writes. A fixed
+        # polling window is neither a completion barrier nor a latency spec.
+        stopped = local.stop(timeout=10)
+        assert stopped['stopped'] and not stopped['timed_out']
+        assert stopped.get('state_recorded') is not False
         item = service.lookup(c.db, result['item']['request_id'])['item']
         assert len(c.model.calls) == 1
         assert item['state'] == ('needs_review' if long_form else 'done')
