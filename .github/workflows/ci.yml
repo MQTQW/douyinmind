@@ -169,7 +169,11 @@ jobs:
             'tests/test_favorites_snapshot_safety.py',
             'tests/test_knowledge_bases.py',
             'tests/test_knowledge_base_integration.py',
-            'tests/test_collector_login_lifecycle.py'
+            'tests/test_collector_login_lifecycle.py',
+            'tests/test_semantic_plan_proposal.py',
+            'tests/test_semantic_triage.py',
+            'tests/test_assistant_ai_helper_http.py',
+            'tests/test_assistant_product_bridge.py'
           )
           & $backendPython @runnerArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -189,7 +193,8 @@ jobs:
             '--allow-fixture-hardlinks', '--disable-optional-httpx-cli', '--tests',
             'tests/test_mention_agent_store.py::AgentStoreTests::test_hardlink_to_foreign_database_is_rejected',
             'tests/test_mention_agent_store.py::AgentStoreTests::test_redirected_journal_sidecar_is_rejected_before_write',
-            'tests/test_operator_query_draft_service.py::test_bundle_revalidates_candidate_instead_of_trusting_file_flags[hardlink]'
+            'tests/test_operator_query_draft_service.py::test_bundle_revalidates_candidate_instead_of_trusting_file_flags[hardlink]',
+            'tests/test_assistant_queue.py'
           )
           & $backendPython @runnerArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

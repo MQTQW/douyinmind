@@ -6,7 +6,7 @@ from pathlib import Path
 import threading
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, StrictBool
 
 from .control import AssistantControl
 from .queue import AssistantQueue, QueueError, utc
@@ -188,10 +188,12 @@ class AssistantAPI:
         from . import semantic_triage
         if not semantic_triage.applicable(task):
             raise QueueError("triage_not_applicable")
+        context = semantic_triage.context_key(task)
         details = task.get("details") if isinstance(task.get("details"), dict) else {}
-        cached = details.get("semantic_triage")
-        if isinstance(cached, str) and cached.strip():
-            return {"success": True, "text": cached, "cached": True}
+        cached = semantic_triage.cached_text(task)
+        if cached is not None:
+            return {"success": True, "text": cached, "cached": True,
+                'fallback': False, 'context_key': context}
         try:
             from .usage_budget import UsageBudget
             from .semantic_intent_model import default_semantic_model
@@ -199,10 +201,29 @@ class AssistantAPI:
             result = semantic_triage.explain(task, model=default_semantic_model(), budget=budget)
         except Exception:
             result = {"text": semantic_triage.fallback_for(task), "fallback": True}
-        self.queue.set_semantic_triage(task_id, result["text"])
-        return {"success": True, "text": result["text"], "fallback": result.get("fallback", False), "cached": False}
+        current = self.queue.get_task(task_id)
+        if current is None:
+            raise QueueError('task_not_found')
+        if semantic_triage.context_key(current) != context:
+            return {'success': True, 'text': '任务状态已更新，请刷新记录后查看当前处理建议。',
+                'stale': True, 'fallback': True, 'cached': False,
+                'context_key': semantic_triage.context_key(current)}
+        cached = semantic_triage.cached_text(current)
+        if cached is not None:
+            return {'success': True, 'text': cached, 'cached': True,
+                'fallback': False, 'context_key': context}
+        if not result.get('fallback') and not result.get('pending'):
+            try:
+                self.queue.set_semantic_triage(task_id, result['text'], expected_context=context)
+            except QueueError as error:
+                if str(error) != 'semantic_triage_context_changed':
+                    raise
+                return {'success': True, 'text': '任务状态已更新，请刷新记录后查看当前处理建议。',
+                    'stale': True, 'fallback': True, 'cached': False, 'context_key': context}
+        return {"success": True, "text": result["text"], "fallback": result.get("fallback", False),
+            "cached": False, 'pending': result.get('pending', False), 'context_key': context}
 
-    def propose_plan(self, task_id):
+    def propose_plan(self, task_id, *, regenerate=False):
         """Display-only multi-step plan proposal; never executes or sends."""
         task = self.queue.get_task(task_id)
         if task is None:
@@ -219,16 +240,32 @@ class AssistantAPI:
         if isinstance(cached, dict) and cached.get("summary"):
             return {"success": True, "proposal": cached, "cached": True}
         from . import semantic_plan_proposal
+        budget = None
         try:
             from .usage_budget import UsageBudget
             from .semantic_intent_model import default_semantic_model
             budget = UsageBudget.prepare(self.queue.path.parent / "usage-budget.sqlite3")
-            result = semantic_plan_proposal.propose(subject, model=default_semantic_model(), budget=budget)
+            result = semantic_plan_proposal.propose(subject, model=default_semantic_model(),
+                budget=budget, regenerate=regenerate)
         except Exception:
             result = semantic_plan_proposal.fallback_proposal()
+        current = self.queue.get_task(task_id)
+        if current is None:
+            raise QueueError('task_not_found')
+        current_details = current.get('details') if isinstance(current.get('details'), dict) else {}
+        cached = current_details.get('semantic_plan_proposal')
+        if isinstance(cached, dict) and cached.get('summary'):
+            return {'success': True, 'proposal': cached, 'cached': True}
         if not result.get("fallback"):
             self.queue.set_semantic_plan_proposal(task_id, result)
-        return {"success": True, "proposal": result, "cached": False}
+        allowed = False
+        if result.get('fallback') and budget is not None:
+            try:
+                allowed = semantic_plan_proposal.can_regenerate(current, budget)
+            except Exception:
+                pass
+        return {"success": True, "proposal": result, "cached": False,
+            'pending': result.get('pending', False), 'can_regenerate': allowed}
 
     def action(self, task_id, action):
         if action not in {"reconcile", "resume", "retry_query", "retry_unsent", "dismiss_unsent", "readback_unsent", "retry_after_readback"}:
@@ -312,6 +349,11 @@ def failure(error):
 
 class EmptyBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class PlanProposalBody(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    regenerate: StrictBool = False
 
 
 class ControlBody(BaseModel):
@@ -471,10 +513,10 @@ def dismiss_intake_issue(issue_id: str, body: EmptyBody, service=Depends(get_ser
 
 
 @router.post("/tasks/{task_id}/plan-proposal")
-def plan_proposal(task_id: str, body: EmptyBody, service=Depends(get_service)):
+def plan_proposal(task_id: str, body: PlanProposalBody, service=Depends(get_service)):
     """Propose a fixed multi-step plan for the operator; no step is executed."""
     try:
-        return service.propose_plan(task_id)
+        return service.propose_plan(task_id, regenerate=body.regenerate)
     except Exception as error:
         raise failure(error) from None
 

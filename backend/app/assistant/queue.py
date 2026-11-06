@@ -30,6 +30,9 @@ STATES = frozenset({"queued", "waiting_desktop", "executing", "waiting_ingestion
     "verification_required", "failed_no_submit", "failed", "cancelled", "completed_private"})
 TERMINAL = frozenset({"b_view_visible", "delivery_unknown", "verification_required", "failed_no_submit", "failed", "cancelled", "completed_private"})
 SEND_TERMINAL = frozenset({"b_view_visible", "delivery_unknown", "verification_required", "failed_no_submit"})
+# Worker metadata and each display helper retain their 64K input limits.
+# Storage combines those independently validated components.
+_TASK_DETAILS_STORAGE_LIMIT = 3 * 65536
 # Failures where no public reply/preflight send was produced. The operator may
 # retry these once explicitly; delivery_unknown and visible states stay locked.
 UNSENT_RETRY_REASONS = frozenset({
@@ -242,6 +245,17 @@ def normalized_result(value):
                 raise QueueError("invalid_task_steps")
     encoded(result)
     return result
+
+
+def _updated_details(row, result):
+    current = json.loads(row['details'])
+    if 'details' not in result:
+        return current
+    details = dict(result['details'])
+    for key in ('semantic_plan_proposal', 'semantic_triage', 'semantic_triage_context_key'):
+        if key in current:
+            details[key] = current[key]
+    return details
 
 
 def _delivery_readback_shape(task):
@@ -561,9 +575,12 @@ class AssistantQueue:
     def public_task(self, task, *, detail=False):
         if task is None:
             return None
+        stored_details = task.get('details') if isinstance(task.get('details'), dict) else {}
         value = {name: task.get(name) for name in ("id", "kind", "state", "binding_id", "user_id", "device_id", "knowledge_base_id",
             "video_id", "video_title", "agent_task_id", "reason_code", "import_state", "reply_state", "usage")}
         value['query_scope'] = task.get('binding', {}).get('query_scope', 'library')
+        value['execution_attempts'] = task.get('execution_attempts', 0)
+        value['publish_attempts'] = task.get('publish_attempts', 0)
         value['scope_label'] = '全部入库资料' if value['query_scope'] == 'all_local' else '指定知识库'
         if task.get("import_state"):
             processing_stage = task["import_state"]
@@ -594,7 +611,8 @@ class AssistantQueue:
         if task['state'] == 'waiting_library':
             value['stages']['processing'] = 'not_started'
             value['execution_note'] = '已在原评论询问目标知识库；确认选择后再保存，当前尚未提交入库。'
-            choice = task.get('details', {}).get('library_choice', {})
+            choice = stored_details.get('library_choice')
+            choice = choice if isinstance(choice, dict) else {}
             if choice.get('state') in {'selected', 'handoff_claimed'}:
                 value['status_label'] = '已选择，准备保存'
                 value['execution_note'] = '已记录你的选择，正在接续保存任务；不会重新发送问库评论。'
@@ -606,7 +624,11 @@ class AssistantQueue:
             value['execution_note'] = '只读核对暂时无法完成；任务记录保留。可稍后重试，或标记为未提交后重新发送指令。'
         if detail:
             value["timeline"] = self.list_events(task["id"])
-            value["details"] = task.get("details", {})
+            value["details"] = dict(stored_details)
+            from .semantic_triage import cached_text
+            if cached_text(task) is None:
+                for name in ('semantic_triage', 'semantic_triage_context_key'):
+                    value['details'].pop(name, None)
         return value
 
     def list_tasks(self, *, state=None, q=None, page=1, page_size=20, binding_id=None):
@@ -707,7 +729,7 @@ class AssistantQueue:
               import_state=COALESCE(?,import_state),reply_state=COALESCE(?,reply_state),usage=?,details=?,lease_until=NULL,
               reconciliation=NULL,reconciled_at=NULL,next_poll_at=?,updated_at=? WHERE id=?""",
               (state, result.get("agent_task_id"), result.get("reason_code"), result.get("import_state"), result.get("reply_state", state if state in SEND_TERMINAL else None),
-               encoded(result.get("usage", json.loads(row["usage"]))), encoded(result.get("details", json.loads(row["details"]))),
+               encoded(result.get("usage", json.loads(row["usage"]))), encoded(_updated_details(row, result), _TASK_DETAILS_STORAGE_LIMIT),
                now + (45 if state == 'waiting_library' else 10) if state in {'waiting_ingestion', 'waiting_library'} else 0, now, task_id))
             self._event(db, task_id, "finished_" + phase, {key: value for key, value in result.items() if key != "details"})
             if phase == 'execute' and self._query_retry(db, task_id) is not None:
@@ -907,7 +929,7 @@ class AssistantQueue:
               import_state=COALESCE(?,import_state),reply_state=COALESCE(?,reply_state),details=?,reconciliation=?,reconciled_at=?,
               poll_token=NULL,poll_until=NULL,updated_at=? WHERE id=?""",
               (state, result.get("agent_task_id"), result.get("reason_code"), result.get("import_state"), result.get("reply_state", state if state in SEND_TERMINAL else None),
-               encoded(result.get("details", json.loads(row["details"]))), encoded({key: value for key, value in result.items() if key != "details"}), now, now, task_id))
+               encoded(_updated_details(row, result), _TASK_DETAILS_STORAGE_LIMIT), encoded({key: value for key, value in result.items() if key != "details"}), now, now, task_id))
             self._event(db, task_id, "reconciled", {key: value for key, value in result.items() if key != "details"})
             return self._raw(db.execute("SELECT * FROM assistant_tasks WHERE id=?", (task_id,)).fetchone())
 
@@ -1103,9 +1125,9 @@ class AssistantQueue:
                     raise QueueError("notice_task_mismatch")
             self._remember(db, binding_id, fingerprint, reason, task_id)
 
-    def set_semantic_triage(self, task_id, body):
+    def set_semantic_triage(self, task_id, body, *, expected_context=None):
         """Cache a display-only failure explanation; never changes state."""
-        from .semantic_triage import TRIAGE_MAX_CHARS
+        from .semantic_triage import TRIAGE_MAX_CHARS, context_key
         task_id = text(task_id, 128)
         if (type(body) is not str or not 1 <= len(body) <= TRIAGE_MAX_CHARS
                 or any(ord(char) < 32 and char not in '\t' for char in body)):
@@ -1115,10 +1137,13 @@ class AssistantQueue:
             if row is None:
                 raise QueueError("task_not_found")
             task = self._raw(row)
+            current_context = context_key(task)
+            if expected_context is not None and current_context != expected_context:
+                raise QueueError('semantic_triage_context_changed')
             details = task.get("details") if isinstance(task.get("details"), dict) else {}
-            details = {**details, "semantic_triage": body}
+            details = {**details, "semantic_triage": body, 'semantic_triage_context_key': current_context}
             db.execute("UPDATE assistant_tasks SET details=?,updated_at=? WHERE id=?",
-                       (encoded(details), time.time(), task_id))
+                       (encoded(details, _TASK_DETAILS_STORAGE_LIMIT), time.time(), task_id))
             self._event(db, task_id, "semantic_triage", {"length": len(body)})
             return self._raw(db.execute("SELECT * FROM assistant_tasks WHERE id=?", (task_id,)).fetchone())
 
@@ -1129,6 +1154,7 @@ class AssistantQueue:
                 or type(proposal.get('summary')) is not str or not 1 <= len(proposal['summary']) <= 800
                 or type(proposal.get('steps')) is not list or len(proposal['steps']) > 8):
             raise QueueError('invalid_semantic_plan_proposal')
+        encoded(proposal)
         with self._tx() as db:
             row = db.execute('SELECT * FROM assistant_tasks WHERE id=?', (task_id,)).fetchone()
             if row is None:
@@ -1137,7 +1163,7 @@ class AssistantQueue:
             details = task.get('details') if isinstance(task.get('details'), dict) else {}
             details = {**details, 'semantic_plan_proposal': proposal}
             db.execute('UPDATE assistant_tasks SET details=?,updated_at=? WHERE id=?',
-                       (encoded(details), time.time(), task_id))
+                       (encoded(details, _TASK_DETAILS_STORAGE_LIMIT), time.time(), task_id))
             self._event(db, task_id, 'semantic_plan_proposal', {'goal': proposal.get('goal')})
             return self._raw(db.execute('SELECT * FROM assistant_tasks WHERE id=?', (task_id,)).fetchone())
 

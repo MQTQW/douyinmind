@@ -188,18 +188,25 @@ export function useCallback(f,values){const i=c++;return callbacks[i]??=f;}
 export function useEffect(f,values){const i=e++;if(!deps[i]||values.some((v,j)=>!Object.is(v,deps[i][j]))){deps[i]=values;pending.push(()=>{cleanups[i]?.();cleanups[i]=f();});}}
 export function flush(){for(const f of pending.splice(0))f();}`);
 const hooks = await import(hookURL);
-const fakeAPIURL = asURL(`export let calls=[],overview,task,failAction=false;
-export function reset(o,t){calls=[];overview=o;task=t;failAction=false;}
+const fakeAPIURL = asURL(`export let calls=[],overview,task,failAction=false,failDetail=false,helperRequests=[];
+export function reset(o,t){calls=[];overview=o;task=t;failAction=false;failDetail=false;helperRequests=[];}
 export function setTask(t){task=t;}
 export function setFailure(v){failAction=v;}
+export function setDetailFailure(v){failDetail=v;}
 export function assistantErrorMessage(c,f){return f;}
 export async function getAssistantOverview(){calls.push(['overview']);return overview;}
 export async function listAssistantTasks(p){calls.push(['list',p]);return{items:[task],total:1};}
-export async function getAssistantTask(id){calls.push(['detail',id]);return task;}
+export async function getAssistantTask(id){calls.push(['detail',id]);if(failDetail)throw new Error('OLD_TASK_A_DETAIL_ERROR');return task;}
 export async function controlAssistant(action){calls.push(['control',action]);return{overview};}
-export async function actOnAssistantTask(id,action){calls.push(['action',id,action]);if(failAction)throw new Error('合成本次网络错误');return{accepted:true};}`);
+export async function actOnAssistantTask(id,action){calls.push(['action',id,action]);if(failAction)throw new Error('合成本次网络错误');return{accepted:true};}
+function helper(kind,id,signal,regenerate=false){calls.push([kind,id]);return new Promise((resolve,reject)=>helperRequests.push({kind,id,signal,regenerate,resolve,reject}));}
+export function proposeAssistantTaskPlan(id,signal,regenerate=false){return helper('plan',id,signal,regenerate);}
+export function explainAssistantTask(id,signal){return helper('triage',id,signal);}`);
 const fakeAPI = await import(fakeAPIURL);
 const Panel = (await import(await moduleURL('../src/components/AssistantPanel.tsx', { ...sharedImports, react: hookURL, '../api': fakeAPIURL }))).default;
+const HookDetails = (await import(await moduleURL('../src/components/AssistantPanel.tsx', {
+  ...sharedImports, react: hookURL, '../api': fakeAPIURL,
+}, source => source.replace('function TaskDetails(', 'export function TaskDetails(')))).TaskDetails;
 function nodes(element, predicate, result = []) {
   if (Array.isArray(element)) { for (const child of element) nodes(child, predicate, result); return result; }
   if (!element || typeof element !== 'object') return result;
@@ -256,6 +263,349 @@ test('configuration recovery CTA, manual verification entry and abnormal explana
     const copy = nodes(tree, n => n.props.className === 'assistant-control-copy')[0];
     assert.match(nodes(copy, n => n.type === 'h4')[0].props.title, /不要把密码或验证码发到聊天|助手仍暂停/);
     assert.equal(buttons(tree).find(n => text(n) === '开启助手').props.disabled, true);
+  });
+});
+
+async function withHelperDetails(run, task = {}) {
+  hooks.reset();
+  fakeAPI.reset({}, {});
+  const props = { task: { ...base, state: 'needs_review', reason_code: 'preflight_failed',
+    reply_state: 'needs_review', details: {}, ...task }, error: '', pending: '', demo: false,
+    notice: '', noticeError: false, onClose() {}, onRefresh() {}, async onAction() {} };
+  let scrolls = 0;
+  const render = () => {
+    hooks.begin();
+    const tree = HookDetails(props);
+    const dialog = nodes(tree, node => node.type === 'dialog')[0];
+    dialog.props.ref.current = { open: true, showModal() {}, close() {} };
+    const result = nodes(tree, node => node.props['aria-label'] === 'AI辅助结果')[0];
+    if (result) result.props.ref.current = { scrollIntoView() { scrolls++; } };
+    return tree;
+  };
+  const settle = async () => {
+    hooks.flush();
+    await new Promise(resolve => setImmediate(resolve));
+    return render();
+  };
+  try {
+    let tree = render(); tree = await settle(); tree = await settle();
+    await run({ props, tree, render, settle, scrolls: () => scrolls });
+  } finally { hooks.reset(); }
+}
+
+for (const kind of ['plan', 'triage']) {
+  const originalLabel = kind === 'plan' ? '生成处理计划' : '让助手解释下一步';
+  const cachedLabel = kind === 'plan' ? '查看处理计划' : '查看助手解释';
+  const successful = kind === 'plan' ? { success: true, proposal: { summary: '合成处理计划结果' } }
+    : { success: true, text: '合成助手解释结果' };
+  test(`${kind} displays nearby loading and result, retains cached view and synchronously suppresses duplicate clicks`, async () => {
+    await withHelperDetails(async ({ tree, render, settle, scrolls }) => {
+      const button = buttons(tree).find(node => text(node) === originalLabel);
+      const first = button.props.onClick();
+      const second = button.props.onClick();
+      tree = render(); tree = await settle();
+      assert.equal(fakeAPI.helperRequests.length, 1);
+      assert.match(text(tree), kind === 'plan' ? /正在生成处理计划/ : /正在根据当前任务状态生成解释/);
+      const order = nodes(tree, () => true);
+      const actions = order.findIndex(node => node.props.className === 'assistant-detail-actions');
+      const result = order.findIndex(node => node.props['aria-label'] === 'AI辅助结果');
+      const records = order.findIndex(node => node.props.className === 'assistant-ui-records');
+      assert.ok(actions < result && result < records);
+      assert.ok(scrolls() > 0);
+      fakeAPI.helperRequests[0].resolve(successful);
+      await first; await second; tree = await settle();
+      assert.match(text(tree), /合成.*结果/);
+      assert.ok(buttons(tree).some(node => text(node) === cachedLabel));
+      await buttons(tree).find(node => text(node) === cachedLabel).props.onClick();
+      assert.equal(fakeAPI.helperRequests.length, 1);
+      assert.equal(nodes(tree, node => node.props['aria-live'] === 'polite').length, 1);
+    });
+  });
+
+  test(`${kind} shows a readable adjacent API failure and releases the control`, async () => {
+    await withHelperDetails(async ({ tree, settle }) => {
+      const request = buttons(tree).find(node => text(node) === originalLabel).props.onClick();
+      fakeAPI.helperRequests[0].reject(new Error('合成网络错误，请稍后再试。'));
+      await request; tree = await settle();
+      assert.match(text(nodes(tree, node => node.props['aria-label'] === 'AI辅助结果')[0]), /合成网络错误/);
+      assert.equal(nodes(tree, node => node.props.role === 'alert').length, 1);
+      assert.equal(buttons(tree).find(node => text(node) === originalLabel).props.disabled, false);
+    });
+  });
+
+  for (const response of [null, {}, kind === 'plan' ? { proposal: { summary: ' ' } } : { text: ' ' }]) {
+    test(`${kind} reports an empty or malformed success response`, async () => {
+      await withHelperDetails(async ({ tree, settle }) => {
+        const request = buttons(tree).find(node => text(node) === originalLabel).props.onClick();
+        fakeAPI.helperRequests[0].resolve(response);
+        await request; tree = await settle();
+        assert.match(text(tree), /返回内容为空/);
+      });
+    });
+  }
+
+  test(`${kind} presents a pending request as status and accepts a later cached detail`, async () => {
+    await withHelperDetails(async ({ props, tree, settle }) => {
+      const request = buttons(tree).find(node => text(node) === originalLabel).props.onClick();
+      fakeAPI.helperRequests[0].resolve(kind === 'plan'
+        ? { pending: true, proposal: { summary: '同一计划正在生成', fallback: true } }
+        : { pending: true, text: '同一解释正在生成' });
+      await request; tree = await settle();
+      assert.match(text(tree), /同一.*正在生成/);
+      assert.ok(buttons(tree).some(node => text(node) === originalLabel));
+      props.task = { ...props.task, details: kind === 'plan'
+        ? { semantic_plan_proposal: successful.proposal }
+        : { semantic_triage: successful.text, semantic_triage_context_key: 'fresh-context' } };
+      tree = await settle(); tree = await settle();
+      assert.match(text(tree), /合成.*结果/);
+      assert.ok(buttons(tree).some(node => text(node) === cachedLabel));
+      assert.equal(fakeAPI.helperRequests.length, 1);
+    });
+  });
+
+  test(`${kind} aborts on a task change and ignores the late previous-task result`, async () => {
+    await withHelperDetails(async ({ props, tree, render, settle }) => {
+      const request = buttons(tree).find(node => text(node) === originalLabel).props.onClick();
+      const pending = fakeAPI.helperRequests[0];
+      props.task = { ...props.task, id: 'another-helper-task', details: {} };
+      tree = render();
+      assert.equal(nodes(tree, node => node.props['aria-label'] === 'AI辅助结果').length, 0);
+      assert.equal(buttons(tree).find(node => text(node) === originalLabel).props.disabled, true);
+      tree = await settle();
+      assert.equal(pending.signal.aborted, true);
+      pending.resolve(successful); await request; tree = await settle();
+      assert.doesNotMatch(text(tree), /合成.*结果/);
+      assert.equal(buttons(tree).find(node => text(node) === originalLabel).props.disabled, false);
+    });
+  });
+
+  test(`${kind} rejects a saved old-task click handler after a new task render`, async () => {
+    await withHelperDetails(async ({ props, tree, render, settle }) => {
+      const oldClick = buttons(tree).find(node => text(node) === originalLabel).props.onClick;
+      props.task = { ...props.task, id: 'new-click-target-task', details: {} };
+      tree = render();
+      await oldClick();
+      assert.equal(fakeAPI.helperRequests.length, 0);
+      tree = await settle(); tree = await settle();
+      const request = buttons(tree).find(node => text(node) === originalLabel).props.onClick();
+      assert.equal(fakeAPI.helperRequests[0].id, 'new-click-target-task');
+      fakeAPI.helperRequests[0].resolve(successful); await request;
+    });
+  });
+
+  test(`${kind} aborts a pending request on detail close`, async () => {
+    await withHelperDetails(async ({ tree, settle }) => {
+      const request = buttons(tree).find(node => text(node) === originalLabel).props.onClick();
+      await settle();
+      const pending = fakeAPI.helperRequests[0];
+      hooks.reset();
+      assert.equal(pending.signal.aborted, true);
+      pending.resolve(successful); await request;
+    });
+  });
+}
+
+test('an explanation arriving after a fact change cannot replace current-state guidance', async () => {
+  await withHelperDetails(async ({ props, tree, render, settle }) => {
+    const request = buttons(tree).find(node => text(node) === '让助手解释下一步').props.onClick();
+    const pending = fakeAPI.helperRequests[0];
+    props.task = { ...props.task, state: 'waiting_library', reply_state: 'b_view_visible' };
+    tree = render();
+    pending.resolve({ text: '过时的预检失败解释' }); await request;
+    tree = await settle(); tree = await settle();
+    assert.equal(pending.signal.aborted, true);
+    assert.doesNotMatch(text(tree), /过时的预检失败解释/);
+    assert.match(text(tree), /任务状态已更新/);
+  });
+});
+
+test('a completed plan is synchronously scoped to its task before switch effects run', async () => {
+  await withHelperDetails(async ({ props, tree, render, settle }) => {
+    await buttons(tree).find(node => text(node) === '查看处理计划').props.onClick();
+    tree = await settle();
+    assert.match(text(tree), /OLD_COMPLETED_PLAN/);
+    props.task = { ...props.task, id: 'another-completed-plan-task', details: {} };
+    tree = render();
+    assert.doesNotMatch(text(tree), /OLD_COMPLETED_PLAN/);
+    assert.equal(nodes(tree, node => node.props['aria-label'] === 'AI辅助结果').length, 0);
+    const generate = buttons(tree).find(node => text(node) === '生成处理计划');
+    assert.equal(generate.props.disabled, true);
+    await generate.props.onClick();
+    assert.equal(fakeAPI.helperRequests.length, 0);
+    tree = await settle(); tree = await settle();
+    assert.doesNotMatch(text(tree), /OLD_COMPLETED_PLAN/);
+    assert.equal(buttons(tree).find(node => text(node) === '生成处理计划').props.disabled, false);
+  }, { details: { semantic_plan_proposal: { summary: 'OLD_COMPLETED_PLAN' } } });
+});
+
+for (const oldFeedback of ['error', 'pending', 'regenerate']) {
+  test(`task switch synchronously masks old ${oldFeedback} feedback and permission`, async () => {
+    await withHelperDetails(async ({ props, tree, render, settle }) => {
+      const request = buttons(tree).find(node => text(node) === '生成处理计划').props.onClick();
+      if (oldFeedback === 'error') fakeAPI.helperRequests[0].reject(new Error('OLD_PLAN_ERROR'));
+      else fakeAPI.helperRequests[0].resolve({ proposal: { summary: 'OLD_PLAN_MESSAGE', fallback: true },
+        pending: oldFeedback === 'pending', can_regenerate: oldFeedback === 'regenerate' });
+      await request; tree = await settle();
+      assert.match(text(tree), /OLD_PLAN/);
+      props.task = { ...props.task, id: 'another-feedback-task', details: {} };
+      tree = render();
+      assert.doesNotMatch(text(tree), /OLD_PLAN|确认重新生成一次/);
+      assert.equal(nodes(tree, node => node.props['aria-label'] === 'AI辅助结果').length, 0);
+      tree = await settle(); tree = await settle();
+      assert.doesNotMatch(text(tree), /OLD_PLAN|确认重新生成一次/);
+      assert.equal(fakeAPI.helperRequests.length, 1);
+    });
+  });
+}
+
+test('selected task and retained detail must match before any detail action is rendered', async () => {
+  await withPanel({}, async ({ tree, render, settle }) => {
+    nodes(tree, node => node.props.className === 'assistant-task-row')[0].props.onClick();
+    tree = render(); await settle(); tree = render(); await settle(); tree = render();
+    assert.equal(modal(tree).props.task.id, base.id);
+    modal(tree).props.onOpenTask('another-selected-task');
+    tree = render();
+    assert.equal(modal(tree).key, 'another-selected-task');
+    assert.equal(modal(tree).props.task, null);
+    const html = renderToStaticMarkup(createElement(TaskDetails, modal(tree).props));
+    assert.match(html, /正在读取处理记录/);
+    assert.doesNotMatch(html, /生成处理计划|让助手解释下一步|重新处理这条回复/);
+    await settle(); tree = render(); await settle(); tree = render();
+    assert.equal(modal(tree).props.task, null);
+    assert.equal(fakeAPI.helperRequests.length, 0);
+  });
+});
+
+test('a previous detail-read error cannot flash during another selected task loading window', async () => {
+  await withPanel({}, async ({ tree, render, settle }) => {
+    nodes(tree, node => node.props.className === 'assistant-task-row')[0].props.onClick();
+    tree = render(); await settle(); tree = render(); await settle(); tree = render();
+    fakeAPI.setDetailFailure(true);
+    modal(tree).props.onRefresh();
+    tree = render(); await settle(); tree = render(); await settle(); tree = render();
+    assert.equal(modal(tree).props.error, 'OLD_TASK_A_DETAIL_ERROR');
+    modal(tree).props.onOpenTask('another-error-task');
+    tree = render();
+    assert.equal(modal(tree).props.task, null);
+    assert.equal(modal(tree).props.error, '');
+    const html = renderToStaticMarkup(createElement(TaskDetails, modal(tree).props));
+    assert.match(html, /正在读取处理记录/);
+    assert.doesNotMatch(html, /OLD_TASK_A_DETAIL_ERROR/);
+  });
+});
+
+test('a completed task clears an in-flight explanation and points to its current result', async () => {
+  await withHelperDetails(async ({ props, tree, render, settle }) => {
+    const request = buttons(tree).find(node => text(node) === '让助手解释下一步').props.onClick();
+    const pending = fakeAPI.helperRequests[0];
+    props.task = { ...props.task, state: 'b_view_visible', reply_state: 'b_view_visible' };
+    tree = render(); tree = await settle();
+    pending.resolve({ text: '过时的失败处理建议' }); await request;
+    tree = await settle();
+    assert.doesNotMatch(text(tree), /过时的失败处理建议|请重新生成助手解释/);
+    assert.match(text(tree), /请查看当前处理结果/);
+    assert.ok(!buttons(tree).some(node => text(node) === '让助手解释下一步'));
+  });
+});
+
+test('unchanged old cached explanation is hidden immediately when task facts change', async () => {
+  await withHelperDetails(async ({ props, tree, render, settle }) => {
+    await buttons(tree).find(node => text(node) === '查看助手解释').props.onClick();
+    tree = await settle();
+    assert.match(text(tree), /旧状态解释/);
+    props.task = { ...props.task, state: 'waiting_library', reply_state: 'b_view_visible' };
+    tree = render();
+    assert.doesNotMatch(text(tree), /旧状态解释/);
+    tree = await settle(); tree = await settle();
+    assert.doesNotMatch(text(tree), /旧状态解释/);
+    assert.ok(buttons(tree).some(node => text(node) === '让助手解释下一步'));
+    assert.equal(fakeAPI.helperRequests.length, 0);
+  }, { details: { semantic_triage: '旧状态解释', semantic_triage_context_key: 'old-context' } });
+});
+
+for (const counter of ['execution_attempts', 'publish_attempts']) {
+  test(`${counter} change invalidates an in-flight explanation even when state and reason match`, async () => {
+    await withHelperDetails(async ({ props, tree, render, settle }) => {
+      const request = buttons(tree).find(node => text(node) === '让助手解释下一步').props.onClick();
+      const pending = fakeAPI.helperRequests[0];
+      props.task = { ...props.task, [counter]: 2,
+        actions: { ...props.task.actions, can_retry_unsent: false } };
+      tree = render();
+      pending.resolve({ text: '过时的尚有重试机会说明' }); await request;
+      tree = await settle(); tree = await settle();
+      assert.equal(pending.signal.aborted, true);
+      assert.doesNotMatch(text(tree), /过时的尚有重试机会说明/);
+      assert.match(text(tree), /任务状态已更新/);
+      assert.equal(props.task.state, 'needs_review');
+      assert.equal(props.task.reason_code, 'preflight_failed');
+      assert.ok(buttons(tree).some(node => text(node) === '让助手解释下一步'));
+      assert.equal(fakeAPI.helperRequests.length, 1);
+    }, { execution_attempts: 1, publish_attempts: 1 });
+  });
+
+  test(`${counter} change immediately hides an old explanation cache with the same state and reason`, async () => {
+    await withHelperDetails(async ({ props, tree, render, settle }) => {
+      await buttons(tree).find(node => text(node) === '查看助手解释').props.onClick();
+      tree = await settle();
+      assert.match(text(tree), /旧尝试次数解释/);
+      props.task = { ...props.task, [counter]: 2 };
+      tree = render();
+      assert.doesNotMatch(text(tree), /旧尝试次数解释/);
+      tree = await settle(); tree = await settle();
+      assert.doesNotMatch(text(tree), /旧尝试次数解释/);
+      assert.ok(buttons(tree).some(node => text(node) === '让助手解释下一步'));
+      assert.equal(fakeAPI.helperRequests.length, 0);
+    }, { execution_attempts: 1, publish_attempts: 1,
+      details: { semantic_triage: '旧尝试次数解释', semantic_triage_context_key: 'old-attempts-context' } });
+  });
+}
+
+test('a late inactive helper response preserves the suggestion the user is viewing', async () => {
+  await withHelperDetails(async ({ tree, render, settle, scrolls }) => {
+    const plan = buttons(tree).find(node => text(node) === '生成处理计划').props.onClick();
+    tree = render(); tree = await settle();
+    const triage = buttons(tree).find(node => text(node) === '让助手解释下一步').props.onClick();
+    tree = render(); tree = await settle();
+    const before = scrolls();
+    fakeAPI.helperRequests[0].resolve(null); await plan;
+    tree = await settle(); tree = await settle();
+    const result = nodes(tree, node => node.props['aria-label'] === 'AI辅助结果')[0];
+    assert.match(text(result), /助手解释/);
+    assert.doesNotMatch(text(result), /处理计划返回内容为空/);
+    assert.equal(scrolls(), before);
+    fakeAPI.helperRequests[1].resolve({ text: '最新解释结果' }); await triage;
+  });
+});
+
+test('a lost settled plan requires the visible usage confirmation before its one regeneration request', async () => {
+  await withHelperDetails(async ({ tree, render, settle }) => {
+    const first = buttons(tree).find(node => text(node) === '生成处理计划').props.onClick();
+    assert.equal(fakeAPI.helperRequests[0].regenerate, false);
+    fakeAPI.helperRequests[0].resolve({ proposal: { summary: '上次计划结果需要重新生成。', fallback: true }, can_regenerate: true });
+    await first; tree = await settle();
+    assert.match(text(tree), /重新生成会新增一次 AI 模型用量/);
+    assert.equal(fakeAPI.helperRequests.length, 1);
+    const confirmation = buttons(tree).find(node => text(node) === '确认重新生成一次');
+    const regenerated = confirmation.props.onClick();
+    confirmation.props.onClick();
+    assert.equal(fakeAPI.helperRequests.length, 2);
+    assert.equal(fakeAPI.helperRequests[1].regenerate, true);
+    fakeAPI.helperRequests[1].resolve({ proposal: { summary: '明确再生成的计划结果' } });
+    await regenerated; tree = render(); tree = await settle();
+    assert.match(text(tree), /明确再生成的计划结果/);
+    assert.ok(!buttons(tree).some(node => text(node) === '确认重新生成一次'));
+    await buttons(tree).find(node => text(node) === '查看处理计划').props.onClick();
+    assert.equal(fakeAPI.helperRequests.length, 2);
+  });
+});
+
+test('a pending or unknown plan has no regeneration permission control', async () => {
+  await withHelperDetails(async ({ tree, settle }) => {
+    const request = buttons(tree).find(node => text(node) === '生成处理计划').props.onClick();
+    fakeAPI.helperRequests[0].resolve({ proposal: { summary: '上次请求结果待核对。', fallback: true }, pending: true });
+    await request; tree = await settle();
+    assert.ok(!buttons(tree).some(node => text(node) === '确认重新生成一次'));
+    assert.equal(fakeAPI.helperRequests[0].regenerate, false);
   });
 });
 

@@ -112,6 +112,18 @@ def _stamp(value):
     return _instant(value).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
+def reservation_pending(reservation, *, now=None):
+    """Bound a display hint; existing reservations keep all accounting fences."""
+    if not isinstance(reservation, dict) or reservation.get('state') != 'reserved':
+        return False
+    try:
+        age = (_instant(now or datetime.now(timezone.utc))
+            - _instant(reservation.get('admitted_at_utc'))).total_seconds()
+    except (UsageBudgetError, ValueError, OverflowError):
+        return False
+    return -5 <= age <= 300
+
+
 def _provider_usage(usage):
     """Accept only explicit numeric provider totals; missing is not zero."""
     if usage is None:

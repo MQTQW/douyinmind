@@ -12,6 +12,7 @@ import json
 import re
 
 from .workflow_store import SHAPES
+from .usage_budget import reservation_pending
 
 PROPOSAL_ESTIMATE_TOKENS = 1200
 _SAVE_HINT = re.compile("保存|存到|存进|存入|加入|入库|收藏|导入|收录|放到|收进")
@@ -140,10 +141,22 @@ def summary_for(proposal):
 
 def fallback_proposal():
     return {"goal": "decline", "question": None, "steps": [],
-            "summary": "暂时无法生成多步计划；原任务记录已保留。", "fallback": True}
+            "summary": "暂时无法生成多步计划，请稍后查看处理记录。", "fallback": True}
 
 
-def propose(task, *, model, budget):
+def can_regenerate(task, budget):
+    details = task.get('details') if isinstance(task.get('details'), dict) else {}
+    cached = details.get('semantic_plan_proposal')
+    if isinstance(cached, dict) and cached.get('summary'):
+        return False
+    task_id = str(task.get('id'))
+    original = budget.get_request('plan-proposal:' + task_id)
+    return (isinstance(original, dict) and original.get('state') == 'settled'
+        and original.get('origin') == 'live' and original.get('task_id') == task.get('id')
+        and budget.get_request('plan-proposal-regenerate:' + task_id) is None)
+
+
+def propose(task, *, model, budget, regenerate=False):
     """Return a validated proposal; never executes a step or changes task state."""
     text = task.get("comment_text") if isinstance(task, dict) else None
     try:
@@ -152,11 +165,38 @@ def propose(task, *, model, budget):
         return fallback_proposal()
     request_key = "plan-proposal:" + str(task.get("id"))
     try:
-        budget.reserve(task.get("id"), request_key, PROPOSAL_ESTIMATE_TOKENS)
+        if regenerate:
+            if not can_regenerate(task, budget):
+                existing = budget.get_request('plan-proposal-regenerate:' + str(task.get('id')))
+                result = fallback_proposal()
+                if reservation_pending(existing):
+                    result.update(summary='这条任务的处理计划正在生成，请稍后刷新查看。', pending=True)
+                else:
+                    result['summary'] = '当前请求的用量或结果仍需核对，请查看处理记录。'
+                return result
+            request_key = 'plan-proposal-regenerate:' + str(task.get('id'))
+        reservation = budget.reserve(task.get("id"), request_key, PROPOSAL_ESTIMATE_TOKENS)
     except Exception:
         return fallback_proposal()
+    if not isinstance(reservation, dict) or reservation.get('may_request') is not True:
+        result = fallback_proposal()
+        current_request = reservation
+        if not regenerate and isinstance(reservation, dict) and reservation.get('state') == 'settled':
+            current_request = budget.get_request('plan-proposal-regenerate:' + str(task.get('id'))) or reservation
+        if reservation_pending(current_request):
+            result.update(summary='这条任务的处理计划正在生成，请稍后刷新查看。', pending=True)
+        else:
+            result['summary'] = '上次处理计划请求的结果尚待核对，请刷新记录查看。'
+        return result
     try:
         turn = model.complete(messages, plan_tools())
+    except Exception:
+        try:
+            budget.mark_unknown(request_key)
+        except Exception:
+            pass
+        return fallback_proposal()
+    try:
         try:
             budget.settle(request_key, turn.usage)
         except Exception:

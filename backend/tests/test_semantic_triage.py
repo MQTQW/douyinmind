@@ -1,7 +1,11 @@
 """Failure-triage display text: model output is bounded, cached separately."""
 from types import SimpleNamespace
+from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from app.assistant import semantic_triage
+from app.assistant.usage_budget import reservation_pending
 
 
 class FakeModel:
@@ -26,6 +30,7 @@ class FakeBudget:
         if self.fail:
             raise RuntimeError(self.fail)
         self.reserved.append((task_id, request_key, estimate))
+        return {'may_request': True}
 
     def settle(self, request_key, usage):
         self.settled.append((request_key, usage))
@@ -65,3 +70,32 @@ def test_applicability_and_fixed_reason_fallbacks():
     assert semantic_triage.applicable({"state": "publishing"}) is False
     assert "重新发一条评论指令" in semantic_triage.fallback_for(
         {"state": "needs_review", "reason_code": "original_notification_candidates_exceed_limit"})
+
+
+@pytest.mark.parametrize('age,pending', [(0, True), (300, True), (-5, True), (301, False), (-6, False)])
+def test_pending_display_hint_is_bounded_by_receipt_age(age, pending):
+    now = datetime(2026, 11, 6, tzinfo=timezone.utc)
+    receipt = {'state': 'reserved', 'admitted_at_utc': (now - timedelta(seconds=age)).isoformat()}
+    assert reservation_pending(receipt, now=now) is pending
+    assert receipt['state'] == 'reserved'
+
+
+@pytest.mark.parametrize('receipt', [None, {}, {'state': 'unknown'}, {'state': 'settled'},
+    {'state': 'reserved'}, {'state': 'reserved', 'admitted_at_utc': 'PRIVATE'},
+    {'state': 'reserved', 'admitted_at_utc': '2026-11-06T00:00:00'}])
+def test_pending_display_rejects_unknown_or_malformed_receipts(receipt):
+    assert reservation_pending(receipt) is False
+
+
+def test_legacy_details_and_choice_shapes_have_stable_current_facts():
+    for details in (None, {}, {'library_choice': None}, {'library_choice': []}, {'library_choice': 'old'}):
+        task = {**TASK, 'details': details}
+        assert semantic_triage._facts(task)['library_choice_state'] is None
+        assert semantic_triage.context_key(task)
+
+
+def test_spent_execution_retry_uses_current_record_guidance():
+    task = {**TASK, 'execution_attempts': 2}
+    result = semantic_triage.explain(task, model=FakeModel('可以再重新处理一次。'), budget=FakeBudget())
+    assert result['fallback'] and '多次处理尝试' in result['text']
+    assert '重新处理' not in result['text']

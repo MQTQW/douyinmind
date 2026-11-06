@@ -33,6 +33,25 @@ const renderDetails = task => renderToStaticMarkup(createElement(TaskDetails, {
   onClose() {}, onRefresh() {}, async onAction() {},
 }));
 
+test('AI helper requests use empty default bodies and regeneration only on explicit confirmation', async () => {
+  const original = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (url, options) => {
+    seen.push({ url, options });
+    return new Response(JSON.stringify({ success: true, proposal: { summary: '合成计划' }, text: '合成解释' }), { status: 200 });
+  };
+  try {
+    const signal = new AbortController().signal;
+    await api.proposeAssistantTaskPlan('fixture-helper', signal);
+    await api.proposeAssistantTaskPlan('fixture-helper', signal, true);
+    await api.explainAssistantTask('fixture-helper', signal);
+    await api.getAssistantTask('fixture-helper');
+    assert.deepEqual(seen.slice(0, 3).map(row => JSON.parse(row.options.body)), [{}, { regenerate: true }, {}]);
+    assert.ok(seen.slice(0, 3).every(row => row.options.signal === signal));
+    assert.equal(seen[3].options.body, undefined);
+  } finally { globalThis.fetch = original; }
+});
+
 test('budget blocks explain only the next request and retain prior usage', () => {
   const task = { ...base, state: 'needs_review', reason_code: 'model_budget_exceeded', usage: { total_tokens: 1140 } };
   const message = view.taskIssueExplanation(task);

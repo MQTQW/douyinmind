@@ -43,6 +43,7 @@ class FakeBudget:
         if self.fail:
             raise RuntimeError(self.fail)
         self.reserved.append((task_id, request_key, estimate))
+        return {'may_request': True}
 
     def settle(self, request_key, usage):
         self.settled.append((request_key, usage))

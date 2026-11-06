@@ -50,6 +50,39 @@
   border-radius: 9px;
 }
 
+.assistant-helper-results {
+  margin: 0 23px 23px;
+  padding: 16px 0;
+  border-block: 1px solid var(--color-border);
+  scroll-margin-block: 16px;
+}
+
+.assistant-helper-results h4 {
+  margin: 0 0 10px;
+  color: var(--color-ink);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.assistant-helper-results p {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.8;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.assistant-helper-results .assistant-helper-error {
+  color: var(--color-error, #9f3434);
+}
+
+.assistant-helper-regenerate {
+  display: grid;
+  justify-items: start;
+  gap: 10px;
+  margin-top: 12px;
+}
+
 .assistant-ui-records > summary {
   padding: 14px 15px;
   cursor: pointer;

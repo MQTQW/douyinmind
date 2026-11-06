@@ -73,13 +73,14 @@ export interface AssistantTask {
   id: string; kind: string; state: string; status_label?: string; binding_id?: string; user_id?: string; device_id?: string; knowledge_base_id?: number | null; query_scope?: 'library' | 'all_local'; scope_label?: string; execution_note?: string;
   video_id?: string; video_title?: string; comment_text?: string; created_at?: string | number; updated_at?: string | number;
   agent_task_id?: string; reason_code?: string | null; import_state?: string | null; reply_state?: string | null;
+  execution_attempts?: number; publish_attempts?: number;
   actions?: { can_reconcile: boolean; can_resume: boolean; can_retry_query?: boolean; can_retry_unsent?: boolean; can_dismiss_unsent?: boolean; can_readback_unsent?: boolean; can_retry_after_readback?: boolean };
   stages?: Record<string, string | { state?: string; label?: string }>;
   usage?: AssistantUsage | null; timeline?: AssistantTimelineStep[];
   sources?: { source_id?: string; chunk_id?: string; title?: string; url?: string; platform_item_id?: string; time_range?: string }[];
   reply?: { text?: string; state?: string; kind?: string } | null;
   details?: { reply_text?: string; library_name?: string; sources?: AssistantTask['sources']; steps?: AssistantTimelineStep[]; timings?: AssistantTimings;
-    library_choice?: { choice_id?: string; state?: string; option_count?: number; selected_knowledge_base_id?: number | null; selected_library_name?: string | null; child_task_id?: string | null }; semantic_triage?: string; semantic_plan_proposal?: { goal?: string; summary?: string; steps?: { tool: string; args: Record<string, unknown> }[] } };
+    library_choice?: { choice_id?: string; state?: string; option_count?: number; selected_knowledge_base_id?: number | null; selected_library_name?: string | null; child_task_id?: string | null }; semantic_triage?: string; semantic_triage_context_key?: string; semantic_plan_proposal?: { goal?: string; summary?: string; steps?: { tool: string; args: Record<string, unknown> }[] } };
   latest_action?: AssistantActionStatus | null;
 }
 export interface AssistantTaskPage { items: AssistantTask[]; total: number; page: number; page_size: number; }
@@ -222,12 +223,12 @@ export function getAssistantTask(id: string, signal?: AbortSignal): Promise<Assi
 export function controlAssistant(action: 'start' | 'pause' | 'stop'): Promise<{ success: boolean; overview: AssistantOverview }> {
   return assistantRequest(`/${action}`, { method: 'POST', body: '{}' });
 }
-export function proposeAssistantTaskPlan(id: string): Promise<{ success: boolean; proposal: { goal?: string; summary: string; steps?: { tool: string; args: Record<string, unknown> }[]; fallback?: boolean }; cached?: boolean }> {
-  return assistantRequest(`/tasks/${encodeURIComponent(id)}/plan-proposal`, { method: 'POST', body: JSON.stringify({}) });
+export function proposeAssistantTaskPlan(id: string, signal?: AbortSignal, regenerate = false): Promise<{ success: boolean; proposal: { goal?: string; summary: string; steps?: { tool: string; args: Record<string, unknown> }[]; fallback?: boolean }; cached?: boolean; pending?: boolean; stale?: boolean; context_key?: string; can_regenerate?: boolean }> {
+  return assistantRequest(`/tasks/${encodeURIComponent(id)}/plan-proposal`, { method: 'POST', body: JSON.stringify(regenerate ? { regenerate: true } : {}), signal });
 }
 
-export function explainAssistantTask(id: string): Promise<{ success: boolean; text: string; cached?: boolean; fallback?: boolean }> {
-  return assistantRequest(`/tasks/${encodeURIComponent(id)}/triage`, { method: 'POST', body: JSON.stringify({}) });
+export function explainAssistantTask(id: string, signal?: AbortSignal): Promise<{ success: boolean; text: string; cached?: boolean; fallback?: boolean; pending?: boolean; stale?: boolean; context_key?: string }> {
+  return assistantRequest(`/tasks/${encodeURIComponent(id)}/triage`, { method: 'POST', body: JSON.stringify({}), signal });
 }
 
 export function actOnAssistantTask(id: string, action: AssistantTaskAction): Promise<{ success: boolean; accepted?: boolean; task?: AssistantTask; message?: string }> {

@@ -30,7 +30,7 @@ export default function AssistantPanel() {
   const [pending, setPending] = useState('');
   const [selected, setSelected] = useState<string | null>(null);
   const [detail, setDetail] = useState<api.AssistantTask | null>(null);
-  const [detailError, setDetailError] = useState('');
+  const [detailError, setDetailError] = useState<{ taskId: string; message: string } | null>(null);
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
   const [healthNow, setHealthNow] = useState(() => Date.now());
   const startRequested = useRef(false);
@@ -84,7 +84,7 @@ export default function AssistantPanel() {
   useEffect(() => { if (page > Math.max(1, Math.ceil(total / pageSize))) setPage(Math.max(1, Math.ceil(total / pageSize))); }, [page, total]);
 
   useEffect(() => {
-    setDetail(null); setDetailError('');
+    setDetail(null); setDetailError(null);
     if (!selected) return;
     const controller = new AbortController();
     if (demo) { setDetail(demoTaskDetail(selected)); return; }
@@ -92,8 +92,8 @@ export default function AssistantPanel() {
     const load = async () => {
       if (polling || document.visibilityState === 'hidden') return;
       polling = true;
-      try { const value = await api.getAssistantTask(selected, controller.signal); if (!controller.signal.aborted) { setDetail(value); setDetailError(''); } }
-      catch (reason) { if (!controller.signal.aborted) setDetailError(reason instanceof Error ? reason.message : '任务详情暂时无法读取。'); }
+      try { const value = await api.getAssistantTask(selected, controller.signal); if (!controller.signal.aborted) { setDetail(value); setDetailError(null); } }
+      catch (reason) { if (!controller.signal.aborted) setDetailError({ taskId: selected, message: reason instanceof Error ? reason.message : '任务详情暂时无法读取。' }); }
       finally { polling = false; }
     };
     void load();
@@ -249,33 +249,153 @@ export default function AssistantPanel() {
       </div><div className="assistant-pagination"><span>共 {recordsUnread ? '—' : total} 项{lastUpdated && <small>最近读取 {new Date(lastUpdated).toLocaleTimeString('zh-CN', { hour12: false })}</small>}</span><div><button className="icon-button" aria-label="上一页" disabled={recordsUnread || page <= 1 || loading} onClick={() => setPage(value => value - 1)}><ArrowLeft size={16} /></button><span>{recordsUnread ? '— / —' : `${page} / ${pages}`}</span><button className="icon-button" aria-label="下一页" disabled={recordsUnread || page >= pages || loading} onClick={() => setPage(value => value + 1)}><ArrowRight size={16} /></button></div></div>
       <p className="assistant-boundary-note"><ShieldCheck size={14} />收到指令、资料完成与回复可见分别记录。回复结果不明时只核查，不自动重发。</p>
     </> : <AssistantSettings demo={demo} binding={overview?.binding} setup={overview?.setup} nativeChannel={overview?.native_channel} nativeProvision={overview?.native_provision} onChanged={refresh} />}
-    {selected && <TaskDetails task={detail} error={detailError} pending={pending} demo={demo} notice={notice?.message ?? ''} noticeError={notice?.error ?? false} noticeSource={notice?.source} onClose={() => setSelected(null)} onRefresh={refresh} onAction={taskAction} onOpenTask={id => { setNotice(null); setSelected(id); }} />}
+    {selected && <TaskDetails key={selected} task={detail?.id === selected ? detail : null} error={detailError?.taskId === selected ? detailError.message : ''} pending={pending} demo={demo} notice={notice?.message ?? ''} noticeError={notice?.error ?? false} noticeSource={notice?.source} onClose={() => setSelected(null)} onRefresh={refresh} onAction={taskAction} onOpenTask={id => { setNotice(null); setSelected(id); }} />}
   </div>;
 }
 
 function TaskDetails({ task, error, pending, demo, notice, noticeError, noticeSource, onClose, onRefresh, onAction, onOpenTask }: { task: api.AssistantTask | null; error: string; pending: string; demo: boolean; notice: string; noticeError: boolean; noticeSource?: AssistantNoticeSource; onClose: () => void; onRefresh: () => void; onAction: (task: api.AssistantTask, action: api.AssistantTaskAction) => Promise<void>; onOpenTask?: (id: string) => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
-  const [planProposal, setPlanProposal] = useState<{ summary: string } | null>(task?.details?.semantic_plan_proposal?.summary ? { summary: task.details.semantic_plan_proposal.summary } : null);
-  const [planBusy, setPlanBusy] = useState(false);
-  const [planError, setPlanError] = useState('');
-  useEffect(() => { setPlanProposal(task?.details?.semantic_plan_proposal?.summary ? { summary: task.details.semantic_plan_proposal.summary } : null); setPlanError(''); }, [task?.id, task?.details?.semantic_plan_proposal?.summary]);
-  const proposePlan = async () => {
-    if (!task || planBusy) return;
-    setPlanBusy(true); setPlanError('');
-    try { const result = await api.proposeAssistantTaskPlan(task.id); if (result.proposal.summary) setPlanProposal({ summary: result.proposal.summary }); }
-    catch (reason) { setPlanError(reason instanceof Error ? reason.message : '计划建议暂时不可用；原任务记录已保留。'); }
-    finally { setPlanBusy(false); }
+  const helperResults = useRef<HTMLElement>(null);
+  const mounted = useRef(true);
+  const [helperTaskId, setHelperTaskId] = useState(task?.id);
+  const helperCurrent = helperTaskId === task?.id;
+  const planRequest = useRef<AbortController | null>(null);
+  const triageRequest = useRef<AbortController | null>(null);
+  const [storedHelperView, setHelperView] = useState<'plan' | 'triage' | null>(null);
+  const helperView = helperCurrent ? storedHelperView : null;
+  const helperViewRef = useRef<'plan' | 'triage' | null>(null);
+  const [helperFocus, setHelperFocus] = useState(0);
+  const [storedPlanProposal, setPlanProposal] = useState<{ summary: string } | null>(task?.details?.semantic_plan_proposal?.summary ? { summary: task.details.semantic_plan_proposal.summary } : null);
+  const planProposal = helperCurrent ? storedPlanProposal : null;
+  const [storedPlanBusy, setPlanBusy] = useState(false);
+  const planBusy = helperCurrent && storedPlanBusy;
+  const [storedPlanError, setPlanError] = useState('');
+  const planError = helperCurrent ? storedPlanError : '';
+  const [storedPlanMessage, setPlanMessage] = useState('');
+  const planMessage = helperCurrent ? storedPlanMessage : '';
+  const [storedPlanCanRegenerate, setPlanCanRegenerate] = useState(false);
+  const planCanRegenerate = helperCurrent && storedPlanCanRegenerate;
+  const triageScope = JSON.stringify([task?.id, task?.state, task?.reason_code, task?.kind,
+    task?.reply_state, task?.import_state, Boolean(task?.details?.reply_text), task?.details?.library_choice?.state,
+    task?.execution_attempts ?? 0, task?.publish_attempts ?? 0]);
+  const canExplainTriage = Boolean(task && ['needs_review', 'needs_reconcile', 'verification_required',
+    'delivery_unknown', 'failed', 'failed_no_submit', 'waiting_library'].includes(task.state));
+  const [triageResult, setTriageResult] = useState({ scope: triageScope, text: task?.details?.semantic_triage ?? '' });
+  const triageCurrent = helperCurrent && triageResult.scope === triageScope;
+  const triageText = triageCurrent ? triageResult.text : '';
+  const [storedTriageBusy, setTriageBusy] = useState(false);
+  const triageBusy = triageCurrent && storedTriageBusy;
+  const [storedTriageError, setTriageError] = useState('');
+  const triageError = triageCurrent ? storedTriageError : '';
+  const [storedTriageMessage, setTriageMessage] = useState('');
+  const triageMessage = triageCurrent ? storedTriageMessage : '';
+  const context = useRef({ taskId: task?.id, triageScope,
+    planCache: task?.details?.semantic_plan_proposal, triageCache: triageText });
+  context.current = { taskId: task?.id, triageScope,
+    planCache: task?.details?.semantic_plan_proposal, triageCache: triageText };
+  const showHelper = (view: 'plan' | 'triage') => {
+    helperViewRef.current = view;
+    setHelperView(view);
+    setHelperFocus(value => value + 1);
   };
-  const [triageText, setTriageText] = useState<string>(task?.details?.semantic_triage ?? '');
-  const [triageBusy, setTriageBusy] = useState(false);
-  const [triageError, setTriageError] = useState('');
-  useEffect(() => { setTriageText(task?.details?.semantic_triage ?? ''); setTriageError(''); }, [task?.id, task?.details?.semantic_triage]);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; planRequest.current?.abort(); triageRequest.current?.abort(); };
+  }, []);
+  useEffect(() => {
+    setHelperTaskId(task?.id);
+    planRequest.current?.abort(); planRequest.current = null;
+    setPlanBusy(false); setPlanError(''); setPlanMessage(''); setPlanCanRegenerate(false);
+    helperViewRef.current = null; setHelperView(null);
+  }, [task?.id]);
+  useEffect(() => {
+    setPlanProposal(task?.details?.semantic_plan_proposal?.summary ? { summary: task.details.semantic_plan_proposal.summary } : null);
+    if (task?.details?.semantic_plan_proposal?.summary) {
+      if (helperViewRef.current === 'plan' && planMessage) setHelperFocus(value => value + 1);
+      setPlanError(''); setPlanMessage(''); setPlanCanRegenerate(false);
+    }
+  }, [task?.id, task?.details?.semantic_plan_proposal?.summary]);
+  useEffect(() => {
+    triageRequest.current?.abort(); triageRequest.current = null;
+    setTriageBusy(false); setTriageError('');
+    setTriageResult({ scope: triageScope, text: '' });
+    setTriageMessage(helperViewRef.current === 'triage'
+      ? canExplainTriage ? '任务状态已更新，请重新生成助手解释。' : '任务状态已更新，请查看当前处理结果。'
+      : '');
+  }, [triageScope]);
+  useEffect(() => {
+    setTriageResult({ scope: triageScope, text: task?.details?.semantic_triage ?? '' });
+    if (task?.details?.semantic_triage) {
+      if (helperViewRef.current === 'triage' && triageMessage) setHelperFocus(value => value + 1);
+      setTriageError(''); setTriageMessage('');
+    }
+  }, [task?.id, task?.details?.semantic_triage, task?.details?.semantic_triage_context_key]);
+  useEffect(() => {
+    if (helperFocus > 0) helperResults.current?.scrollIntoView({ block: 'nearest' });
+  }, [helperFocus]);
+  const proposePlan = async (regenerate = false) => {
+    if (!mounted.current || !helperCurrent || !task || context.current.taskId !== task.id
+      || planRequest.current || (regenerate && !planCanRegenerate)) return;
+    showHelper('plan');
+    if (planProposal) return;
+    const taskId = task.id;
+    const request = new AbortController();
+    planRequest.current = request;
+    const current = () => mounted.current && !request.signal.aborted
+      && context.current.taskId === taskId && planRequest.current === request;
+    setPlanBusy(true); setPlanError(''); setPlanMessage(''); setPlanCanRegenerate(false);
+    try {
+      const result = await api.proposeAssistantTaskPlan(taskId, request.signal, regenerate);
+      if (!current()) return;
+      if (!result || typeof result !== 'object') {
+        setPlanError('处理计划返回内容为空，请刷新记录后再试。');
+        if (helperViewRef.current === 'plan') setHelperFocus(value => value + 1);
+        return;
+      }
+      const summary = typeof result?.proposal?.summary === 'string' ? result.proposal.summary.trim() : '';
+      setPlanCanRegenerate(result.can_regenerate === true && Boolean(result.proposal?.fallback)
+        && !result.pending && !result.stale);
+      if (result.pending && context.current.planCache?.summary) setPlanProposal({ summary: context.current.planCache.summary });
+      else if (result.pending || result.stale || result.proposal?.fallback) setPlanMessage(summary || '处理计划正在生成，请稍后刷新记录。');
+      else if (summary) setPlanProposal({ summary });
+      else setPlanError('处理计划返回内容为空，请刷新记录后再试。');
+      if (helperViewRef.current === 'plan') setHelperFocus(value => value + 1);
+    } catch (reason) {
+      if (current()) {
+        setPlanError(reason instanceof Error ? reason.message : '计划建议暂时不可用，请稍后再试。');
+        if (helperViewRef.current === 'plan') setHelperFocus(value => value + 1);
+      }
+    } finally { if (current()) { planRequest.current = null; setPlanBusy(false); } }
+  };
   const explainTriage = async () => {
-    if (!task || triageBusy) return;
-    setTriageBusy(true); setTriageError('');
-    try { const result = await api.explainAssistantTask(task.id); setTriageText(result.text); }
-    catch (reason) { setTriageError(reason instanceof Error ? reason.message : '解释暂时不可用；原任务记录已保留。'); }
-    finally { setTriageBusy(false); }
+    if (!mounted.current || !triageCurrent || !task || context.current.triageScope !== triageScope || triageRequest.current) return;
+    showHelper('triage');
+    if (triageText) return;
+    const scope = triageScope;
+    const request = new AbortController();
+    triageRequest.current = request;
+    const current = () => mounted.current && !request.signal.aborted
+      && context.current.triageScope === scope && triageRequest.current === request;
+    setTriageBusy(true); setTriageError(''); setTriageMessage('');
+    try {
+      const result = await api.explainAssistantTask(task.id, request.signal);
+      if (!current()) return;
+      if (!result || typeof result !== 'object') {
+        setTriageError('助手解释返回内容为空，请刷新记录后再试。');
+        if (helperViewRef.current === 'triage') setHelperFocus(value => value + 1);
+        return;
+      }
+      if (result.pending && context.current.triageCache) setTriageResult({ scope, text: context.current.triageCache });
+      else if (result.pending || result.stale || result.fallback) setTriageMessage(result.text || '助手解释暂时不可用，请稍后刷新记录。');
+      else if (typeof result?.text === 'string' && result.text.trim()) setTriageResult({ scope, text: result.text });
+      else setTriageError('助手解释返回内容为空，请刷新记录后再试。');
+      if (helperViewRef.current === 'triage') setHelperFocus(value => value + 1);
+    } catch (reason) {
+      if (current()) {
+        setTriageError(reason instanceof Error ? reason.message : '解释暂时不可用，请稍后再试。');
+        if (helperViewRef.current === 'triage') setHelperFocus(value => value + 1);
+      }
+    } finally { if (current()) { triageRequest.current = null; setTriageBusy(false); } }
   };
   useEffect(() => { const node = dialog.current; node?.showModal(); return () => { if (node?.open) node.close(); }; }, []);
   const replyText = task?.reply?.text ?? task?.details?.reply_text;
@@ -303,10 +423,6 @@ function TaskDetails({ task, error, pending, demo, notice, noticeError, noticeSo
       <div className="assistant-detail-stages">{stages.map(stage => <Stage key={`${stage.tone}:${stage.label}`} value={stage} />)}</div>
       {guidance && <section className={`assistant-guidance is-${guidance.tone}`} aria-label="任务状态与下一步">{guidance.tone === "success" ? <Check size={18} /> : guidance.tone === "danger" ? <CircleHelp size={18} /> : guidance.tone === "active" ? <LoaderCircle size={18} className="spin" /> : <ShieldCheck size={18} />}<div><strong>{guidance.title}</strong><p>{guidance.message}</p>{issue && issue.message !== guidance.message && <small>{issue.message}</small>}</div></section>}
       {!completedActionHistory && actionRecord}
-      {triageText && <section className="assistant-detail-section" aria-label="助手解释"><h4>助手解释</h4><p>{triageText}</p></section>}
-      {planProposal && <section className="assistant-detail-section" aria-label="处理计划建议"><h4>处理计划建议（仅建议，未执行）</h4><p>{planProposal.summary}</p></section>}
-      {planError && <p className="assistant-notice is-error" role="alert">{planError}</p>}
-      {triageError && <p className="assistant-notice is-error" role="alert">{triageError}</p>}
       {error && <div className="assistant-feedback attention" role="alert"><p>{error} 以下保留上次读取的详情。</p></div>}
       <section className="assistant-detail-section"><h4>原评论指令</h4><blockquote>{task.comment_text || '未记录评论正文'}</blockquote><dl><div><dt>收到时间</dt><dd>{assistantTime(task.created_at)}</dd></div><div><dt>最近更新</dt><dd>{assistantTime(task.updated_at)}</dd></div><div><dt>资料范围</dt><dd>{assistantScopeLabel(task)}</dd></div></dl></section>
       {choiceStage && <section className="assistant-detail-section" aria-label="本轮选库状态"><h4>本轮保存位置</h4>{!stages.some(stage => stage.label === choiceStage.label && stage.tone === choiceStage.tone) && <Stage value={choiceStage} />}<p>{choiceTargetLabel}</p>{typeof choice?.option_count === 'number' && Number.isSafeInteger(choice.option_count) && choice.option_count >= 0 && <p>本轮可选知识库：{choice.option_count} 个</p>}<p className="assistant-muted">请在抖音原评论线程回答库名或序号。选定后另建保存任务；已询问和已选择都不等于视频已经入库。</p>{child && <button className="text-button" disabled={!onOpenTask || Boolean(pending)} onClick={() => onOpenTask?.(child)}>查看对应保存任务<ChevronRight size={14} /></button>}</section>}
@@ -322,9 +438,29 @@ function TaskDetails({ task, error, pending, demo, notice, noticeError, noticeSo
         {guidance?.actions.includes('resume') && canResumeTask(task) && <button className="ui-button ui-button-primary" disabled={Boolean(pending)} onClick={() => void onAction(task, 'resume')}><Play size={15} />继续未开始任务</button>}
         {task.state === 'waiting_library' && <span className="assistant-muted assistant-guidance-hint">请在抖音原评论线程回复库名，助手会继续处理。</span>}
         <button className="text-button" onClick={onRefresh} disabled={Boolean(pending)}>刷新记录</button>
-        {task?.comment_text && !planProposal && <button className="ui-button" disabled={planBusy || Boolean(pending)} onClick={() => void proposePlan()}>{planBusy ? <LoaderCircle size={15} className="spin" /> : <CircleHelp size={15} />}生成处理计划</button>}
-        {task && !triageText && ['needs_review', 'needs_reconcile', 'verification_required', 'delivery_unknown', 'failed', 'failed_no_submit', 'waiting_library'].includes(task.state) && <button className="ui-button" disabled={triageBusy || Boolean(pending)} onClick={() => void explainTriage()}>{triageBusy ? <LoaderCircle size={15} className="spin" /> : <CircleHelp size={15} />}让助手解释下一步</button>}
+        {task?.comment_text && <button className="ui-button" disabled={!helperCurrent || planBusy || Boolean(pending)} onClick={() => void proposePlan()}>{planBusy ? <LoaderCircle size={15} className="spin" /> : <CircleHelp size={15} />}{planBusy ? '正在生成处理计划…' : planProposal ? '查看处理计划' : '生成处理计划'}</button>}
+        {canExplainTriage && <button className="ui-button" disabled={!triageCurrent || triageBusy || Boolean(pending)} onClick={() => void explainTriage()}>{triageBusy ? <LoaderCircle size={15} className="spin" /> : <CircleHelp size={15} />}{triageBusy ? '正在生成助手解释…' : triageText ? '查看助手解释' : '让助手解释下一步'}</button>}
       </footer>
+      {helperView && <section ref={helperResults} className="assistant-helper-results" aria-label="AI辅助结果" aria-busy={helperView === 'plan' ? planBusy : triageBusy}>
+        <h4>{helperView === 'plan' ? '处理计划建议' : '助手解释'}</h4>
+        <div aria-live="polite" aria-atomic="true">
+          {helperView === 'plan' ? <>
+            {planBusy && <p role="status">正在生成处理计划，请稍候…</p>}
+            {planProposal && <p>{planProposal.summary}</p>}
+            {planMessage && <p role="status">{planMessage}</p>}
+            {planError && <p className="assistant-helper-error" role="alert">{planError}</p>}
+            {planCanRegenerate && <div className="assistant-helper-regenerate">
+              <p>重新生成会新增一次 AI 模型用量。</p>
+              <button className="ui-button" disabled={planBusy || Boolean(pending)} onClick={() => void proposePlan(true)}><RefreshCw size={15} />确认重新生成一次</button>
+            </div>}
+          </> : <>
+            {triageBusy && <p role="status">正在根据当前任务状态生成解释，请稍候…</p>}
+            {triageText && <p>{triageText}</p>}
+            {triageMessage && <p role="status">{triageMessage}</p>}
+            {triageError && <p className="assistant-helper-error" role="alert">{triageError}</p>}
+          </>}
+        </div>
+      </section>}
       <details className="assistant-ui-records"><summary>处理记录<span>来源、步骤、耗时与用量</span></summary>
         {completedActionHistory && actionRecord}
         {issue && <section className="assistant-detail-section"><h4>状态说明</h4><p className="assistant-muted"><code>{issue.code}</code>（{issue.message}）</p></section>}
